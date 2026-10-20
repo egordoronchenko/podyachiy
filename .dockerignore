@@ -1,0 +1,15 @@
+.env
+.env.*
+!.env.example
+.git
+.gitignore
+__pycache__
+*.pyc
+out/
+testdata/
+*.pem
+README.md
+inbox/
+outbox/
+backup/
+state/

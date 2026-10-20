@@ -1,0 +1,58 @@
+# Сборка из исходников. Рядом с этим файлом должен лежать .env (образец — install/.env.example).
+# Имя проекта задано явно: из папки с русским названием Docker его не выведет. Второй
+# установке на той же машине дайте своё: COMPOSE_PROJECT_NAME в её .env.
+name: podyachiy
+
+services:
+  podyachiy:
+    # сборка из исходников кладёт образ под тем же именем, под каким он лежит на Docker Hub:
+    # установка из готового образа (install/compose.yml) подхватит его без скачивания
+    image: egordoronchenko/podyachiy:${IMAGE_TAG:-latest}
+    build:
+      context: .
+      # дата сборки и коммит — в раздел «О сервисе»; не заданы в окружении — поля пусты
+      args:
+        BUILD_DATE: ${BUILD_DATE:-}
+        GIT_COMMIT: ${GIT_COMMIT:-}
+    env_file: .env
+    environment:
+      # время в логах и журнале — местное, иначе контейнер живёт по UTC
+      TZ: ${TZ:-Europe/Moscow}
+    ports:
+      # BIND — на каком адресе машины слушать. 127.0.0.1 — только с этого компьютера;
+      # 0.0.0.0 — из локальной сети, по адресу вида http://192.0.2.10:8081.
+      # В интернет сервис публиковать нельзя.
+      - "${BIND:-127.0.0.1}:${PORT:-8081}:8080"
+    volumes:
+      # Входная папка: сервис читает записи и кладёт сюда загруженные через страницу.
+      # Существующие файлы он не меняет и не удаляет. Чтобы запретить запись совсем,
+      # допишите в конец строки :ro — кнопка загрузки на странице тогда исчезнет.
+      - "${HOST_INBOX:-./inbox}:/data/inbox"
+      - "${HOST_OUTBOX:-./outbox}:/data/outbox"
+      # Учётные записи пользователей и ключ подписи входов. Эту папку по сети не раздают:
+      # в ней хеши паролей. Без неё заводить пользователей сервис не даст.
+      - "${HOST_STATE:-./state}:/data/state"
+      - "${HOST_BACKUP:-./backup}:/data/backup"
+      # шаблоны протоколов правятся на хосте в обычном редакторе
+      - "${HOST_PROMPTS:-./prompts}:/app/prompts"
+    # Имя host.docker.internal — сама машина, на которой стоит Docker: по нему сервис
+    # достаёт до локальной текстовой модели (LM Studio). В Docker Desktop имя есть
+    # и так, на Linux его даёт эта строка.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    # без проверки Docker считает контейнер живым, пока жив процесс:
+    # приложение внутри могло встать, а «Up» продолжал бы висеть
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/status', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      start_period: 20s
+      retries: 3
+    # логи контейнера тоже растут без предела, если их не ограничить
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

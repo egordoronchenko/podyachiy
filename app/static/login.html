@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Подьячий — вход</title>
+<link rel="icon" type="image/png" href="/static/favicon.png">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+
+<div class="topbar">
+  <div class="inner">
+    <span class="spacer"></span>
+    <a class="navlink" href="/help">Справка</a>
+    <button class="ghost icon" id="theme" title="Светлая или тёмная тема" aria-label="Переключить тему"></button>
+  </div>
+</div>
+
+<main class="wrap">
+  <img class="loginlogo" id="loginlogo" alt="">
+  <p class="loginname" id="loginname"></p>
+  <form class="card loginbox" id="form" novalidate></form>
+</main>
+
+<script src="/static/common.js"></script>
+<script>
+initTheme();
+const q = new URLSearchParams(location.search);
+// что показывает страница: вход, смена своего пароля, заявка на доступ или «Забыл пароль»
+const view = q.has("change") ? "change" : q.has("request") ? "request" : q.has("forgot") ? "forgot" : "login";
+// после входа возвращаем туда, откуда человека отправили входить, — но только внутрь сервиса
+const next = (q.get("next") || "/").startsWith("/") && !(q.get("next") || "").startsWith("//") ? (q.get("next") || "/") : "/";
+const form = document.getElementById("form");
+const val = id => document.getElementById(id).value.trim();
+const back = `<a class="navlink" href="/login">Назад ко входу</a>`;
+
+/* Проверки полей — те же правила, что на сервере: человек видит ошибку под полем сразу,
+   не дожидаясь ответа. Сервер всё равно проверяет заново. */
+let mail = false;       // шлёт ли сервис письма: без почты заявка идёт администратору в список, а почта в ней необязательна
+let dom = {};           // вход под учётной записью домена: on — предлагать, blocked — настроен, но соединение не защищено
+let notice = "";        // почему прежний вход больше не действует (домен отказал) — сервер говорит один раз
+const RULES = {
+  name: v => !v ? "Укажите фамилию, имя и отчество" : "",
+  email: v => !v ? (mail ? "Укажите почту: на неё придёт ссылка для входа" : "")
+    : !/^[^@\s]+@[^@\s]+\.[^@\s.]+$/.test(v) ? "Почта — в виде имя@организация.ru" : "",
+  login: v => !v ? "Придумайте логин"
+    : v.toLowerCase() === "admin" ? "Логин admin занят администратором — выберите другой"
+    : !/^[a-z0-9][a-z0-9._-]{1,31}$/.test(v.toLowerCase()) ? "Логин — латинские буквы, цифры, точка, дефис; от 2 до 32 знаков" : "",
+  who: v => !v ? "Укажите логин или почту" : "",
+};
+
+function check(id) {
+  const problem = RULES[id] ? RULES[id](val(id)) : "";
+  fieldError(id, problem);
+  return !problem;
+}
+
+const VIEWS = {
+  login: signup => `
+    <h2>Вход</h2>
+    ${dom.on ? `<p class="lead">Входите учётной записью домена${dom.name ? ` <b>${esc(dom.name)}</b>` : ""} —
+      тем же логином и паролем, что на рабочем компьютере.</p>` : ""}
+    ${dom.blocked ? `<div class="nhint warn lines" role="note">${icon("alert", 14)}<span>С учётной записью домена
+      войти можно только по защищённому адресу${dom.https ? `: <a href="${esc(dom.https)}/login">${esc(dom.https)}</a>` : " сервиса (https://)"}.
+      Здесь соединение не защищено — доменный пароль сюда не вводите.</span></div>` : ""}
+    <label for="login">Логин</label>
+    <input type="text" id="login" autocomplete="username" autocapitalize="none" spellcheck="false"
+           ${dom.on ? `aria-describedby="login-hint"` : ""} required autofocus>
+    ${dom.on ? `<div class="fhint" id="login-hint">Например: ivanov${dom.name ? `, ${esc(dom.name)}\\ivanov` : ""} или ivanov@домен</div>` : ""}
+    <label for="password">Пароль</label>
+    <input type="password" id="password" autocomplete="current-password" required>
+    <div class="row"><button id="go">Войти</button></div>
+    <div class="msg${notice ? " err" : ""}" id="msg" role="alert">${esc(notice)}</div>
+    ${dom.on ? `<div class="fhint">Пароль доменной учётной записи меняется в домене, а не здесь.</div>` : ""}
+    ${signup ? `<nav class="authlinks" aria-label="Нет доступа">
+        <a href="/login?request">Запросить доступ</a>
+        ${mail ? `<a href="/login?forgot">Забыл пароль</a>` : `<span>Забыли пароль — обратитесь к администратору</span>`}</nav>`
+      : `<div class="note">Логин и пароль выдаёт администратор сервиса.</div>`}`,
+
+  change: () => `
+    <h2>Смена пароля</h2>
+    <label for="old">Текущий пароль</label>
+    <input type="password" id="old" autocomplete="current-password" required>
+    <label for="new">Новый пароль, не короче 8 знаков</label>
+    <input type="password" id="new" autocomplete="new-password" minlength="8" required>
+    <div class="row"><button id="go">Сменить пароль</button><a class="navlink" href="/">Отмена</a></div>
+    <div class="msg" id="msg" role="alert"></div>`,
+
+  request: signup => !signup ? `
+    <h2>Запросить доступ</h2>
+    <div class="note">Заявки здесь не принимаются. Логин и пароль выдаёт администратор сервиса — обратитесь к нему.</div>
+    <div class="row">${back}</div>` : `
+    <h2>Запросить доступ</h2>
+    <p class="lead">${mail ? `Заявку рассмотрит администратор. Когда доступ откроют, на почту придёт письмо
+      с логином и ссылкой, по которой вы сами зададите пароль.`
+      : `Заявку рассмотрит администратор. Когда доступ откроют, он сам сообщит вам логин и передаст ссылку,
+      по которой вы зададите пароль.`}</p>
+    ${formField("name", "Фамилия, имя, отчество",
+      `<input type="text" id="name" autocomplete="name" maxlength="120" aria-describedby="name-err" required autofocus>`, "", true)}
+    ${formField("email", "Рабочая почта",
+      `<input type="email" id="email" autocomplete="email" maxlength="254" inputmode="email" spellcheck="false"
+              aria-describedby="email-hint email-err" ${mail ? "required" : ""}>`,
+      mail ? "На неё придёт ссылка для входа" : "Необязательно; сейчас сервис писем не шлёт", mail)}
+    ${formField("login", "Желаемый логин",
+      `<input type="text" id="login" autocomplete="username" autocapitalize="none" spellcheck="false" maxlength="32"
+              aria-describedby="login-hint login-err" required>`,
+      "Латинские буквы, цифры, точка, дефис; от 2 до 32 знаков. Например: ivanov", true)}
+    ${formField("comment", "Комментарий",
+      `<textarea id="comment" rows="3" maxlength="500" aria-describedby="comment-hint comment-err"></textarea>`,
+      "Необязательно: отдел и для чего нужен сервис")}
+    <div class="row"><button id="go">Отправить заявку</button>${back}</div>
+    <div class="msg" id="msg" role="alert"></div>`,
+
+  forgot: () => !mail ? `
+    <h2>Забыл пароль</h2>
+    <div class="note">Сбросить пароль самому здесь нельзя: в сервисе не настроена почта.
+      Новый пароль задаст администратор сервиса — обратитесь к нему.</div>
+    <div class="row">${back}</div>` : `
+    <h2>Забыл пароль</h2>
+    <p class="lead">Пришлём на почту из вашей учётной записи ссылку, по которой вы зададите новый пароль.</p>
+    ${formField("who", "Логин или почта",
+      `<input type="text" id="who" autocomplete="username" autocapitalize="none" spellcheck="false" maxlength="254"
+              aria-describedby="who-err" required autofocus>`, "", true)}
+    <div class="row"><button id="go">Прислать ссылку</button>${back}</div>
+    <div class="msg" id="msg" role="alert"></div>`,
+};
+
+const DONE = {
+  request: () => mail ? `Администратор получил уведомление. Когда он откроет доступ, на указанную почту придёт письмо
+    с логином и ссылкой для задания пароля. Если заявку отклонят, письма не будет — узнать о решении можно у администратора.`
+    : `Заявка передана администратору. Логин и способ входа он сообщит сам.`,
+  forgot: () => `Если такая учётная запись есть и в ней указана почта, мы отправили на неё ссылку.
+    Она действует 48 часов. Письма нет — проверьте папку «Спам» или обратитесь к администратору сервиса.`,
+};
+
+function finished(title, text) {
+  form.innerHTML = `<h2>${title}</h2>
+    <div class="done" role="status" tabindex="-1" id="done">${icon("ok", 18)}<span>${text}</span></div>
+    <div class="row">${back}</div>`;
+  document.getElementById("done").focus();
+}
+
+async function start() {
+  // заявку принимают и без почты; сброса пароля без неё нет — слать ссылку некуда
+  let signup = false;
+  try {
+    const said = await api("/api/me");
+    ({ mail, signup } = said);
+    dom = said.domain || {};
+    notice = said.notice ? said.notice.charAt(0).toUpperCase() + said.notice.slice(1) : "";
+  } catch (e) { /* сервис недоступен — покажем обычный вход */ }
+  form.innerHTML = VIEWS[view](signup);
+  document.title = document.title.replace("вход",
+    { login: "вход", change: "смена пароля", request: "заявка на доступ", forgot: "новый пароль" }[view]);
+  const first = form.querySelector("[autofocus]");
+  if (first) first.focus();
+}
+
+// ошибка под полем появляется, когда человек закончил ввод, и уходит, как только он её исправил
+form.addEventListener("focusout", e => { if (RULES[e.target.id] && e.target.value.trim()) check(e.target.id); });
+form.addEventListener("input", e => {
+  if (e.target.getAttribute("aria-invalid") === "true") check(e.target.id);
+});
+
+form.addEventListener("submit", async e => {
+  e.preventDefault();
+  const button = document.getElementById("go");
+  if (!button || button.disabled) return;
+  const fields = { request: ["name", "email", "login"], forgot: ["who"] }[view] || [];
+  const bad = fields.filter(id => !check(id));
+  if (bad.length) { document.getElementById(bad[0]).focus(); return; }
+  const label = button.textContent;
+  button.disabled = true;
+  button.textContent = "Отправляю…";
+  say("msg", "", "");
+  try {
+    if (view === "change") {
+      await api("/api/password", { old: document.getElementById("old").value, new: document.getElementById("new").value });
+      // прежняя метка входа с новым паролем не действует — входим заново
+      say("msg", "ok", "Пароль изменён. Войдите с новым паролем.");
+      setTimeout(() => { location.href = "/login"; }, 1500);
+    } else if (view === "request") {
+      await api("/api/request", { name: val("name"), email: val("email"), login: val("login"), comment: val("comment") });
+      finished("Заявка отправлена", DONE.request());
+    } else if (view === "forgot") {
+      await api("/api/forgot", { login: val("who") });
+      finished("Проверьте почту", DONE.forgot());
+    } else {
+      await api("/api/login", { login: val("login"), password: document.getElementById("password").value });
+      location.href = next;
+    }
+  } catch (err) {
+    button.disabled = false;
+    button.textContent = label;
+    // отказ про конкретное поле — под ним, с переводом курсора; остальное — под кнопкой
+    if (err.field && fieldError(err.field, err.message)) document.getElementById(err.field).focus();
+    else say("msg", "err", err.message);
+  }
+});
+
+start();
+</script>
+</body>
+</html>

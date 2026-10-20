@@ -1,0 +1,19 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.pyc
+out/
+testdata/
+inbox/
+outbox/
+state/
+*.pem
+.pytest_cache/
+backup/
+# база и журналы — где бы ни оказались
+*.db
+*.db-wal
+*.db-shm
+*.log
+node_modules/

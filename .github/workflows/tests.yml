@@ -1,0 +1,27 @@
+# Тесты на каждую правку: образ собирается из репозитория, тесты идут внутри него.
+name: Тесты
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Проверить, что код компилируется
+        run: python3 -m py_compile app/*.py
+
+      - name: Собрать образ
+        run: docker build -t podyachiy:test .
+
+      - name: Тесты внутри образа
+        run: >
+          docker run --rm -v "$PWD:/w" -w /w podyachiy:test
+          sh -c "pip install -q -r requirements-dev.txt && python -m pytest -q -p no:cacheprovider"

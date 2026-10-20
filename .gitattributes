@@ -1,0 +1,7 @@
+# Текстовые файлы хранятся и выдаются с переводом строки LF — на любой системе.
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.webp binary
+*.ttf binary
+*.woff2 binary
