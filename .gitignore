@@ -17,3 +17,6 @@ backup/
 *.db-shm
 *.log
 node_modules/
+
+# Локальные настройки Claude Code — не для репозитория
+.claude/settings.local.json
