@@ -36,7 +36,7 @@ def scanner(cfg, service):
     """Настоящий сканер над теми же папками и тем же журналом."""
     return watcher.Service(cfg=cfg, log=lambda s: None, ledger=service.ledger, journal=None,
                            speech_model=lambda: "elevenlabs/scribe-v2", tell=lambda record, kind, login, by_hand: None,
-                           words=lambda rel: dictionary.merge([]))
+                           words=lambda rel: dictionary.merge([]), series=lambda rel: True)
 
 
 def test_rename_moves_source_results_ledger_and_marker(tmp_path):

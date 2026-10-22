@@ -20,6 +20,8 @@
         <a class="linkbtn" id="tasksbtn" hidden title="Поручения из протоколов этой папки и её подпапок">Поручения</a>
         <button class="ghost" id="dcbtn" hidden aria-haspopup="dialog"
           title="Участники и сокращения этой папки: по ним сервис пишет ФИО и термины в протоколах">Словарь</button>
+        <button class="ghost" id="srbtn" hidden aria-haspopup="dialog"
+          title="Переносить ли в новый протокол незакрытые поручения предыдущей записи этой папки">Серия<span class="sw" id="srstate"></span></button>
         <button class="ghost" id="acbtn" hidden title="Кому открыта эта папка">Доступ</button>
         <button class="ghost" id="mkbtn" hidden title="Создать подпапку здесь">Новая папка</button>
       </div>
@@ -46,6 +48,7 @@
 </div>
 
 <div id="access" hidden></div>
+<div id="series" hidden></div>
 <div id="recact" hidden></div>
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
@@ -165,6 +168,8 @@ function render() {
   document.getElementById("acbtn").hidden = !data.manage;
   // панель доступа относится к одной папке: ушли из неё — панель закрывается
   if (accessFor !== null && accessFor !== data.path) closeAccess();
+  seriesButton();
+  if (seriesFor !== null && seriesFor !== data.path) closeSeries(false);
 
   const upbtn = document.getElementById("upbtn");
   const target = uploadDir();
@@ -484,6 +489,98 @@ document.getElementById("access").addEventListener("change", async e => {
     say("acmsg", "ok", "Сохранено");
   } catch (err) { say("acmsg", "err", err.message); }
 });
+
+/* ---------- серия совещаний ----------
+   Признак папки: в конец протокола новой записи сервис дописывает незакрытые поручения
+   предыдущей записи этой папки. Он включён у каждой папки, пока его не выключили; у корня его нет,
+   и кнопки там нет. Видят его все, кому папка открыта, — на кнопке «Серия» и в её окне; переключает
+   хозяин папки, сразу, без кнопки «Сохранить». */
+let seriesFor = null;
+
+function seriesButton() {
+  const btn = document.getElementById("srbtn"), state = document.getElementById("srstate");
+  btn.hidden = !data.path;
+  state.textContent = data.series ? "вкл" : "выкл";
+  state.classList.toggle("on", !!data.series);
+  btn.setAttribute("aria-label", `Серия совещаний: ${data.series ? "включена" : "выключена"}`);
+}
+
+// back — вернуть фокус на кнопку «Серия»: окно закрыл человек, а не уход в другую папку
+function closeSeries(back = true) {
+  if (seriesFor === null) return;
+  seriesFor = null;
+  const box = document.getElementById("series");
+  box.hidden = true;
+  box.innerHTML = "";
+  if (back) document.getElementById("srbtn").focus();
+}
+
+function drawSeries(note) {
+  const box = document.getElementById("series"), on = !!data.series, edit = !!data.owns;
+  box.hidden = false;
+  box.innerHTML = `<div class="veil" id="srveil"><div class="modal" role="dialog" aria-modal="true" aria-labelledby="srtitle">
+    <header><h2 id="srtitle">Папка «${esc(seriesFor.split("/").pop())}»</h2>
+      <button class="ghost icon" id="srclose" aria-label="Закрыть">${icon("close", 15)}</button></header>
+    <div class="body">
+      <label class="switchrow" for="srswitch">
+        <input type="checkbox" role="switch" id="srswitch"${on ? " checked" : ""}${edit ? "" : " disabled"}
+          aria-describedby="srhint">
+        <span><b>Серия совещаний</b><span class="dim"> — ${on ? "включена" : "выключена"}</span></span>
+      </label>
+      <p class="fhint" id="srhint">В конец протокола новой записи добавляются незакрытые поручения предыдущей записи этой папки.</p>
+      <p class="note">Выключите, если в папке лежат не связанные между собой совещания. Подпапки — отдельные серии
+        со своим переключателем. Готовые протоколы от переключателя не меняются: раздел у записи убирают кнопкой
+        «Убрать этот раздел» на вкладке «Протокол».</p>
+      ${edit ? "" : `<p class="dim signby">Менять может владелец папки или её администратор.</p>`}
+      <div class="msg${note ? " " + note.kind : ""}" id="srmsg" role="status">${note ? esc(note.text) : ""}</div>
+      <div class="row"><button type="button" class="ghost" id="srdone">Закрыть</button></div>
+    </div></div></div>`;
+  (edit ? document.getElementById("srswitch") : document.getElementById("srdone")).focus();
+}
+
+document.getElementById("srbtn").onclick = () => {
+  if (seriesFor !== null) return closeSeries();
+  seriesFor = data.path;
+  drawSeries();
+};
+const seriesBox = document.getElementById("series");
+let seriesDownOnVeil = false;
+seriesBox.addEventListener("mousedown", e => { seriesDownOnVeil = e.target.id === "srveil"; });
+seriesBox.addEventListener("click", e => {
+  if (e.target.closest("#srclose, #srdone") || (e.target.id === "srveil" && seriesDownOnVeil)) closeSeries();
+});
+seriesBox.addEventListener("change", async e => {
+  const sw = e.target.closest("#srswitch");
+  if (!sw) return;
+  const on = sw.checked;
+  sw.disabled = true;
+  say("srmsg", "", "Сохраняю…");
+  try {
+    const d = await api("/api/folder/series", { dir: seriesFor, on });
+    if (seriesFor === null || d.path !== data.path) return;      // пока сохраняли, окно закрыли или ушли в другую папку
+    data.series = d.series;
+    seriesButton();
+    drawSeries({ kind: "ok", text: d.series
+      ? "Сохранено: папка — серия совещаний. Раздел появится в протоколах, собранных с этой минуты."
+      : "Сохранено: папка — не серия. Новые протоколы её записей придут без раздела «Поручения прошлого совещания»." });
+  } catch (err) {
+    sw.checked = !on;
+    sw.disabled = false;
+    say("srmsg", "err", err.message);
+    sw.focus();
+  }
+});
+// Escape закрывает окно серии, а не запись под ним; Tab ходит по кругу внутри окна
+addEventListener("keydown", e => {
+  if (seriesFor === null || seriesBox.hidden) return;
+  if (e.key === "Escape") { e.stopPropagation(); closeSeries(); return; }
+  if (e.key !== "Tab") return;
+  const stops = [...seriesBox.querySelectorAll("button, input:not(:disabled)")];
+  const first = stops[0], last = stops[stops.length - 1];
+  if (!seriesBox.contains(document.activeElement)) { e.preventDefault(); first.focus(); }
+  else if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+  else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+}, true);
 
 /* ---------- действия с записью ----------
    Переименовать, перенести, удалить — хозяину записи. Каждое открывается своим окном:

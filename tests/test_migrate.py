@@ -209,7 +209,7 @@ def test_fresh_install_gets_an_empty_base_and_no_folder_of_old_files(tmp_path):
     assert sorted(p.name for p in cfg.state_dir.iterdir() if not p.name.startswith(db.FILE + "-")) == [db.FILE]
     assert users.Users(base).users == {} and journal.Journal(base).read() == [] and base.noted("legacy") is None
     assert base.noted("created") and [line for line in lines if "перенос" in line] == []
-    assert any(line.startswith("база: ") and "схема 1" in line for line in lines)
+    assert any(line.startswith("база: ") and f"схема {db.SCHEMA_VERSION}" in line for line in lines)
 
 
 def test_spending_from_before_the_journal_is_carried_by_a_line_per_record(tmp_path):

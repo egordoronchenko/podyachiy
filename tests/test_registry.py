@@ -6,7 +6,7 @@ import os
 import types
 from pathlib import Path
 
-from app import external, marks, mindmap, pipeline, registry, summarize, triage, actions
+from app import actions, external, ledger, marks, mindmap, pipeline, registry, summarize, triage
 from app.config import Settings
 
 MD = """# Протокол совещания
@@ -158,7 +158,7 @@ def test_rebuilt_record_keeps_its_place_in_the_row():
               rec("П/в.mp4", "", "2026-09-15T10:00:00+03:00")]
     cfg = types.SimpleNamespace(inbox=Path("нет"), outbox=Path("нет"), public_url="")
     said = []
-    assert pipeline.previous_tasks(cfg, "П/б.mp4", folder, "", "2026-10-10T10:00:00+03:00", said.append) == ""
+    assert pipeline.previous_tasks(cfg, "П/б.mp4", folder, "", "2026-10-10T10:00:00+03:00", said.append, series=True) == ""
     assert said == []                         # предыдущая — «а», её протокола на диске нет: молча без раздела
     key = registry.order_key({"record_date": "", "finished_at": "2026-10-10T10:00:00+03:00",
                               "first_done_at": folder[1]["first_done_at"]})
@@ -173,7 +173,8 @@ def test_block_lists_open_tasks_with_links_and_is_not_parsed_as_tasks_of_the_new
     assert block.splitlines() == [
         "## Поручения прошлого совещания", "",
         f"Незакрытые поручения из протокола записи [«Планёрка (вкс)» от 01.10.2026]({link}). "
-        "Раздел добавлен сервисом; статус — каким он был на том совещании.", "",
+        "Раздел добавлен сервисом: эта папка — серия совещаний; статус — каким он был на том совещании. "
+        "Убрать раздел можно кнопкой у его заголовка на странице записи.", "",
         f"- **Иванов Иван:** Согласовать смету; срок: до пятницы; статус: в работе; [в записи 00:10:05]({link}&t=605)",
         "- **Ответственный не назван:** Проверить остатки",
         f"- **Петрова (не участвовал в совещании):** прислать договор; статус: ждёт; [в записи 00:20:00]({link}&t=1200)"]
@@ -204,7 +205,7 @@ TRI = {"type": "meeting", "title": "Планёрка", "gist": "О складе"
        "confidence": "высокая", "type_reason": ""}
 
 
-def processed(tmp_path, monkeypatch, name, neighbours, prev_tasks=True, protocol=MD):
+def processed(tmp_path, monkeypatch, name, neighbours, prev_tasks=True, protocol=MD, series=True):
     """Настоящий pipeline.process над готовой расшифровкой; модели подменены."""
     root = Path(__file__).resolve().parent.parent
     cfg = types.SimpleNamespace(inbox=tmp_path / "in", outbox=tmp_path / "out", prompts_dir=root / "prompts",
@@ -230,7 +231,7 @@ def processed(tmp_path, monkeypatch, name, neighbours, prev_tasks=True, protocol
     monkeypatch.setattr(actions, "extract_file", no_actions)
     lines = []
     record = asyncio.run(pipeline.process(cfg, f"Планёрки/{name}.mp3", name, None, False, False, lines.append,
-                                          neighbours=neighbours))
+                                          neighbours=neighbours, series=series))
     assert record["status"] == "ok", record.get("error")
     return cfg, record, (cfg.outbox / "Планёрки" / name / "summary" / f"{name}.md").read_text(encoding="utf-8"), lines
 
@@ -270,3 +271,53 @@ def test_prev_tasks_setting_switches_the_block_off(tmp_path, monkeypatch):
     for value, on in (("1", True), ("0", False), ("нет", False), ("off", False), ("", True)):
         monkeypatch.setenv("PREV_TASKS", value)
         assert Settings.from_env().prev_tasks is on, value
+
+
+def test_block_is_built_only_in_a_series_folder_and_not_after_a_person_removed_it(tmp_path, monkeypatch):
+    _, first, _, _ = processed(tmp_path, monkeypatch, "первая", [])
+    first["first_done_at"] = "2026-10-01T10:00:00+03:00"           # первая обработана раньше
+    # папка не отмечена как серия совещаний — раздела нет, и в журнале работы сказано почему
+    _, second, text, lines = processed(tmp_path, monkeypatch, "вторая", [first], series=False)
+    assert registry.BLOCK_TITLE not in text
+    assert "папка не отмечена как серия совещаний — поручения прошлого совещания не ищу" in lines
+    # серия, но у этой записи раздел убрали кнопкой — пересборка его не возвращает
+    second.update(first_done_at=second["finished_at"], **{ledger.REMOVED: True})
+    _, _, text, lines = processed(tmp_path, monkeypatch, "вторая", [first, second])
+    assert registry.BLOCK_TITLE not in text
+    assert "раздел «Поручения прошлого совещания» у этой записи убран вручную — не добавляю" in lines
+    # а без отметки — раздел на месте
+    del second[ledger.REMOVED]
+    _, _, text, _ = processed(tmp_path, monkeypatch, "вторая", [first, second])
+    assert text.count("## Поручения прошлого совещания") == 1
+
+
+def test_records_in_the_root_never_get_the_block(tmp_path):
+    """Две несвязанные записи в корне — не серия: раздел не собирается, даже если признак передан.
+    Те же две записи в папке — серия, и раздел есть."""
+    cfg = types.SimpleNamespace(inbox=tmp_path / "in", outbox=tmp_path / "out", public_url="")
+    for folder in ("", "П"):
+        path = cfg.outbox / folder / "а" / "summary" / "а.md"
+        path.parent.mkdir(parents=True)
+        path.write_text(MD, encoding="utf-8")
+    pair = lambda folder: [rec(f"{folder}а.mp4", "2026-10-01", "2026-10-01T10:00:00+03:00", stem="а"),
+                           rec(f"{folder}б.mp4", "2026-10-08", "2026-10-08T10:00:00+03:00", stem="б")]
+    said = []
+    assert pipeline.previous_tasks(cfg, "б.mp4", pair(""), "2026-10-08", "2026-10-08T10:00:00+03:00", said.append,
+                                   series=True) == ""
+    assert said == ["запись в корне — поручения прошлого совещания не ищу"]
+    tail = pipeline.previous_tasks(cfg, "П/б.mp4", pair("П/"), "2026-10-08", "2026-10-08T10:00:00+03:00",
+                                   lambda s: None, series=True)
+    assert tail.startswith("## Поручения прошлого совещания") and "Согласовать смету" in tail
+
+
+def test_block_is_cut_out_and_put_back_where_the_service_puts_it():
+    tail = registry.block({"file": "П/а.mp4", "title": "Планёрка"}, UNMARKED(MD))
+    head = "<!-- протокол: модель тест -->\n\n# Протокол\n\n## 1. Кратко\n\nРешили.\n"
+    whole = head + "\n" + tail                                          # так его дописывает summarize_file
+    assert registry.has_block(whole) and not registry.has_block(head)
+    assert registry.without_block(whole) == head and registry.with_block(head, tail) == whole
+    assert registry.without_block(head) == head                         # раздела нет — текст как был
+    # после раздела дописали свой раздел руками — вырезается только раздел сервиса
+    assert registry.without_block(whole + "\n## 9. Приписка\n\nТекст.\n") == head + "\n## 9. Приписка\n\nТекст.\n"
+    # похожий заголовок, написанный не сервисом, разделом не считается
+    assert not registry.has_block("# Протокол\n\n## 6. Поручения прошлого совещания и прочее\n\nТекст.\n")

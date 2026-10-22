@@ -41,20 +41,21 @@ def service(tmp_path, workers):
     cfg.inbox.mkdir()
     return watcher.Service(cfg=cfg, log=lambda s: None, ledger=Ledger(db.Database(cfg.outbox.parent / "state")), journal=Trail(),
                            speech_model=lambda: "elevenlabs/scribe-v2", tell=lambda record, kind, login, by_hand: None,
-                           words=lambda rel: dictionary.merge([]))
+                           words=lambda rel: dictionary.merge([]), series=lambda rel: True)
 
 
 def slow_process(monkeypatch, sec=0.15):
     """Обработка-заглушка: спит и записывает, кто шёл одновременно с кем."""
-    seen = types.SimpleNamespace(now=[], most=0, twice=[], order=[], stems={}, models={})
+    seen = types.SimpleNamespace(now=[], most=0, twice=[], order=[], stems={}, models={}, series={})
 
-    async def process(cfg, rel, stem, template, force, manual, log, on_progress=None, neighbours=None, words=None, marked=None):
+    async def process(cfg, rel, stem, template, force, manual, log, on_progress=None, neighbours=None, words=None, marked=None, series=False):
         if rel in seen.now:
             seen.twice.append(rel)
         seen.now.append(rel)
         seen.most = max(seen.most, len(seen.now))
         seen.order.append(rel)
         seen.stems[rel] = stem
+        seen.series[rel] = series
         log("шаг 1: расшифровка с разделением говорящих — заглушка")
         await on_progress(1, 2)
         await asyncio.sleep(sec)
@@ -95,6 +96,17 @@ def test_one_worker_goes_strictly_one_by_one_in_queue_order(tmp_path, monkeypatc
     svc.queue = [watcher.QueueItem(path=f"запись {n}.mp4") for n in range(4)]
     drain(svc)
     assert seen.most == 1 and seen.order == [f"запись {n}.mp4" for n in range(4)]
+
+
+def test_worker_asks_whether_the_folder_of_the_record_is_a_series(tmp_path, monkeypatch):
+    svc = service(tmp_path, workers=1)
+    asked = []
+    svc.series = lambda rel: asked.append(rel) or rel.startswith("Планёрки/")
+    seen = slow_process(monkeypatch, sec=0.01)
+    svc.queue = [watcher.QueueItem(path=p) for p in ("Планёрки/вкс.mp4", "Разное/вкс.mp4")]
+    drain(svc)
+    assert asked == ["Планёрки/вкс.mp4", "Разное/вкс.mp4"]
+    assert seen.series == {"Планёрки/вкс.mp4": True, "Разное/вкс.mp4": False}
 
 
 def test_same_record_never_runs_in_two_workers(tmp_path, monkeypatch):

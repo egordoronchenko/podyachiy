@@ -34,6 +34,9 @@ MARKER_SUFFIX = ".done.json"
 RETRY_STATUSES = ("error", "no_summary")   # исходы, после которых стоит повторить
 MAX_FAILURES = 3                           # сбоев подряд, после которых — только вручную
 RETRY_AFTER_SEC = 1800                     # пауза после первого сбоя, дальше растёт
+# раздел «Поручения прошлого совещания» у записи убран вручную: пересборка протокола его не
+# возвращает (pipeline.previous_tasks). Ставит и снимает человек кнопкой у раздела (web.py)
+REMOVED = "prev_tasks_removed"
 
 
 def said(record: dict | None) -> str | None:
@@ -124,6 +127,9 @@ class Ledger:
                                   if record.get("status") in RETRY_STATUSES else 0)
             # о чём автору уже написано — переживает повторы и пересборки
             record["announced"] = said(prev)
+            # и раздел, убранный человеком, тоже: пересборка его не вернула, не вернёт и следующая
+            if prev.get(REMOVED):
+                record[REMOVED] = True
             # суммы — по валютам; у строк, записанных до этого, одно число в долларах
             record["cost_total"] = usage.plus(usage.amounts(prev.get("cost_total")),
                                               usage.amounts(record.get("cost")))
@@ -133,11 +139,19 @@ class Ledger:
 
     def announce(self, rel: str, kind: str) -> None:
         """Отметка: по записи наступило событие, о котором автору положено письмо."""
+        self.amend(rel, announced=kind)
+
+    def amend(self, rel: str, **fields) -> dict:
+        """Поля строки записи, которые меняет не прогон, а событие или человек: письмо автору,
+        убранный раздел. Поле, переданное со значением None, из строки убирается."""
         with self.db.write() as con, self._lock:
-            record = dict(self.records[rel], announced=kind)
+            record = dict(self.records[rel], **fields)
+            for name in [k for k, v in fields.items() if v is None]:
+                del record[name]
             self._store(con, record)
             self._touch()
             self.records[rel] = record
+            return record
 
     def move(self, old: str, new: str, old_out: str, new_out: str) -> int:
         """Папку переименовали: её записи теперь живут по новому пути. Отметки поручений

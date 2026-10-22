@@ -98,10 +98,10 @@ def service(tmp_path, monkeypatch, outcomes, uploaded=None):
                           speech_model=lambda: "elevenlabs/scribe-v2",
                           tell=lambda record, kind, login, by_hand: (told.append((record["file"], kind, login)),
                                                                      hands.append(by_hand)),
-                          words=lambda rel: dictionary.merge([]))
+                          words=lambda rel: dictionary.merge([]), series=lambda rel: True)
     left = list(outcomes)
 
-    async def process(cfg, rel, stem, template, force, manual, log, on_progress=None, neighbours=None, words=None, marked=None):
+    async def process(cfg, rel, stem, template, force, manual, log, on_progress=None, neighbours=None, words=None, marked=None, series=False):
         status = left.pop(0)
         if isinstance(status, Exception):
             raise status

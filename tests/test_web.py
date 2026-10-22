@@ -1831,7 +1831,7 @@ def test_tree_shows_only_open_folders_with_their_records(site):
     assert cut == {"": [], HOME: [], "Проекты": []}
     shallow = robot.get("/api/v1/tree", params={"depth": 0}).json()
     assert next(f for f in shallow["folders"] if f["path"] == "Проекты") == {
-        "path": "Проекты", "name": "Проекты", "can_upload": True, "records_inside": 2}
+        "path": "Проекты", "name": "Проекты", "can_upload": True, "series": True, "records_inside": 2}
     inner = robot.get("/api/v1/tree", params={"dir": "Проекты/Сметы"}).json()
     assert inner["path"] == "Проекты/Сметы" and walk(inner) == {
         "Проекты/Сметы": [], "Проекты/Сметы/Архив": ["Проекты/Сметы/Архив/смета.mp4"]}
@@ -2297,7 +2297,7 @@ def test_skill_takes_the_address_from_the_request_when_public_url_is_not_set(sit
 def test_every_request_of_the_skill_is_a_real_address(site):
     """Навык не должен звать адреса, которых нет: все /api/v1/… из него есть в приложении."""
     web, client = site
-    named = set(re.findall(r"/api/v1(?:/[a-z.]+)?", client.get("/skill/SKILL.md").text))
+    named = set(re.findall(r"/api/v1(?:/[a-z._]+)?", client.get("/skill/SKILL.md").text))
     assert len(named) >= 9 and named <= {p for _, p in api_routes(web)}
 
 
@@ -3063,7 +3063,7 @@ def test_worker_tells_the_author_once_and_slow_mail_does_not_hold_it(office, mon
         return sent(*args, **kw)
     monkeypatch.setattr(web.mail, "send", slow_send)
 
-    async def process(cfg, rel, stem, template, force, manual, log, on_progress=None, neighbours=None, words=None, marked=None):
+    async def process(cfg, rel, stem, template, force, manual, log, on_progress=None, neighbours=None, words=None, marked=None, series=False):
         return {"file": rel, "stem": stem, "status": "ok", "cost": {}, "title": "Новая планёрка",
                 "finished_at": "2026-10-10T12:00:00+03:00"}
     monkeypatch.setattr(web.pipeline, "process", process)
@@ -4211,3 +4211,166 @@ def test_admin_sees_the_base_and_the_last_backup_and_a_warning_about_a_network_f
     assert "сетевой папке (cifs)" in warning and "server" not in warning and "локальный диск" in warning
     page = (ROOT / "app" / "static" / "admin.html").read_text(encoding="utf-8")
     assert 'id="storagewarn"' in page and 'role="alert"' in page and "резервная копия не делалась" in page
+
+
+# ---------- серия совещаний и раздел «Поручения прошлого совещания» ----------
+
+PREV = "## Поручения прошлого совещания"
+
+
+def meetings(site):
+    """Папка «Планёрки» с двумя готовыми записями: у второй в конце протокола — раздел с незакрытыми
+    поручениями первой, как его дописывает обработка, и карта с ним. Иванов — администратор папки,
+    Петров её только читает."""
+    from app import external, mindmap, registry
+    web, admin, ivanov, petrov = staffed(site)
+    admin.post("/api/folder", json={"dir": "Планёрки"})
+    admin.post("/api/access", json={"dir": "Планёрки", "login": "ivanov", "read": "tree", "manage": "tree"})
+    admin.post("/api/access", json={"dir": "Планёрки", "login": "petrov", "read": "tree"})
+    for name, day in (("первая", "2026-10-01"), ("вторая", "2026-10-08")):
+        rel = f"Планёрки/{name}.mp4"
+        recorded(web, rel)
+        web.service.ledger.put({**web.service.ledger.get(rel), "title": f"Планёрка {day}", "record_date": day,
+                                "first_done_at": f"{day}T12:00:00+03:00", "finished_at": f"{day}T12:00:00+03:00"})
+    set_protocol(web, "Планёрки/первая.mp4", TASKS_MD)
+    block = registry.block(web.service.ledger.get("Планёрки/первая.mp4"), marks.merged(external.tasks(TASKS_MD), {}))
+    path = set_protocol(web, "Планёрки/вторая.mp4", "<!-- протокол: тест -->\n\n# Протокол\n\nРешили.\n\n" + block)
+    os.utime(path, (1_700_000_000, 1_700_000_000))          # протокол собран давно
+    mindmap.write_for(path)
+    return web, admin, ivanov, petrov, path
+
+
+def test_owner_removes_the_block_and_it_is_gone_from_everything_built_from_the_protocol(site):
+    import docx
+    web, admin, ivanov, petrov, path = meetings(site)
+    rel = "Планёрки/вторая.mp4"
+    shown = ivanov.get("/api/result", params={"file": rel}).json()
+    assert shown["previous"] == {"present": True, "removed": False, "series": True, "title": "Поручения прошлого совещания"}
+    assert ivanov.get("/api/search", params={"q": "Незакрытые поручения"}).json()["files"][0]["file"] == rel
+
+    # читатель папки убрать не может; хозяин — может, без пересборки и вызова модели
+    refused = petrov.post("/api/record/previous_tasks", json={"file": rel, "on": False})
+    assert refused.status_code == 403 and refused.json()["detail"] == web.NO_PREV_EDIT and PREV in path.read_text("utf-8")
+    done = ivanov.post("/api/record/previous_tasks", json={"file": rel, "on": False})
+    assert done.json() == {"ok": True, "file": rel, "present": False, "removed": True, "series": True}
+    text = path.read_text(encoding="utf-8")
+    assert text == "<!-- протокол: тест -->\n\n# Протокол\n\nРешили.\n" and web.service.queue == []
+    assert path.stat().st_mtime == 1_700_000_000           # правка — не пересборка: время сборки протокола прежнее
+    assert "Поручения прошлого совещания" not in path.with_name("вторая.map.html").read_text(encoding="utf-8")
+    assert "Поручения прошлого" not in ivanov.get("/api/map", params={"file": rel}).text
+    assert "Поручения прошлого" not in ivanov.get("/api/v1/record", params={"file": rel}).json()["protocol"]
+    exported = docx.Document(io.BytesIO(ivanov.get("/api/export", params={"file": rel, "format": "docx"}).content))
+    assert "Решили." in [p.text for p in exported.paragraphs]
+    assert not any("Поручения прошлого" in p.text for p in exported.paragraphs)
+    assert ivanov.get("/api/search", params={"q": "Незакрытые поручения"}).json()["files"] == []
+    assert ivanov.get("/api/result", params={"file": rel}).json()["previous"]["removed"] is True
+    assert web.service.ledger.get(rel)["prev_tasks_removed"] is True
+    # повтор ничего не меняет и в журнал второй раз не пишется
+    assert ivanov.post("/api/record/previous_tasks", json={"file": rel, "on": False}).json()["removed"] is True
+    events = [e for e in admin.get("/api/admin/journal").json()["events"] if e["kind"] == "previous_tasks"]
+    assert [(e["by"], e["file"], e["on"]) for e in events] == [("ivanov", rel, False)]
+
+    # вернуть — тем же кодом, что собирает раздел при обработке: из протокола первой записи
+    back = ivanov.post("/api/record/previous_tasks", json={"file": rel, "on": True}).json()
+    assert back == {"ok": True, "file": rel, "present": True, "removed": False, "series": True}
+    assert path.read_text(encoding="utf-8").count(PREV) == 1 and "Согласовать смету" in path.read_text("utf-8")
+    assert path.stat().st_mtime == 1_700_000_000
+    assert "Поручения прошлого совещания" in ivanov.get("/api/map", params={"file": rel}).text
+    assert ivanov.get("/api/search", params={"q": "Незакрытые поручения"}).json()["files"][0]["file"] == rel
+    assert "prev_tasks_removed" not in web.service.ledger.get(rel)
+
+
+def test_removed_block_is_not_brought_back_by_a_rebuild_and_comes_back_by_the_button_only(site):
+    web, admin, ivanov, _, path = meetings(site)
+    rel = "Планёрки/вторая.mp4"
+    robot, _ = keyed(web, ivanov)                         # ключу — в тех же правах, что у страницы
+    assert robot.post("/api/v1/previous_tasks", params={"file": rel, "on": False}).json()["removed"] is True
+    # пересборка: обработчик берёт отметку из строки журнала и раздел не собирает
+    said = []
+    tail = pipeline.previous_tasks(web.cfg, rel, web.service.ledger.history(), "2026-10-08", "", said.append, series=True)
+    assert tail == "" and said == ["раздел «Поручения прошлого совещания» у этой записи убран вручную — не добавляю"]
+    web.service.ledger.put({**web.service.ledger.get(rel), "finished_at": "2026-10-10T12:00:00+03:00"})
+    assert web.service.ledger.get(rel)["prev_tasks_removed"] is True
+
+    # пока протокол собирается, кнопка не трогает файл
+    web.service.enqueue_manual(rel, None, False, "ivanov", "rebuild")
+    busy = ivanov.post("/api/record/previous_tasks", json={"file": rel, "on": True})
+    assert busy.status_code == 409 and "собирается" in busy.json()["detail"]
+    web.service.queue.clear()
+
+    # у первой записи все поручения закрыты отметками — возвращать нечего: раздела нет, отметка снята
+    first = ivanov.get("/api/result", params={"file": "Планёрки/первая.mp4"}).json()["tasks"]
+    for task in first:
+        marked = ivanov.post("/api/record/task", json={"file": "Планёрки/первая.mp4", "key": task["key"], "done": True})
+        assert marked.status_code == 200
+    empty = ivanov.post("/api/record/previous_tasks", json={"file": rel, "on": True}).json()
+    assert empty == {"ok": True, "file": rel, "present": False, "removed": False, "series": True}
+    assert PREV not in path.read_text(encoding="utf-8")
+
+
+def test_block_comes_back_only_in_a_series_folder_and_the_root_has_neither(site):
+    from app import registry
+    web, admin, ivanov, petrov, path = meetings(site)
+    rel = "Планёрки/вторая.mp4"
+    assert ivanov.post("/api/record/previous_tasks", json={"file": rel, "on": False}).status_code == 200
+    assert ivanov.post("/api/folder/series", json={"dir": "Планёрки", "on": False}).json() == {
+        "ok": True, "path": "Планёрки", "series": False}
+    refused = ivanov.post("/api/record/previous_tasks", json={"file": rel, "on": True})
+    assert refused.status_code == 409 and "не отмечена как серия" in refused.json()["detail"]
+    assert ivanov.get("/api/result", params={"file": rel}).json()["previous"]["series"] is False
+    assert web.service.series(rel) is False                 # и обработчик спросит то же самое
+    ivanov.post("/api/folder/series", json={"dir": "Планёрки", "on": True})
+    assert ivanov.post("/api/record/previous_tasks", json={"file": rel, "on": True}).json()["present"] is True
+
+    # раздел, который уже стоит в протоколе записи корня, убирается кнопкой; вернуть его нельзя
+    recorded(web, "разное.mp4")
+    task = {"who": "Иванов", "absent": False, "task": "Сверить склад", "due": None, "due_text": None, "status": None,
+            "at": None, "at_sec": None, "done": False}
+    root = set_protocol(web, "разное.mp4", "# Протокол\n\nДемонстрация.\n\n"
+                        + registry.block(web.service.ledger.get("Планёрки/первая.mp4"), [task]))
+    assert admin.get("/api/result", params={"file": "разное.mp4"}).json()["previous"] == {
+        "present": True, "removed": False, "series": False, "title": "Поручения прошлого совещания"}
+    assert admin.post("/api/record/previous_tasks", json={"file": "разное.mp4", "on": False}).json()["present"] is False
+    assert root.read_text(encoding="utf-8") == "# Протокол\n\nДемонстрация.\n"
+    refused = admin.post("/api/record/previous_tasks", json={"file": "разное.mp4", "on": True})
+    assert refused.status_code == 409 and "в корне" in refused.json()["detail"]
+    assert web.service.series("разное.mp4") is False
+    # у корня переключателя нет
+    assert admin.get("/api/browse").json()["series"] is False
+    assert admin.post("/api/folder/series", json={"dir": "", "on": True}).json()["detail"] == web.ROOT_NO_SERIES
+    assert admin.post("/api/v1/series", params={"dir": "/", "on": True}).status_code == 400
+
+
+def test_series_switch_follows_the_rights_and_is_seen_by_every_reader(site):
+    web, admin, ivanov, petrov, _ = meetings(site)
+    admin.post("/api/folder", json={"dir": "Планёрки/Архив"})
+    assert petrov.get("/api/browse", params={"path": "Планёрки"}).json()["series"] is True    # новая папка — серия
+    refused = petrov.post("/api/folder/series", json={"dir": "Планёрки", "on": False})
+    assert refused.status_code == 403 and refused.json()["detail"] == web.NO_SERIES_EDIT
+    assert petrov.post("/api/folder/series", json={"dir": "Нет такой", "on": False}).status_code == 404
+    robot, _ = keyed(web, ivanov)
+    assert robot.post("/api/v1/series", params={"dir": "Планёрки", "on": False}).json()["series"] is False
+    assert robot.post("/api/v1/series", params={"dir": "Планёрки", "on": False}).status_code == 200    # повтор
+    assert petrov.get("/api/browse", params={"path": "Планёрки"}).json()["series"] is False
+    tree = petrov.get("/api/v1/tree", params={"dir": "Планёрки"}).json()
+    assert tree["series"] is False and tree["folders"][0]["series"] is True                 # подпапка — своя серия
+    events = [e for e in admin.get("/api/admin/journal").json()["events"] if e["kind"] == "series"]
+    assert [(e["by"], e["folder"], e["on"], e.get("via")) for e in events] == [("ivanov", "Планёрки", False, "key")]
+
+    # переименование папки уносит признак с собой, удаление — убирает
+    assert admin.post("/api/admin/folders/rename", json={"dir": "Планёрки", "name": "Летучки"}).status_code == 200
+    assert ivanov.get("/api/browse", params={"path": "Летучки"}).json()["series"] is False
+    assert ivanov.get("/api/browse", params={"path": "Летучки/Архив"}).json()["series"] is True
+    assert web.serial.off() == {"Летучки"}
+    assert admin.post("/api/admin/folders/delete", json={"dir": "Летучки"}).json()["ok"]
+    assert web.serial.off() == set()
+    admin.post("/api/folder", json={"dir": "Летучки"})
+    assert admin.get("/api/browse", params={"path": "Летучки"}).json()["series"] is True
+
+
+def test_series_and_the_block_have_no_limits_in_personal_mode(tmp_path):
+    with running(tmp_path, mode="personal") as (web, client):
+        client.post("/api/folder", json={"dir": "Планёрки"})
+        assert client.post("/api/folder/series", json={"dir": "Планёрки", "on": False}).json()["series"] is False
+        recorded(web, "Планёрки/вкс.mp4")
+        assert client.post("/api/record/previous_tasks", json={"file": "Планёрки/вкс.mp4", "on": False}).json()["removed"]

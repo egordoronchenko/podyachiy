@@ -1,10 +1,10 @@
 """Переименование и удаление папок администратором.
 
 Папка живёт сразу в нескольких местах: записи во входной папке, результаты в выходной,
-а в базе — строки журнала обработки, отметки поручений, права пользователей, словари и пути
-в журнале расходов. Переименование и удаление проходят по всем, иначе записи «потеряются»
-на странице или пойдут в обработку заново. Всё, что в базе, меняется одной транзакцией:
-сначала переезжают папки на диске, потом записывается база; не записалась — папки
+а в базе — строки журнала обработки, отметки поручений, права пользователей, словари, признак
+«серия совещаний» и пути в журнале расходов. Переименование и удаление проходят по всем, иначе
+записи «потеряются» на странице или пойдут в обработку заново. Всё, что в базе, меняется одной
+транзакцией: сначала переезжают папки на диске, потом записывается база; не записалась — папки
 возвращаются на место, и половины переезда не остаётся.
 
 Гонки со сканером и обработчиками нет по той же причине, что и у действий с записью
@@ -24,7 +24,7 @@ import shutil
 import time
 from pathlib import Path
 
-from . import marks, upload, users
+from . import marks, series, upload, users
 
 TRASH = ".trash"
 TRASH_DAYS = 30
@@ -81,6 +81,7 @@ def rename(cfg, service, people: users.Users, folder: str, name: str, also=None)
         with service.ledger.db.write():
             service.ledger.move(folder, target, str(cfg.outbox / folder), str(cfg.outbox / target))
             people.rename_folder(folder, target)
+            series.Store(service.ledger.db).move_folder(folder, target)
             if also:
                 also(target)
     except BaseException:
@@ -125,6 +126,7 @@ def remove(cfg, service, people: users.Users, folder: str, by: str, also=None) -
             noted = marks.Store(service.ledger.db).everything(folder)
             records = service.ledger.drop(folder)
             people.drop_folder(folder)
+            series.Store(service.ledger.db).drop_folder(folder)
             done["records"] = len(records)
             if also:
                 also(done)

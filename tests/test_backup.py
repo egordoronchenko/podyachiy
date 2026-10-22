@@ -101,7 +101,7 @@ def test_verify_passes_a_whole_archive_and_names_what_is_wrong_with_a_damaged_on
     said = []
     manifest = backup.verify(archive, said.append)
     assert manifest["base"]["counts"]["events"] == 9
-    for part in ("цел", "схема базы 1", "База читается и цела", "пользователей 3", "записей 3", "25.00 ₽ + 0.33 $"):
+    for part in ("цел", f"схема базы {db.SCHEMA_VERSION}", "База читается и цела", "пользователей 3", "записей 3", "25.00 ₽ + 0.33 $"):
         assert part in said[0], part
     before = sorted(p.name for p in tmp_path.rglob("*"))
     backup.verify(archive, quiet)
@@ -349,20 +349,21 @@ def test_archive_of_an_older_schema_is_restored_and_the_service_updates_it_at_st
                                 backup_dir=cfg.backup_dir)
     said = []
     backup.restore(new, made["archive"], said.append, kept=kept)
-    assert any("схема базы в архиве старее (1)" in line and "обновит её сам при запуске" in line for line in said)
+    n = len(steps) - 1                      # схема, которой записан архив
+    assert any(f"схема базы в архиве старее ({n})" in line and "обновит её сам при запуске" in line for line in said)
     lines = []
     base = db.Database(new.state_dir, lines.append)
-    assert base.version == 2 and lines == ["схема базы обновлена: версия 1 → 2"] and users.Users(base).count() == 3
+    assert base.version == n + 1 and lines == [f"схема базы обновлена: версия {n} → {n + 1}"] and users.Users(base).count() == 3
     base.close()
 
-    # и наоборот: архив сделан более новой версией сервиса (схема 2), а разворачивает его прежняя
+    # и наоборот: архив сделан более новой версией сервиса (схема n + 1), а разворачивает его прежняя
     newer = backup.create(new, kept=kept, say=quiet, now=datetime.datetime(2030, 1, 1).astimezone())
-    assert newer["schema"] == 2
+    assert newer["schema"] == n + 1
     monkeypatch.undo()
     older = types.SimpleNamespace(state_dir=tmp_path / "с" / "state", inbox=tmp_path / "с" / "inbox",
                                   outbox=tmp_path / "с" / "outbox", prompts_dir=tmp_path / "с" / "prompts",
                                   backup_dir=cfg.backup_dir)
-    with pytest.raises(backup.BackupError, match="архив сделан более новой версией сервиса \(схема базы 2, эта версия знает 1\)"):
+    with pytest.raises(backup.BackupError, match=rf"архив сделан более новой версией сервиса \(схема базы {n + 1}, эта версия знает {n}\)"):
         backup.restore(older, newer["archive"], quiet, kept=kept)
     assert not (tmp_path / "с").exists()                               # ничего не развёрнуто
     backup.verify(newer["archive"], quiet)                             # а проверить такой архив можно и прежней версией

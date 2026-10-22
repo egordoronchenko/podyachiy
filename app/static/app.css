@@ -21,6 +21,7 @@
   --ok: #15803d;      --ok-bg: #dcfce7;
   --warn: #a45309;    --warn-bg: #fef3c7;
   --err: #b3181c;     --err-bg: #fee2e2;
+  --err-ink: #ffffff;  /* текст на красной кнопке */
   --info: #1d4ed8;    --info-bg: #dbeafe;
   --shadow: 0 1px 2px rgba(15, 23, 42, .06), 0 1px 3px rgba(15, 23, 42, .04);
 
@@ -45,6 +46,7 @@
     --ok: #58d68a;    --ok-bg: #102e1e;
     --warn: #f0b429;  --warn-bg: #372a09;
     --err: #f98080;   --err-bg: #3d1618;
+    --err-ink: #2a0d0f;
     --info: #6ba5fb;  --info-bg: #10233d;
     --shadow: 0 1px 2px rgba(0, 0, 0, .4);
     color-scheme: dark;
@@ -64,6 +66,7 @@
   --ok: #58d68a;    --ok-bg: #102e1e;
   --warn: #f0b429;  --warn-bg: #372a09;
   --err: #f98080;   --err-bg: #3d1618;
+  --err-ink: #2a0d0f;
   --info: #6ba5fb;  --info-bg: #10233d;
   --shadow: 0 1px 2px rgba(0, 0, 0, .4);
   color-scheme: dark;
@@ -277,7 +280,7 @@ tr.picked td { background: var(--info-bg); }
 .rowacts button { min-height: 32px; padding: 4px 10px; font-size: 12.5px; }
 button.dangerlink, button.ghost.dangerlink { color: var(--err); margin-left: 8px; }
 button.dangerlink:hover:not(:disabled) { background: var(--err-bg); border-color: transparent; color: var(--err); }
-button.danger { background: var(--err); color: #fff; border-color: transparent; }
+button.danger { background: var(--err); color: var(--err-ink); border-color: transparent; }
 .dangerbox { border-color: var(--err); }
 ul.plain { margin: 10px 0 0; padding-left: 20px; font-size: 13.5px; color: var(--ink-2); }
 ul.plain li { margin: 4px 0; }
@@ -984,6 +987,63 @@ pre.smtperr:empty { display: none; }
 /* кнопок в шапке стало три: длинное название папки не сжимается в столбик, кнопки уходят на вторую строку */
 .c2 .hrow { flex-wrap: wrap; }
 .c2 .hrow h1 { flex: 1 1 150px; }
+/* на телефоне и сенсорном экране — по пальцу */
+@media (max-width: 600px), (pointer: coarse) {
+  .c2 .hrow button, .c2 .hrow a.linkbtn { min-height: 44px; padding: 6px 12px; }
+}
+
+/* ---------- серия совещаний: кнопка в шапке папки и её окно ---------- */
+.c2 .hrow #srbtn { display: inline-flex; align-items: center; gap: 6px; }
+.hrow .sw { padding: 0 7px; border-radius: 999px; font-size: 11.5px; font-weight: 600; line-height: 18px;
+  border: 1px solid var(--line-2); color: var(--ink-3); }
+.hrow .sw.on { border-color: transparent; background: var(--info-bg); color: var(--info); }
+#series .veil { z-index: 30; }
+#series .modal { width: min(520px, 100%); }
+#series .modal header { display: flex; align-items: center; gap: 12px; }
+#series .modal header h2 { margin: 0; flex: 1; font-size: 16px; text-transform: none; letter-spacing: 0; color: var(--ink); overflow-wrap: anywhere; }
+#series .modal .body { padding: 14px 18px 18px; overflow: auto; }
+#series .fhint { margin: 2px 0 0 54px; font-size: 13px; color: var(--ink-2); }
+#series .note { margin: 14px 0 0; }
+#series .signby { margin: 12px 0 0; font-size: 13px; }
+#series .msg.err::before { content: "Ошибка: "; font-weight: 600; }
+/* переключатель: флажок с ролью switch — читается и нажимается как обычный флажок, пробелом в том числе */
+.switchrow { display: flex; align-items: center; gap: 12px; min-height: 44px; margin: 0; cursor: pointer;
+  font-size: 14px; color: var(--ink); }
+.switchrow b { font-weight: 600; }
+.switchrow input[role=switch] {
+  appearance: none; -webkit-appearance: none; flex: none; position: relative; margin: 0; cursor: pointer;
+  width: 42px; height: 24px; border-radius: 999px; border: 2px solid var(--ink-3); background: var(--surface-2);
+  transition: background .15s ease, border-color .15s ease;
+}
+.switchrow input[role=switch]::after {
+  content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%;
+  background: var(--ink-3); transition: transform .15s ease, background .15s ease;
+}
+.switchrow input[role=switch]:checked { background: var(--primary); border-color: var(--primary); }
+.switchrow input[role=switch]:checked::after { transform: translateX(18px); background: var(--primary-ink); }
+.switchrow input[role=switch]:focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; }
+.switchrow input[role=switch]:disabled { cursor: not-allowed; opacity: .6; }
+.switchrow:has(input:disabled) { cursor: default; }
+@media (max-width: 600px) {
+  #series .veil { padding: 10px; }
+  #series .row button, #series #srclose { min-height: 44px; min-width: 44px; }
+}
+
+/* ---------- раздел «Поручения прошлого совещания»: кнопка под заголовком, вопрос, возврат ---------- */
+.prevbar { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; margin: 2px 0 8px; }
+.prevbar.ask { display: block; padding: 10px 12px; border: 1px solid var(--err); border-radius: 8px; background: var(--surface-2); }
+.prevbar.ask p { margin: 0; font-size: 13.5px; line-height: 1.5; color: var(--ink); }
+/* у разрушительного действия «Отмена» слева, красная кнопка — на другом краю */
+.prevbar .row.apart { justify-content: space-between; margin-top: 10px; }
+.prevbar.gone { margin-top: 18px; padding: 8px 10px; border: 1px dashed var(--line-2); border-radius: 8px;
+  background: var(--surface-2); font-size: 13px; color: var(--ink-2); }
+.prevbar.gone span { flex: 1 1 240px; }
+.prevbar .msg { flex-basis: 100%; margin: 6px 0 0; min-height: 0; }
+.prevbar .msg:empty { display: none; }
+.prevbar button.dangerlink { margin-left: 0; }
+@media (max-width: 600px), (pointer: coarse) {
+  .prevbar button { min-height: 44px; padding: 8px 14px; }
+}
 
 /* ---------- реестр поручений ---------- */
 .tfilter { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 12px 16px; align-items: end; }

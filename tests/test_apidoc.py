@@ -149,7 +149,7 @@ def test_openapi_lists_the_external_api_and_nothing_internal(stand):
     spec = guest.get("/api/v1/openapi.json").json()
     described = {(m, p) for m, p, _ in operations(spec)}
     v1 = {(m, p) for m, p in T.api_routes(web) if p.startswith("/api/v1")}
-    assert len(v1) == 23 and described == v1 | T.MANAGE_KEY | ALSO_OUTSIDE
+    assert len(v1) == 25 and described == v1 | T.MANAGE_KEY | ALSO_OUTSIDE
     assert described.isdisjoint(T.PAGE_ONLY) and described <= set(T.api_routes(web))
     for method, path, item in operations(spec):
         assert (item["x-key"] == "manage") == ((method, path) in T.MANAGE_KEY), f"{method} {path}"

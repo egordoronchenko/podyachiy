@@ -18,7 +18,7 @@ def test_new_base_gets_the_whole_schema_and_the_safe_modes(tmp_path):
     assert base.version == db.SCHEMA_VERSION == len(db.MIGRATIONS)
     tables = {r["name"] for r in base.rows("SELECT name FROM sqlite_master WHERE type = 'table'")}
     assert {"users", "grants", "keys", "dictionaries", "settings", "template_notes", "requests", "records", "marks",
-            "events", "runs", "run_money", "run_stages", "run_providers", "uploads", "meta"} <= tables
+            "events", "runs", "run_money", "run_stages", "run_providers", "uploads", "meta", "series_off"} <= tables
     assert base.value("PRAGMA journal_mode") == "wal" and base.value("PRAGMA foreign_keys") == 1
     assert base.value("PRAGMA synchronous") == 2                    # FULL: закрытая транзакция переживает и отключение питания
     base.check()
@@ -46,22 +46,23 @@ def test_schema_steps_are_applied_in_order_and_a_failed_step_changes_nothing(tmp
     assert lines == []                                              # новая база — не «обновление схемы»
 
     # шаг с ошибкой: первая его команда уже выполнилась, но шаг откатывается целиком
+    n = len(db.MIGRATIONS)
     broken = db.MIGRATIONS + (("CREATE TABLE half (id INTEGER PRIMARY KEY)", "CREATE TABLE users (x INTEGER)"),)
-    with pytest.raises(db.Refusal, match="до версии 2 не удалось.*осталась версии 1"):
+    with pytest.raises(db.Refusal, match=f"до версии {n + 1} не удалось.*осталась версии {n}"):
         db.Database(tmp_path, lines.append, steps=broken)
     same = db.Database(tmp_path, lines.append)
-    assert same.version == 1 and same.row("SELECT name FROM sqlite_master WHERE name = 'half'") is None
+    assert same.version == n and same.row("SELECT name FROM sqlite_master WHERE name = 'half'") is None
     same.close()
 
     newer = db.Database(tmp_path, lines.append, steps=db.MIGRATIONS + EXTRA + (("ALTER TABLE extra ADD COLUMN more TEXT",),))
-    assert newer.version == 3 and newer.noted("память") == "цела"
+    assert newer.version == n + 2 and newer.noted("память") == "цела"
     assert [dict(r) for r in newer.rows("SELECT * FROM extra")] == [{"id": 1, "note": "шаг 2", "more": None}]
-    assert lines == ["схема базы обновлена: версия 1 → 2", "схема базы обновлена: версия 2 → 3"]
+    assert lines == [f"схема базы обновлена: версия {n} → {n + 1}", f"схема базы обновлена: версия {n + 1} → {n + 2}"]
     newer.close()
     # база от более новой версии сервиса — этой версией не открывается и не трогается
     with pytest.raises(db.Refusal, match="от более новой версии сервиса"):
         db.Database(tmp_path)
-    assert db.Database(tmp_path, steps=db.MIGRATIONS + EXTRA + (("SELECT 1",),)).version == 3
+    assert db.Database(tmp_path, steps=db.MIGRATIONS + EXTRA + (("SELECT 1",),)).version == n + 2
 
 
 def test_write_is_all_or_nothing_and_nested_writes_join_the_outer_one(tmp_path):

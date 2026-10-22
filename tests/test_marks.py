@@ -159,7 +159,7 @@ def test_block_of_previous_tasks_skips_what_a_person_closed(tmp_path):
     prev = {"file": "Планёрки/вкс.mp4", "stem": "вкс", "status": "ok", "first_done_at": "2026-10-01T10:00:00+03:00",
             "finished_at": "2026-10-01T10:00:00+03:00"}
     block = lambda: pipeline.previous_tasks(cfg, "Планёрки/новая.mp4", [prev], "", "2026-10-08T10:00:00+03:00",
-                                            lambda s: None, file.store)
+                                            lambda s: None, file.store, series=True)
     assert block().count("\n- **") == 2 and "Согласовать смету" in block() and "Закрыть акт" not in block()
     file.put(external.tasks(MD), key_of("Согласовать"), True, "ivanov")
     assert block().count("\n- **") == 1 and "Согласовать смету" not in block() and "Проверить остатки" in block()

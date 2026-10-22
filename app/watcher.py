@@ -86,6 +86,10 @@ class Service:
     # (dictionary.Store.effective). Спрашивается перед каждым заданием — правка словаря
     # действует со следующей обработки.
     words: Callable[[str], dict]
+    # Отмечена ли папка записи как серия совещаний — по пути записи (series.Store.on её папки):
+    # только тогда в конец протокола дописываются незакрытые поручения предыдущей записи папки.
+    # Спрашивается перед каждым заданием — переключатель действует со следующей обработки.
+    series: Callable[[str], bool]
     # Отметки и сроки поручений: для раздела «Поручения прошлого совещания» и карты протокола.
     marked: marks.Store | None = None
     pending: dict[str, Pending] = field(default_factory=dict)
@@ -311,7 +315,8 @@ class Service:
                 replace(self.cfg, model=item.model or self.speech_model()), item.path, stem, item.template, item.force,
                 item.manual, job_log, on_progress,
                 neighbours=self.ledger.history(limit=len(self.ledger.records)),
-                words=self.words(item.path), marked=self.marked)
+                words=self.words(item.path), marked=self.marked,
+                series=self.series(item.path))
             # исход записи и её расход — одной транзакцией: строка журнала обработки без
             # строки расходов означала бы прогон, которого нет в отчёте
             with self.ledger.db.write():

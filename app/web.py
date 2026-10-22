@@ -42,10 +42,10 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.requests import ClientDisconnect
 
 from . import (about, apidoc, backup, brand, costbook, db, dictionary, directory, export, external, folders, journal, keys, mail,
-               marks, media, migrate, mindmap, names, notify, pipeline, providers, records, registry, search, settings,
-               signup, speech, templates, upload, users)
+               marks, media, migrate, mindmap, names, notify, pipeline, providers, records, registry, search, series,
+               settings, signup, speech, templates, upload, users)
 from .config import Settings
-from .ledger import Ledger
+from .ledger import REMOVED, Ledger
 from .logbook import Logbook
 from .watcher import Service
 
@@ -86,6 +86,7 @@ claims = signup.Requests(base)
 options = settings.Store(base, log)              # что администратор выбрал на странице
 look = brand.Brand(base, log)                    # логотип и название организации (корпоративный режим)
 words = dictionary.Store(base)                   # участники и сокращения папок и записей
+serial = series.Store(base)                      # признак папки «Серия совещаний»
 noted = marks.Store(base)                        # отметки «выполнено» и сроки поручений
 task_cache = registry.Cache()        # разобранные поручения протоколов — чтобы не читать сотни файлов на запрос
 domain = directory.Directory(cfg, log)           # вход под учётной записью домена (корпоративный режим)
@@ -344,7 +345,8 @@ async def lifespan(app: FastAPI):
         log(f"текстовые этапы идут по своему адресу: {cfg.summary_base_url} "
             f"(поручения: {', '.join(cfg.actions_models)}) — запасной поставщик на них не действует")
     service = Service(cfg=cfg, log=log, ledger=Ledger(base, log), journal=trail,
-                      speech_model=speech_model, tell=_tell, words=words.effective, marked=noted)
+                      speech_model=speech_model, tell=_tell, words=words.effective, marked=noted,
+                      series=lambda rel: serial.on(_parent_of(rel)))
     log(f"обработчиков: {cfg.workers} — столько записей идёт одновременно (WORKERS в .env)")
     tasks = [asyncio.create_task(service.scan_loop()),
              *(asyncio.create_task(service.worker_loop()) for _ in range(cfg.workers)),
@@ -1040,8 +1042,10 @@ def browse(path: str = "", flat: bool = False, who: users.Access = Depends(viewe
                    "exts": sorted(media.MEDIA_EXTS), "anywhere": upload_ready and who.uploader,
                    "denied": _upload_denied(who, rel)},
         "mkdir": upload_ready and who.plants(rel),
-        # хозяин папки правит её словарь и словари её записей (в том числе при загрузке)
+        # хозяин папки правит её словарь и словари её записей (в том числе при загрузке) и включает
+        # и выключает у неё признак «серия совещаний» (series — включён ли; у корня его нет)
         "owns": who.owns(rel),
+        "series": serial.on(rel),
         # из общего списка запись уходит в личную папку — если человеку разрешено в неё загружать
         "home_upload": upload_ready and bool(who.home) and who.uploads(who.home),
         # раздавать доступ можно к папке, не к корню: корень открывает только администратор
@@ -1248,6 +1252,7 @@ def _disk_folders(root: str, depth: int) -> list[str]:
 
 def _tree(who: users.Access, root: str, depth: int) -> dict:
     done, progress = _visible(who), _in_progress(who)
+    loose = serial.off()
     named = set(who.roots) | {_parent_of(r["file"]) for r in done} | {_parent_of(f) for f in progress}
     named |= {f for f in _disk_folders(root, depth) if who.sees(f)}
     # вместе с папками выше: до открытой папки нужно как-то дойти от корня
@@ -1270,7 +1275,8 @@ def _tree(who: users.Access, root: str, depth: int) -> dict:
 
     def node(path: str, level: int) -> dict:
         out = {"path": path, "name": PurePosixPath(path).name,
-               "can_upload": upload_ready and bool(path) and who.uploads(path)}
+               "can_upload": upload_ready and bool(path) and who.uploads(path),
+               "series": bool(path) and path not in loose}
         if level > depth:
             # глубже не раскрываем: содержимое — отдельным запросом с dir=<path>
             out["records_inside"] = sum(len(rows) for f, rows in by_folder.items() if external.inside(f, path))
@@ -1829,7 +1835,11 @@ def result(file: str, kind: str = "summary", who: users.Access = Depends(viewer)
             # стоит флажок, due_col — в какой ячейке этой строки срок (None — такой колонки нет)
             **({"tasks": [{"line": n, "due_col": col["срок"], **task}
                           for (n, col, _), task in zip(external.tasks_at(text), _marked(file, record, text))],
-                "can_mark": who.owns(_parent_of(file))} if kind == "summary" else {}),
+                "can_mark": who.owns(_parent_of(file)),
+                # раздел «Поручения прошлого совещания»: есть ли он, убран ли вручную; убрать и вернуть
+                # его может тот же хозяин папки (can_edit), title — заголовок, у которого стоит кнопка
+                "previous": {**_prev_view(file, record, text), "title": registry.BLOCK_TITLE}}
+               if kind == "summary" else {}),
             # ФИО из словаря записи и её папок — подсказки при подписи голосов
             "roster": [{"name": p["name"], "role": p["role"]} for p in words.effective(file)["people"]],
             # кто есть кто: части записи с их голосами, реплики с подписями
@@ -2065,6 +2075,138 @@ async def v1_task(file: str, key: str, done: bool | None = None, comment: str = 
     due=ГГГГ-ММ-ДД задаёт срок, пустой due возвращает срок из протокола. Без done и без due
     поручение отмечается выполненным."""
     return await _mark(file, key, True if done is None and due is None else done, comment, due, who)
+
+
+# ---------- раздел «Поручения прошлого совещания» и признак «серия совещаний» ----------
+# Раздел сервис дописывает в конец протокола сам, кодом (registry.block), — если папка записи
+# отмечена как серия совещаний (series.py). У одной записи его убирают и возвращают кнопкой у
+# раздела: без пересборки протокола и без вызова модели. Права — как у подписи говорящих: хозяин
+# папки; ключу доступа — в тех же правах. Признак серии виден всем, кому папка открыта (browse,
+# /api/v1/tree), а включает и выключает его хозяин папки.
+
+NO_PREV_EDIT = "убрать и вернуть раздел может владелец папки или её администратор"
+NO_SERIES_EDIT = "серию совещаний у папки включает и выключает владелец папки или её администратор"
+ROOT_NO_SERIES = ("у корня записей серии нет: в корень кладут разрозненные записи, и поручения прошлого "
+                  "совещания там не собираются")
+
+
+def _prev_view(file: str, record: dict, text: str) -> dict:
+    """Раздел у записи: present — он есть в протоколе; removed — убран человеком, и пересборка его
+    не вернёт; series — папка записи — серия совещаний: только тогда раздел можно вернуть."""
+    return {"present": registry.has_block(text), "removed": bool(record.get(REMOVED)),
+            "series": serial.on(_parent_of(file))}
+
+
+async def _prev_set(file: str, on: bool, who: users.Access) -> dict:
+    """Убрать раздел из протокола записи (on=False) или вернуть его (on=True).
+
+    Убранный раздел запоминается у записи (ledger.REMOVED): пересборка протокола после подписей
+    или словаря его не вернёт. Возвращается он тем же кодом, что собирает его при обработке, — из
+    протокола предыдущей записи папки и отметок у её поручений, какими они стали сейчас; модель
+    не вызывается. Вместе с протоколом заново собирается его карта; выгрузки DOCX и PDF, поиск и
+    реестр поручений читают протокол с диска и правку видят сами.
+
+    Время изменения файла протокола остаётся прежним: правка раздела — не пересборка, а по этому
+    времени страница сверяет, не новее ли протокола подписи и словарь (_rebuild_state).
+
+    Идёт прямо в событийном цикле, без await, — как отметка поручения: пересборка не встанет
+    между проверкой «запись не в работе» и записью файла. Признак записи, строка в журнале
+    действий и файл протокола записываются одной транзакцией: не записался файл — признак прежний."""
+    assert service is not None
+    record = _record(file, who)
+    folder = _parent_of(file)
+    if not who.owns(folder):
+        raise HTTPException(403, NO_PREV_EDIT)
+    path = pipeline.protocol_path(cfg, file, record)
+    if record.get("status") != "ok" or not path.is_file():
+        raise HTTPException(404, "у записи нет протокола — раздела в нём нет")
+    if any(i.path == file for i in service.queue) or _in_work(file):
+        raise HTTPException(409, "протокол записи сейчас собирается — дождитесь окончания")
+    if on and not folder:
+        raise HTTPException(409, "запись лежит в корне: в корне поручения прошлого совещания не собираются")
+    if on and not serial.on(folder):
+        raise HTTPException(409, "папка записи не отмечена как серия совещаний: включите у папки «Серию совещаний»")
+    text = path.read_text(encoding="utf-8")
+    stamp = path.stat()
+    with base.write():
+        flag = bool(record.get(REMOVED)) == on              # признак не тот, что нужен
+        if flag:
+            service.ledger.amend(file, **{REMOVED: None if on else True})
+        if not on:
+            fresh = registry.without_block(text)
+        elif registry.has_block(text):
+            fresh = text
+        else:
+            # признак уже снят: previous_tasks смотрит на него в строке журнала
+            tail = pipeline.previous_tasks(
+                cfg, file, service.ledger.history(limit=len(service.ledger.records)), record.get("record_date") or "",
+                record.get("finished_at") or "", lambda line: log(f"[{PurePosixPath(file).name}] {line}"), noted,
+                series=True)
+            fresh = registry.with_block(text, tail) if tail else text
+        if flag or fresh != text:
+            jot("previous_tasks", who, file=file, on=on)
+        if fresh != text:
+            path.write_text(fresh, encoding="utf-8")
+            os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+            mindmap.write_for(path, noted.load(file))
+    if flag or fresh != text:
+        log(f"раздел «{registry.BLOCK_TITLE}»: {file} — "
+            + ("убран вручную" if not on else "возвращён" if fresh != text else
+               "снова собирается, но незакрытых поручений у предыдущей записи папки нет")
+            + f" ({who.login}" + (f", ключ «{who.key}»" if who.key else "") + ")")
+    return {"ok": True, "file": file, **_prev_view(file, service.ledger.get(file), fresh)}
+
+
+class PreviousTasks(BaseModel):
+    file: str
+    on: bool                    # false — убрать раздел, true — вернуть
+
+
+@app.post("/api/record/previous_tasks")
+async def record_previous_tasks(req: PreviousTasks, who: users.Access = Depends(viewer)):
+    """Кнопка у раздела «Поручения прошлого совещания» в окне записи."""
+    return await _prev_set(req.file, req.on, who)
+
+
+@app.post("/api/v1/previous_tasks")
+async def v1_previous_tasks(file: str, on: bool, who: users.Access = Depends(viewer)):
+    """То же для ИИ-клиентов и программ: on=false — убрать раздел, on=true — вернуть."""
+    return await _prev_set(file, on, who)
+
+
+async def _series_set(path: str, on: bool, who: users.Access) -> dict:
+    """Включить или выключить у папки признак «серия совещаний». Действует со следующей обработки
+    и пересборки: готовые протоколы не меняются — раздел в них убирают кнопкой у раздела."""
+    if not users.norm_folder(path):
+        raise HTTPException(400, ROOT_NO_SERIES)
+    folder = _dict_folder(path, who)            # та же проверка, что у словаря: закрытая папка неотличима от несуществующей
+    if not who.owns(folder):
+        raise HTTPException(403, NO_SERIES_EDIT)
+    with base.write():
+        changed = serial.put(folder, on)
+        if changed:
+            jot("series", who, folder=folder, on=on)
+    if changed:
+        log(f"папка «{folder}»: серия совещаний {'включена' if on else 'выключена'} ({who.login}"
+            + (f", ключ «{who.key}»" if who.key else "") + ")")
+    return {"ok": True, "path": folder, "series": on}
+
+
+class SeriesSet(BaseModel):
+    dir: str
+    on: bool
+
+
+@app.post("/api/folder/series")
+async def folder_series(req: SeriesSet, who: users.Access = Depends(viewer)):
+    """Переключатель «Серия совещаний» в окне папки."""
+    return await _series_set(req.dir, req.on, who)
+
+
+@app.post("/api/v1/series")
+async def v1_series(dir: str, on: bool, who: users.Access = Depends(viewer)):
+    """То же для ИИ-клиентов и программ. Прочитать признак — поле series в /api/v1/tree."""
+    return await _series_set(dir, on, who)
 
 
 # ---------- письма о записи ----------

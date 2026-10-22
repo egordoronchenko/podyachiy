@@ -153,7 +153,9 @@ def build_record(rec: dict, work: Path, meta: dict) -> dict:
             "timestamps": len(mindmap.TS.findall(md)), "timestamps_unknown": 0, "runs": 1, "error": None},
         "results": {
             "summary": {**common, "kind": "summary", "name": f"{stem}.md", "text": md, **voices, "can_mark": rights["owner"],
-                        "tasks": [{"line": n, "due_col": col["срок"], **task} for (n, col, _), task in zip(found, noted)]},
+                        "tasks": [{"line": n, "due_col": col["срок"], **task} for (n, col, _), task in zip(found, noted)],
+                        "previous": {"present": registry.has_block(md), "removed": False, "series": True,
+                                     "title": registry.BLOCK_TITLE}},
             "transcript": {**common, "kind": "transcript", "name": f"{stem}.txt", "text": names.display_text(view["lines"]), **view},
             "srt": {**common, "kind": "srt", "name": f"{stem}.srt", "text": srt, **voices}},
         "map": mindmap.page(marks.stamp(md, saved), view["lines"]),
@@ -190,12 +192,13 @@ def browse(rel: str, flat: bool, files: list[dict], meta: dict) -> dict:
         "upload": {"enabled": rel in meta["folders"], "max_bytes": 4 * 2 ** 30, "exts": sorted(media.MEDIA_EXTS),
                    "anywhere": True, "denied": "" if rel in meta["folders"] or not rel else
                    "загружать записи в эту папку может тот, кому дано право загрузки"},
-        "mkdir": rights["owner"], "owns": rights["owner"], "home_upload": True, "manage": rights["manage"],
+        "mkdir": rights["owner"], "owns": rights["owner"], "series": bool(rel), "home_upload": True,
+        "manage": rights["manage"],
         "service": {"running": 0, "queue": 0, "watching": 0}}
 
 
 def tree(path: str, folders: set[str]) -> dict:
-    return {"path": path, "name": PurePosixPath(path).name, "can_upload": False, "records": [],
+    return {"path": path, "name": PurePosixPath(path).name, "can_upload": False, "series": bool(path), "records": [],
             "folders": [tree(f, folders) for f in sorted(folders, key=str.lower) if parent(f) == path]}
 
 

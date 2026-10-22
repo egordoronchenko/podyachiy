@@ -2523,6 +2523,8 @@ const ACTIONS = {
   user_delete: e => `удалил пользователя ${e.login}`,
   names: e => `подписал говорящих в записи «${e.file}»`,
   dictionary: e => `изменил словарь ${e.file ? `записи «${e.file}»` : `папки «${e.folder}»`}: участников ${e.people}, сокращений ${e.terms}`,
+  series: e => `${e.on ? "включил" : "выключил"} у папки «${e.folder}» серию совещаний`,
+  previous_tasks: e => `${e.on ? "вернул" : "убрал"} раздел «Поручения прошлого совещания» в протоколе записи «${e.file}»`,
   key_issue: e => `выпустил ключ доступа «${e.key}»${e.key_kind === "manage" ? " — с управлением сервисом" : ""}`,
   key_revoke: e => `отозвал ключ доступа «${e.key}»${e.owner ? ` пользователя ${e.owner}` : ""}`,
   speech_model: e => e.source === "env"

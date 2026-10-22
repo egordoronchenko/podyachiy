@@ -98,8 +98,13 @@ def protocol_path(cfg: Settings, rel: str, record: dict | None) -> Path:
 
 
 def previous_tasks(cfg: Settings, rel: str, neighbours: list[dict], day: str, started: str, log,
-                   marked: marks.Store | None = None) -> str:
+                   marked: marks.Store | None = None, *, series: bool) -> str:
     """Раздел «Поручения прошлого совещания» для протокола записи rel, либо пусто.
+
+    Раздел собирается, только если папка записи — серия совещаний (series — её признак,
+    series.py) и человек не убрал раздел у этой записи (ledger.REMOVED). Запись
+    в корне — без раздела всегда: в корень кладут разрозненные записи, и две из них серией
+    не становятся оттого, что лежат рядом.
 
     neighbours — строки журнала обработки. «Предыдущая» — запись той же папки, которая в ряду
     совещаний стоит прямо перед этой (registry.order_key): по дате совещания, а когда разбор
@@ -107,6 +112,15 @@ def previous_tasks(cfg: Settings, rel: str, neighbours: list[dict], day: str, st
     прежнее: её первая обработка уже записана в журнале.
     """
     own = next((r for r in neighbours if r["file"] == rel), {})
+    if "/" not in rel:
+        log("запись в корне — поручения прошлого совещания не ищу")
+        return ""
+    if not series:
+        log("папка не отмечена как серия совещаний — поручения прошлого совещания не ищу")
+        return ""
+    if own.get(ledger.REMOVED):
+        log("раздел «Поручения прошлого совещания» у этой записи убран вручную — не добавляю")
+        return ""
     key = registry.order_key({"record_date": day, "finished_at": started,
                               "first_done_at": own.get("first_done_at") or own.get("finished_at")})
     prev = registry.previous(neighbours, rel, key)
@@ -146,6 +160,7 @@ async def process(
     neighbours: list[dict] | None = None,
     words: dict | None = None,
     marked: marks.Store | None = None,
+    series: bool = False,
 ) -> dict:
     """Прогоняет один файл целиком и возвращает запись для журнала.
 
@@ -153,7 +168,8 @@ async def process(
     результаты одного файла лежат в собственной папке.
 
     neighbours — строки журнала обработки: по ним находится предыдущая запись папки, чьи
-    незакрытые поручения дописываются в конец протокола (PREV_TASKS).
+    незакрытые поручения дописываются в конец протокола (PREV_TASKS) — если папка записи
+    отмечена как серия совещаний (series, признак папки — series.py).
 
     words — действующий словарь записи (dictionary.Store.effective): участники и сокращения
     её самой, её папки и папок выше. Термины и имена из него уходят подсказками распознаванию,
@@ -299,7 +315,7 @@ async def process(
                 log(f"шаг 4: протокол по шаблону «{title}»")
             else:
                 log(f"шаг 3: протокол по шаблону «{title}»")
-            tail = (previous_tasks(cfg, rel, neighbours or [], tri["date"], started, log, marked)
+            tail = (previous_tasks(cfg, rel, neighbours or [], tri["date"], started, log, marked, series=series)
                     if cfg.prev_tasks else "")
             smeta = await summarize.summarize_file(
                 out_dir, stem, template_key, template_text, cfg, log,

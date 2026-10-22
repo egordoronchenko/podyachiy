@@ -727,6 +727,7 @@ let viewAudio = false;      // у этой записи сохранён зву�
 let viewData = null;        // ответ /api/result: текст, а для расшифровки — части и реплики с подписями
 let namesOpen = false, namesDraft = {}, lineEdit = null;
 let dueEdit = null;         // ключ поручения, у которого в окне записи открыто поле срока
+let prevAsk = false;        // у раздела «Поручения прошлого совещания» открыт вопрос «убрать?»
 
 // Минимальный разбор Markdown: заголовки, списки, таблицы, цитаты, жирный,
 // код. Внешние библиотеки не подключить — страница работает без интернета.
@@ -920,6 +921,10 @@ function onDocClick(e) {
   if (t.closest("[data-duesave]") && dueTyped()) saveDue(dueTyped());
   if (t.closest("[data-dueclear]")) saveDue("");
   if (t.closest("[data-duecancel]")) closeDue();
+  if (t.closest("#prevdrop")) { prevAsk = true; fillDoc(); focusIn("#prevno"); }
+  if (t.closest("#prevno")) { prevAsk = false; fillDoc(); focusIn("#prevdrop"); }
+  if (t.closest("#prevyes")) setPrevious(false);
+  if (t.closest("#prevback")) setPrevious(true);
 }
 
 /* Страница может следить за тем, что открыто, — например, держать это в адресе.
@@ -935,7 +940,7 @@ async function openViewer(file, kind, silent) {
   const wasOpen = !!viewFile;
   if (!viewFile) lastFocus = document.activeElement;
   viewFile = file; viewKind = kind || "summary"; viewText = ""; viewAudio = false;
-  viewData = null; lineEdit = null; dueEdit = null;
+  viewData = null; lineEdit = null; dueEdit = null; prevAsk = false;
   if (onViewerChange && !silent) onViewerChange(wasOpen ? "kind" : "open");
   drawViewer(`<div class="skeleton" aria-label="загружаю">
     <span style="width:45%"></span><span></span><span></span><span style="width:70%"></span>
@@ -1127,7 +1132,7 @@ function fillDoc() {
   else if (viewKind === "transcript" && (viewData.lines || []).length) body = transcriptHtml();
   else body = `<pre class="plain">${esc(viewData.text)}</pre>`;
   doc.innerHTML = staleBar() + namesHint() + namesPanel() + body;
-  if (viewKind === "summary") markTasks(doc);
+  if (viewKind === "summary") { markTasks(doc); markPrevious(doc); }
   doc.scrollTop = top;
 }
 
@@ -1232,6 +1237,62 @@ async function onTaskMark(e) {
     box.disabled = false;
     live.className = "tsaid err";
     live.textContent = "Отметка не сохранена: " + err.message;
+  }
+}
+
+/* ---------- раздел «Поручения прошлого совещания» ----------
+   Раздел дописывает в конец протокола сам сервис, если папка записи — серия совещаний. Хозяин
+   папки может убрать его у этой записи — кнопкой под заголовком раздела, после вопроса: раздел
+   пропадёт из протокола, карты и выгрузок. Убранный раздел пересборка не возвращает; вернуть его —
+   кнопкой в конце протокола. Оба действия без пересборки и без вызова модели. */
+function markPrevious(doc) {
+  const p = viewData.previous;
+  if (!p || !viewData.can_edit) return;
+  if (p.present) {
+    const head = [...doc.querySelectorAll("h2")].find(h => h.textContent.trim() === p.title);
+    if (!head) return;
+    head.insertAdjacentHTML("afterend", prevAsk
+      ? `<div class="prevbar ask" role="group" aria-labelledby="prevq">
+          <p id="prevq"><b>Убрать раздел из протокола?</b> Он пропадёт из протокола, карты и выгрузок DOCX и PDF
+            и не вернётся при пересборке. Вернуть его можно кнопкой «Вернуть раздел» в конце протокола.</p>
+          <div class="row apart"><button type="button" class="ghost" id="prevno">Отмена</button>
+            <button type="button" class="danger" id="prevyes">Убрать раздел</button></div>
+          <div class="msg" id="prevmsg" role="alert"></div></div>`
+      : `<div class="prevbar"><button type="button" class="ghost copybtn dangerlink" id="prevdrop"
+          title="Убрать раздел только из протокола этой записи">Убрать этот раздел</button></div>`);
+  } else if (p.removed) {
+    const why = p.series ? "" : viewFile.includes("/") ? " Вернуть его нельзя: папка записи не отмечена как серия совещаний."
+      : " Вернуть его нельзя: запись лежит в корне, а там поручения прошлого совещания не собираются.";
+    doc.insertAdjacentHTML("beforeend", `<div class="prevbar gone">
+      <span>Раздел «${esc(p.title)}» убран из этого протокола и при пересборке не добавляется.${why}</span>
+      ${p.series ? `<button type="button" class="ghost copybtn" id="prevback">Вернуть раздел</button>` : ""}
+      <div class="msg" id="prevmsg" role="alert"></div></div>`);
+  }
+}
+
+async function setPrevious(on) {
+  const go = document.getElementById(on ? "prevback" : "prevyes"), live = document.getElementById("vlive");
+  const was = go.textContent;
+  go.disabled = true;
+  go.textContent = on ? "Возвращаю…" : "Убираю…";
+  try {
+    const d = await api("/api/record/previous_tasks", { file: viewFile, on });
+    prevAsk = false;
+    await refresh();
+    fillDoc();
+    live.className = "tsaid";
+    live.textContent = !on ? `Раздел «${viewData.previous.title}» убран из протокола и карты` + (viewData.previous.series
+        ? ". Вернуть — кнопкой «Вернуть раздел» в конце протокола" : "")
+      : d.present ? "Раздел возвращён в конец протокола"
+      : "Раздел не добавлен: у предыдущей записи папки нет незакрытых поручений";
+    // вернуть было нечего — кнопок у раздела не осталось, о том говорит строка состояния в шапке
+    if (!on) focusIn("#prevback");
+    else if (d.present) focusIn("#prevdrop");
+  } catch (e) {
+    go.disabled = false;
+    go.textContent = was;
+    say("prevmsg", "err", e.message);
+    go.focus();
   }
 }
 
@@ -1525,7 +1586,7 @@ async function saveDict(rebuild) {
 
 function closeViewer(silent) {
   viewFile = null; viewText = ""; viewAudio = false;
-  viewData = null; lineEdit = null; dueEdit = null; namesOpen = false; namesDraft = {};
+  viewData = null; lineEdit = null; dueEdit = null; prevAsk = false; namesOpen = false; namesDraft = {};
   if (onViewerChange && !silent) onViewerChange("close");
   document.getElementById("viewer").innerHTML = "";
   if (lastFocus && lastFocus.isConnected) lastFocus.focus();
@@ -1541,6 +1602,8 @@ function initViewer() {
   };
   document.addEventListener("click", open);
   document.addEventListener("keydown", e => {
+    // Escape при вопросе «убрать раздел?» — это «Отмена», а не закрытие записи
+    if (e.key === "Escape" && prevAsk) { prevAsk = false; fillDoc(); focusIn("#prevdrop"); return; }
     // в поле ввода Escape гасит подсказку браузера, а не закрывает окно с правками
     if (e.key === "Escape" && viewFile && !(e.target.matches && e.target.matches("input"))) closeViewer();
     if ((e.key === "Enter" || e.key === " ") && e.target.closest && e.target.closest("a.open")) open(e);

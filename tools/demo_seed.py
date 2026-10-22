@@ -37,7 +37,7 @@ import sys
 from pathlib import Path, PurePosixPath
 
 from app import (db, dictionary, external, journal, ledger, marks, migrate, mindmap, names, pipeline, registry,
-                 speech, summarize, templates, triage, usage, users)
+                 series, speech, summarize, templates, triage, usage, users)
 from app.config import Settings
 
 RATE = 2.6                  # слов в секунду — темп обычной речи
@@ -49,6 +49,9 @@ PEOPLE: list[tuple[str, str, bool, str]] = []
 # Общие папки и кто их завёл; права: (логин, папка, чтение, администрирование).
 FOLDERS: list[tuple[str, str]] = []
 GRANTS: list[tuple[str, str, str | None, str | None, str | None]] = []
+# Папки, где выключен признак «серия совещаний»: (папка, кто выключил). У остальных он включён, как
+# у любой новой папки, — в конец протокола идут незакрытые поручения предыдущей записи папки.
+LOOSE: list[tuple[str, str]] = []
 # Кому разрешена загрузка в личную папку. Остальные в своей папке только читают.
 HOME_UPLOAD: set[str] = set()
 # Ключи доступа: (логин, название, срок в днях, с управлением ли).
@@ -173,7 +176,8 @@ def write_protocol(cfg: Settings, rec: dict, md: str, book: ledger.Ledger, start
     assert not unknown, f"{rec['file']}: меток нет в расшифровке — {unknown}"
     noted = marks.Store(book.db)
     tail = pipeline.previous_tasks(cfg, rec["file"], book.history(limit=len(book.records)), rec["date"], started,
-                                   lambda line: None, noted)
+                                   lambda line: None, noted,
+                                   series=series.Store(book.db).on(PurePosixPath(rec["file"]).parent.as_posix()))
     folder = base / "summary"
     folder.mkdir()
     target = folder / f"{stem}.md"
@@ -250,8 +254,14 @@ def plan(cfg: Settings, kinds: dict, book: ledger.Ledger, trail: journal.Journal
     for folder, by in FOLDERS:
         def make(folder=folder, by=by):
             (cfg.inbox / folder).mkdir(parents=True, exist_ok=True)
+            series.Store(book.db).put(folder, True)          # новая папка — серия, как в сервисе
             trail.write("folder_create", by, folder=folder)
         then(stamp("2026-08-24 10:05", next(setup)), make)
+    for folder, by in LOOSE:
+        def loose(folder=folder, by=by):
+            series.Store(book.db).put(folder, False)
+            trail.write("series", by, folder=folder, on=False)
+        then(stamp("2026-08-24 10:05", next(setup)), loose)
     for login, folder, read, upload, manage in GRANTS:
         def grant(login=login, folder=folder, read=read, upload=upload, manage=manage):
             people.set_access(login, folder, read, manage, upload)
@@ -455,6 +465,9 @@ GRANTS += [
     ("d.kuznetsov", "Проекты/Склад", users.TREE, None, None),
     ("v.sokolova", "Снабжение/Планёрки", users.ONLY, None, None),
 ]
+
+# в «ИТ» лежат несвязанные совещания — планёрка отдела и разбор сбоя: это не серия
+LOOSE += [("ИТ", "a.melnikov")]
 
 KEYS += [
     ("m.orlova", "Демо: ИИ-клиент на рабочем ноутбуке", 90, False),

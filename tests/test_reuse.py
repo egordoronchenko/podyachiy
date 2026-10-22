@@ -136,7 +136,7 @@ def test_worker_takes_the_model_for_new_records_from_the_settings_and_for_a_run_
                                   uploader=lambda file: "")
     svc = watcher.Service(cfg=cfg, log=seen.lines.append, ledger=Ledger(db.Database(cfg.outbox.parent / "state")), journal=trail,
                           speech_model=lambda: chosen[0], tell=lambda record, kind, login, by_hand: None,
-                          words=lambda rel: dictionary.merge([]))
+                          words=lambda rel: dictionary.merge([]), series=lambda rel: True)
     usage.reset()
 
     async def drain():
