@@ -1,7 +1,10 @@
 import json
 import os
+import pathlib
 import sqlite3
 import types
+import unicodedata
+from pathlib import Path
 
 import pytest
 
@@ -271,3 +274,95 @@ def test_delete_that_fails_midway_returns_the_folder_from_the_trash(tmp_path, mo
     assert people.users["ivanov"]["read"] == {"Снабжение": "tree"}
     assert words.get(dictionary.FOLDERS, "Проекты отдела")["people"] == []
     assert trail.report()["total"]["cost"] == {"RUB": 12.0}                # расходы удаление не трогает
+
+
+def test_delete_whose_trash_note_cannot_be_written_is_not_done(tmp_path, monkeypatch):
+    """Опись корзины («удалено.json») не записалась — удаления нет: папка на месте, база прежняя.
+    Иначе база уже забыла бы папку, а человек получил бы отказ 500."""
+    cfg, service, people = setup(tmp_path)
+    real = pathlib.Path.write_text
+
+    def full_disk(self, *args, **kwargs):
+        if self.name == "удалено.json":
+            raise OSError(28, "No space left on device")
+        return real(self, *args, **kwargs)
+
+    records_before = sorted(service.ledger.records)
+    monkeypatch.setattr(pathlib.Path, "write_text", full_disk)
+    with pytest.raises(OSError):
+        folders.remove(cfg, service, people, "Проекты отдела", "admin")
+    assert sorted(service.ledger.records) == records_before
+    assert sorted(Ledger(db.Database(cfg.outbox.parent / "state")).records) == records_before
+    assert (cfg.inbox / "Проекты отдела/план.mp4").is_file() and (cfg.outbox / "Проекты отдела/план/summary").is_dir()
+    assert people.access("ivanov").sees("Проекты отдела")
+    assert not list((cfg.outbox / folders.TRASH).rglob("*")) and not list((cfg.inbox / folders.TRASH).rglob("*"))
+
+
+def case_blind(monkeypatch, root):
+    """Том без различия регистра в именах (NTFS у Windows, APFS у macOS, папка Windows в Docker Desktop):
+    «Папка» и «папка» там — одна папка. Файловая система тестов регистр различает, и здесь подменяется
+    ровно то, чем тома различаются: поиск файла по имени (os.stat — на нём exists, is_dir, is_file,
+    samefile). Имя, которого нет буквально, ищется среди соседей без учёта регистра; переименование,
+    перечисление папки и сами файлы — настоящие."""
+    real, root = os.stat, Path(root)
+
+    def find(path):
+        if isinstance(path, int):
+            return path
+        p = Path(os.fsdecode(path))
+        if not p.is_absolute() or not p.is_relative_to(root):
+            return path
+        here = root
+        for part in p.relative_to(root).parts:
+            if not os.path.lexists(here / part):
+                try:
+                    part = next((n for n in os.listdir(here) if n.casefold() == part.casefold()), part)
+                except OSError:
+                    pass
+            here = here / part
+        return here
+
+    monkeypatch.setattr(os, "stat", lambda path, *args, **kwargs: real(find(path), *args, **kwargs))
+
+
+def test_case_blind_volume_is_emulated_faithfully(tmp_path, monkeypatch):
+    (tmp_path / "Папка").mkdir()
+    case_blind(monkeypatch, tmp_path)
+    assert (tmp_path / "папка").is_dir() and os.path.samefile(tmp_path / "ПАПКА", tmp_path / "Папка")
+    assert not (tmp_path / "другая").exists() and os.listdir(tmp_path) == ["Папка"]
+
+
+def test_rename_that_changes_only_the_case_is_done_on_a_case_blind_volume(tmp_path, monkeypatch):
+    """«Проекты отдела» → «проекты отдела»: на томе без различия регистра «проекты отдела» уже «есть» —
+    это она сама. Раньше — отказ «папка с таким именем уже есть»."""
+    cfg, service, people = setup(tmp_path)
+    case_blind(monkeypatch, tmp_path)
+    assert folders.rename(cfg, service, people, "Проекты отдела", "проекты Отдела") == "проекты Отдела"
+    assert sorted(os.listdir(cfg.inbox)) == ["Снабжение", "проекты Отдела"]
+    assert sorted(os.listdir(cfg.outbox)) == ["Снабжение", "проекты Отдела"]
+    assert sorted(service.ledger.records) == ["Снабжение/вкс.mp4", "проекты Отдела/Сметы/запись.mp4", "проекты Отдела/план.mp4"]
+    assert people.access("ivanov").rules("проекты Отдела/Сметы")
+    assert not [n for root in (cfg.inbox, cfg.outbox) for n in os.listdir(root) if n.startswith(".")]   # промежуточного имени не осталось
+    # другая папка с тем же именем без учёта регистра — по-прежнему отказ
+    with pytest.raises(folders.FolderError) as e:
+        folders.rename(cfg, service, people, "Снабжение", "проекты отдела")
+    assert e.value.status == 409
+
+
+def test_case_only_rename_that_fails_in_the_database_is_undone(tmp_path, monkeypatch):
+    cfg, service, people = setup(tmp_path)
+    case_blind(monkeypatch, tmp_path)
+
+    def refuse(target):
+        raise sqlite3.OperationalError("database or disk is full")
+
+    with pytest.raises(sqlite3.OperationalError):
+        folders.rename(cfg, service, people, "Снабжение", "снабжение", also=refuse)
+    assert sorted(os.listdir(cfg.inbox)) == ["Проекты отдела", "Снабжение"] and "Снабжение/вкс.mp4" in service.ledger.records
+
+
+def test_new_folder_name_from_a_mac_is_stored_in_one_form(tmp_path):
+    cfg, service, people = setup(tmp_path)
+    nfd = unicodedata.normalize("NFD", "Отчёты й")
+    assert folders.rename(cfg, service, people, "Снабжение", nfd) == "Отчёты й"
+    assert os.listdir(cfg.inbox / "Отчёты й") == ["вкс.mp4"] and "Отчёты й/вкс.mp4" in service.ledger.records

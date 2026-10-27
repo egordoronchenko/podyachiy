@@ -26,11 +26,25 @@ FFMPEG_PARALLEL = 2
 _ffmpeg_slots = threading.BoundedSemaphore(FFMPEG_PARALLEL)
 
 
+# Файл записи — не обязательно то, чем назван: под именем .mp4 может лежать плейлист (HLS, concat),
+# и ffmpeg по нему пошёл бы в сеть (http, tcp, rtmp…) или собрал бы вход из кусков других файлов
+# протоколами concat:, subfile:, data:. Поэтому входу ffmpeg и ffprobe разрешён только протокол file —
+# обычный файл на диске. Формат входа не задаётся: записи приходят в десятке контейнеров, и
+# определяет их сам ffmpeg. Формат того, что ffmpeg пишет, назван явно (-f), а не угадан по имени.
+LOCAL_ONLY = ["-protocol_whitelist", "file"]
+
+
 def run_ffmpeg(args: list[str], **kwargs) -> subprocess.CompletedProcess:
-    """Любой запуск ffmpeg — через эту функцию: она ждёт свободного места. Зовётся
-    из потоков (asyncio.to_thread), поэтому ожидание событийный цикл не держит."""
+    """Любой запуск ffmpeg — через эту функцию: она ждёт свободного места и разрешает входу
+    только файлы на диске. Зовётся из потоков (asyncio.to_thread), поэтому ожидание событийный
+    цикл не держит."""
     with _ffmpeg_slots:
-        return subprocess.run(["ffmpeg", *args], **kwargs)
+        return subprocess.run(["ffmpeg", *LOCAL_ONLY, *args], **kwargs)
+
+
+def run_ffprobe(args: list[str], **kwargs) -> subprocess.CompletedProcess:
+    """Любой запуск ffprobe — через эту функцию: входу разрешены только файлы на диске."""
+    return subprocess.run(["ffprobe", *LOCAL_ONLY, *args], **kwargs)
 
 
 SILENCE_DB = -60.0  # ниже этого порога в дорожке нет сигнала вообще
@@ -38,8 +52,8 @@ AUDIO_SUFFIX = ".audio.mp3"   # имя извлечённой дорожки р�
 
 
 def has_audio_stream(path: Path) -> bool:
-    proc = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries",
+    proc = run_ffprobe(
+        ["-v", "error", "-select_streams", "a", "-show_entries",
          "stream=index", "-of", "csv=p=0", str(path)],
         capture_output=True, text=True, timeout=120,
     )
@@ -89,7 +103,7 @@ def ensure_audio(src: Path, out_dir: Path, stem: str, force: bool, log) -> Path:
     tmp = cached.with_suffix(".tmp.mp3")
     log("извлекаю звук ffmpeg → mono mp3 64k")
     proc = run_ffmpeg(
-        ["-y", "-i", str(src), "-vn", "-ac", "1", "-b:a", "64k", str(tmp)],
+        ["-y", "-i", str(src), "-vn", "-ac", "1", "-b:a", "64k", "-f", "mp3", str(tmp)],
         capture_output=True, text=True,
     )
     if proc.returncode != 0:

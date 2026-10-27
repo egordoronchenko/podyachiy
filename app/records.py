@@ -70,8 +70,10 @@ def _relocate(cfg, service, file: str, target: str, also=None) -> str:
     twins = [p for p in (here.iterdir() if here.is_dir() else ())
              if p.is_file() and p.suffix.lower() in media.MEDIA_EXTS
              and p.stem.lower() == new_stem.lower() and p != cfg.inbox / file]
-    if (twins or (cfg.inbox / target).exists() or service.ledger.get(target) is not None
-            or (new_out.exists() and new_out != old_out)):
+    # на томе без различия регистра «План.mp4» при «план.mp4» «уже есть» — это она сама (folders.same_place)
+    if (twins or ((cfg.inbox / target).exists() and not folders.same_place(cfg.inbox / file, cfg.inbox / target))
+            or service.ledger.get(target) is not None
+            or (new_out.exists() and new_out != old_out and not folders.same_place(old_out, new_out))):
         raise RecordError(409, "запись с таким именем в этой папке уже есть")
     # подпапка с тем же именем: её результаты лягут в ту же папку результатов, что и у записи
     if any(p.is_dir() and p.name.lower() == new_stem.lower() for p in (here.iterdir() if here.is_dir() else ())):
@@ -88,9 +90,10 @@ def _relocate(cfg, service, file: str, target: str, also=None) -> str:
             moved[field] = (sub.parent / _swap(sub.name, stem, new_stem)).as_posix()
 
     renamed: list[tuple[Path, Path]] = []                     # что переехало на диске: откуда → куда
+    rewritten: list[tuple[Path, bytes]] = []                  # маркеры до перезаписи
 
     def shift(old: Path, new: Path) -> None:
-        old.rename(new)
+        folders.move(old, new)
         renamed.append((old, new))
 
     src = cfg.inbox / file
@@ -104,19 +107,24 @@ def _relocate(cfg, service, file: str, target: str, also=None) -> str:
             for p in [p for p in new_out.rglob("*") if p.is_file()]:
                 if p.name != _swap(p.name, stem, new_stem):
                     shift(p, p.with_name(_swap(p.name, stem, new_stem)))
+        # Маркер рядом с результатами — копия строки журнала: путь в нём тоже новый. Пишется до
+        # записи базы: после неё сбой на диске означал бы действие, уже записанное в базу, и отказ 500
+        # человеку, который его повторит — и получит «записи нет» или «имя занято».
+        for suffix in (ledger.MARKER_SUFFIX, ERROR_SUFFIX):
+            marker = new_out / f"{new_stem}{suffix}"
+            if marker.is_file():
+                rewritten.append((marker, marker.read_bytes()))
+                marker.write_text(json.dumps(moved, ensure_ascii=False, indent=2), encoding="utf-8")
         with service.ledger.db.write():
             service.ledger.rekey(file, moved)                 # отметки поручений переезжают вместе со строкой
             if also:
                 also(target)
     except BaseException:
+        for marker, was in reversed(rewritten):
+            marker.write_bytes(was)
         for old, new in reversed(renamed):
-            new.rename(old)
+            folders.move(new, old)
         raise
-    # маркер рядом с результатами — копия строки журнала: путь в нём тоже новый
-    for suffix in (ledger.MARKER_SUFFIX, ERROR_SUFFIX):
-        marker = new_out / f"{new_stem}{suffix}"
-        if marker.is_file():
-            marker.write_text(json.dumps(moved, ensure_ascii=False, indent=2), encoding="utf-8")
     return target
 
 
@@ -124,7 +132,7 @@ def rename(cfg, service, file: str, name: str, also=None) -> str:
     """Новое имя записи в той же папке; расширение остаётся прежним. Возвращает новый путь.
     also(новый путь) — что ещё записать в базу той же транзакцией: словарь записи, событие журнала."""
     ext = PurePosixPath(file).suffix
-    name = name.strip()
+    name = upload.nfc(name.strip())
     if ext and name.lower().endswith(ext.lower()):            # имя вписали вместе с расширением
         name = name[:-len(ext)].rstrip()
     try:
@@ -159,6 +167,7 @@ def remove(cfg, service, file: str, by: str, also=None) -> dict:
     stamp = folders.trash_stamp(cfg)          # две записи удалили в одну секунду — папки корзины разные
     done = {"trash": f"{folders.TRASH}/{stamp}", "keep_days": folders.TRASH_DAYS}
     moved = []
+    note = cfg.outbox / folders.TRASH / stamp
     try:
         for src, root in ((cfg.inbox / file, cfg.inbox), (cfg.outbox / _parent(file) / stem, cfg.outbox)):
             if src.exists():
@@ -171,16 +180,15 @@ def remove(cfg, service, file: str, by: str, also=None) -> dict:
             service.ledger.forget(file)
             if also:
                 also(done)
+            # что это было и откуда — рядом с результатами, чтобы запись можно было вернуть руками.
+            # До записи базы: не записалась опись — удаления нет, а не «удалено, но отказ 500»
+            folders.trash_note(note, {"file": file, "by": by, "at": stamp, "moved": [str(binned) for _, binned in moved],
+                                      "records": [record], "marks": {file: noted} if noted else {}})
     except BaseException:
+        (note / folders.NOTE).unlink(missing_ok=True)
         for place, binned in reversed(moved):
             binned.rename(place)
             folders._tidy(binned.parent)
+        folders._tidy(note)
         raise
-    # что это было и откуда — рядом с результатами, чтобы запись можно было вернуть руками
-    note = cfg.outbox / folders.TRASH / stamp
-    note.mkdir(parents=True, exist_ok=True)
-    (note / "удалено.json").write_text(json.dumps(
-        {"file": file, "by": by, "at": stamp, "moved": [str(binned) for _, binned in moved],
-         "records": [record], "marks": {file: noted} if noted else {}},
-        ensure_ascii=False, indent=1), encoding="utf-8")
     return done

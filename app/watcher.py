@@ -15,13 +15,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import subprocess
 import threading
 import time
+import unicodedata
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
 
-from . import marks, media, notify, pipeline
+from . import folders, marks, media, notify, pipeline, upload
 from .config import Settings
 from .journal import Journal
 from .ledger import MAX_FAILURES, RETRY_AFTER_SEC, RETRY_STATUSES, Ledger
@@ -31,6 +34,90 @@ TEMP_SUFFIXES = {".tmp", ".part", ".crdownload", ".partial", ".!ut"}
 TEMP_PREFIXES = ("~$",)
 # Исход прогона, который база не приняла, пробуем записать снова не чаще этого
 SAVE_RETRY_SEC = 30
+# Недокопированный файл (cut_short): чем он выдаёт себя ffmpeg — у mp4 и mov, у mkv и webm
+CUT_MARKS = ("partial file", "File ended prematurely")
+CUT_TAIL_SEC = 30            # с какого места до конца звука читать файл, чтобы найти его настоящий конец
+CUT_GAP_SEC = 2.0            # насколько звук в файле может кончаться раньше, чем обещает заголовок
+MP4_HEADS = {b"ftyp", b"moov", b"mdat", b"wide", b"free", b"skip"}    # первый блок файла mp4 и mov (m4a, m4v)
+
+
+def cut_short(path: Path) -> str | None:
+    """Чем файл похож на недокопированный, или None.
+
+    Устойчивость размера этого не видит: копия по сети, замершая посреди файла, тоже стоит на месте.
+    Платить за распознавание обрубка нельзя, а взятый в обработку файл автоматика второй раз не
+    возьмёт. Проверки — бесплатные и только те, что на целых файлах не срабатывают:
+      - заголовок WAV называет размер файла, а на диске его меньше;
+      - файл mp4 (по первому блоку) ffmpeg не открывает: оглавление пишется в конце, у обрубка
+        его нет;
+      - ffmpeg сам говорит, что файл кончился раньше времени (CUT_MARKS): у mp4 с оглавлением в
+        начале нет данных, на которые оно указывает, у mkv и webm файл обрывается посреди блока;
+      - заголовок дорожки называет её длительность (mp4, mp3 с заголовком Xing, flac, wma), а звук
+        в файле кончается раньше больше чем на CUT_GAP_SEC. Длительность, которую ffmpeg лишь
+        прикинул по битрейту, в счёт не идёт.
+    Потоки без длины в заголовке (ogg, aac, mp3 без Xing, ts) так не проверить — у них обрубок
+    неотличим от короткой записи. Файл, который ffmpeg не разобрал вовсе, — не сюда: обработка
+    скажет «нет звука», денег это не стоит."""
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as f:
+            head = f.read(12)
+    except OSError:
+        return None
+    if head[:4] == b"RIFF" and head[8:12] == b"WAVE":
+        declared = int.from_bytes(head[4:8], "little") + 8
+        if declared not in (8, 0xFFFFFFFF + 8) and declared > size:
+            return f"по заголовку WAV в файле {declared} байт, а в нём {size}"
+
+    def probe(*args: str) -> subprocess.CompletedProcess | None:
+        try:
+            return media.run_ffprobe([*args, str(path)], capture_output=True, text=True, timeout=120)
+        except (OSError, subprocess.SubprocessError):
+            return None
+
+    def mark(said: str) -> str | None:
+        return next((f"ffmpeg: «{m}»" for m in CUT_MARKS if m in said), None)
+
+    head_info = probe("-v", "warning", "-select_streams", "a:0", "-show_entries", "format=duration:stream=duration",
+                      "-of", "json")
+    if head_info is None:
+        return None
+    if found := mark(head_info.stderr or ""):
+        return found
+    if head_info.returncode != 0 and head[4:8] in MP4_HEADS:
+        # mp4 пишется с оглавлением в конце: у обрубка его нет, и ffmpeg файл не открывает вовсе.
+        # Файл, который mp4 только назван, сюда не попадает: первого блока контейнера у него нет
+        said = (head_info.stderr or "").strip().splitlines()
+        return "ffmpeg не открывает файл mp4" + (f": «{said[0].split('] ', 1)[-1]}»" if said else "")
+    try:
+        info = json.loads(head_info.stdout) if head_info.returncode == 0 else {}
+    except ValueError:
+        info = {}
+    if not info.get("streams"):
+        return None                     # не разобран или звука нет — это скажет обработка
+    own = info["streams"][0].get("duration")
+    try:
+        length = float(own or info.get("format", {}).get("duration"))
+    except (TypeError, ValueError):
+        return None
+    tail = probe("-v", "error", "-select_streams", "a:0", "-read_intervals", f"{max(0.0, length - CUT_TAIL_SEC)}%",
+                 "-show_entries", "packet=pts_time,duration_time", "-of", "csv=p=0")
+    if tail is None:
+        return None
+    if found := mark(tail.stderr or ""):
+        return found
+    if own is None or "Estimating duration from bitrate" in (head_info.stderr or ""):
+        return None
+    last = 0.0
+    for line in tail.stdout.split():
+        start, _, took = line.partition(",")
+        try:
+            last = max(last, float(start) + (float(took) if took and took != "N/A" else 0.0))
+        except ValueError:
+            continue
+    if length - last > CUT_GAP_SEC:
+        return f"по заголовку звук длится {length:.0f} с, а в файле он кончается на {last:.0f} с"
+    return None
 
 
 def hidden(rel: str) -> bool:
@@ -51,6 +138,7 @@ class Pending:
     stable: int = 1              # сколько замеров подряд совпали
     since: float = 0.0           # monotonic: когда этот замер увидели впервые
     first_seen: str = ""
+    cut: str | None = None       # чем файл в этом замере похож на недокопированный (cut_short); None — не проверен
 
     def quiet_sec(self) -> float:
         return time.monotonic() - self.since
@@ -111,6 +199,7 @@ class Service:
     last_scan: str | None = None
     skipped_outbox: bool = False
     warned_changed: set[str] = field(default_factory=set)
+    warned_form: set[str] = field(default_factory=set)      # имена в разложенной форме, о которых уже сказано
     # Обход входной папки и действия с записью (records.py) друг друга исключают: сканер
     # сверяет файлы на диске с журналом обработки по пути, а переименование меняет и то,
     # и другое не одним шагом. Застань сканер середину — принял бы запись за новую.
@@ -165,6 +254,12 @@ class Service:
         # убирает из очереди, и при таком порядке чтения она не выпадет из обоих списков.
         busy = ({i.path for i in list(self.queue)} | {j["file"] for j in list(self.running)}
                 | set(list(self.unsaved)))
+        if self._folders_to_nfc(candidates, busy):
+            try:
+                candidates = sorted(self.cfg.inbox.rglob("*"))
+            except OSError as e:
+                self.log(f"входная папка недоступна: {e}")
+                return
 
         for p in candidates:
             try:
@@ -216,20 +311,117 @@ class Service:
                 prev.stable += 1
             else:
                 prev.size, prev.mtime = st.st_size, st.st_mtime
-                prev.stable, prev.since = 1, time.monotonic()
+                prev.stable, prev.since, prev.cut = 1, time.monotonic(), None
 
             # решение по фактически прошедшему времени, а не по числу замеров:
             # требование — размер и mtime не менялись STABLE_SEC
             if prev.quiet_sec() >= self.cfg.stable_sec:
+                if prev.cut is None:
+                    prev.cut = cut_short(p) or ""
+                    if prev.cut:
+                        self.log(f"{rel}: похоже, файл докопирован не до конца ({prev.cut}) — в обработку не беру, "
+                                 f"жду, пока он изменится. Если запись такая и есть — запустите её вручную")
+                if prev.cut:
+                    continue
+                taken = self._file_to_nfc(rel, busy)
+                if taken is None:
+                    continue                    # рядом ещё копируется другой файл той же папки — следующим обходом
                 self.pending.pop(rel, None)
-                self.queue.append(QueueItem(path=rel))
+                self.queue.append(QueueItem(path=taken))
                 self.log(f"файл дописан (не менялся {prev.quiet_sec():.0f} с, "
                          f"совпавших замеров подряд: {prev.stable}, {human_size(st.st_size)}): "
-                         f"{rel} → в очередь (в очереди {len(self.queue)})")
+                         f"{taken} → в очередь (в очереди {len(self.queue)})")
 
         # файл исчез или переехал — забываем накопленную стабильность
         for rel in [r for r in self.pending if r not in seen]:
             self.pending.pop(rel, None)
+
+    # ---------- имена в разложенной форме (NFD) ----------
+    # Страница, база и права знают имена в составной форме (upload.nfc): так их приводит всё, что
+    # приходит от людей. А Mac, копируя по сети, кладёт «й» и «ё» разложенными — и запись под таким
+    # именем жила бы отдельно от того, что о ней знают страница и права. Сканер приводит к составной
+    # форме имена новых файлов и папок на диске, о которых журнал обработки ещё ничего не знает.
+    # Записанное в журнал под разложенным именем остаётся как есть: его строка журнала, права и
+    # словари — под прежним именем.
+
+    def _form_kept(self, rel: str, why: str) -> None:
+        if rel not in self.warned_form:
+            self.warned_form.add(rel)
+            self.log(f"{rel}: имя в разложенной форме Unicode (так пишет macOS), {why} — оставляю как есть")
+
+    def _nfc_block(self, rel: str, busy: set[str], own: str = "") -> str | None:
+        """Почему имя rel сейчас нельзя привести к составной форме: "wait" — внутри ещё копируется
+        или обрабатывается файл (own — тот, ради которого и переименовываем); текст — насовсем; None — можно."""
+        old, new = self.cfg.inbox / rel, self.cfg.inbox / Path(rel).with_name(upload.nfc(Path(rel).name))
+        if new.exists() and not folders.same_place(old, new):      # тот же файл — у тома, что форм не различает
+            return f"а рядом уже есть «{new.name}» в составной форме"
+        inside = lambda path: path == rel or path.startswith(rel + "/")
+        if any(inside(path) for path in self.ledger.records):
+            return "а журнал обработки знает записи под ним"
+        # ждать — пока внутри копируется файл; докопированные соседи (ждут того же) не держат
+        copying = [path for path, seen in self.pending.items() if seen.quiet_sec() < self.cfg.stable_sec]
+        if any(inside(path) and path != own for path in [*copying, *busy]):
+            return "wait"
+        return None
+
+    def _rename_nfc(self, rel: str) -> str:
+        new = Path(rel).with_name(upload.nfc(Path(rel).name)).as_posix()
+        folders.move(self.cfg.inbox / rel, self.cfg.inbox / new)
+        self.log(f"{rel}: имя приведено к составной форме Unicode (разложенным его пишет macOS) — {new}")
+        return new
+
+    def _folders_to_nfc(self, candidates: list[Path], busy: set[str]) -> bool:
+        """Папки в разложенной форме без файлов внутри — к составной. Папка с файлами — вместе с ними,
+        когда они докопированы (_file_to_nfc): посреди копии папку не переименовывают. Переименовано ли
+        что-нибудь."""
+        moved: list[str] = []
+        for p in candidates:
+            try:
+                rel = p.relative_to(self.cfg.inbox).as_posix()
+                if unicodedata.is_normalized("NFC", p.name) or not p.is_dir():
+                    continue
+            except (OSError, ValueError):
+                continue
+            if hidden(rel) or self._under_outbox(rel) or any(rel.startswith(m + "/") for m in moved):
+                continue
+            why = self._nfc_block(rel, busy)
+            if why and why != "wait":
+                self._form_kept(rel, why)
+                continue
+            try:
+                if why == "wait" or any(c.is_file() for c in p.rglob("*")):
+                    continue                    # файлы в ней — когда докопируются (_file_to_nfc)
+                self._rename_nfc(rel)
+            except OSError as e:
+                self._form_kept(rel, f"а переименовать не вышло ({e.strerror or e})")
+                continue
+            moved.append(rel)
+        return bool(moved)
+
+    def _file_to_nfc(self, rel: str, busy: set[str]) -> str | None:
+        """Докопированный файл — под именем в составной форме, вместе с папками в разложенной над ним.
+        Отдаёт путь, под которым запись идёт в очередь; None — подождать: в той же папке ещё
+        копируется другой файл. Докопированные соседи по такой папке найдутся под её новым именем
+        следующим обходом."""
+        parts = rel.split("/")
+        for n in range(1, len(parts) + 1):
+            here = "/".join(parts[:n])
+            if unicodedata.is_normalized("NFC", parts[n - 1]):
+                continue
+            why = self._nfc_block(here, busy, own=rel)
+            if why == "wait":
+                return None
+            if why:
+                self._form_kept(here, why)
+                return "/".join(parts)
+            try:
+                new = self._rename_nfc(here)
+            except OSError as e:
+                self._form_kept(here, f"а переименовать не вышло ({e.strerror or e})")
+                return "/".join(parts)
+            parts[n - 1] = new.rsplit("/", 1)[-1]
+            rel = "/".join(parts)
+        return "/".join(parts)
 
     async def scan_loop(self) -> None:
         self.log(f"сканер запущен: {self.cfg.inbox} → {self.cfg.outbox}, "

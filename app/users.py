@@ -56,6 +56,7 @@ import hmac
 import re
 import secrets
 import time
+import unicodedata
 from dataclasses import dataclass
 
 from . import db
@@ -113,7 +114,8 @@ def _link_hash(token: str) -> str:
 
 
 def norm_folder(folder: str) -> str:
-    return "/".join(p for p in folder.replace("\\", "/").split("/") if p.strip())
+    """Папка прав: без лишних «/», буквы — в составной форме (NFC), как у путей в upload.folder_rel."""
+    return "/".join(unicodedata.normalize("NFC", p) for p in folder.replace("\\", "/").split("/") if p.strip())
 
 
 NONE, ONLY, TREE = "none", "only", "tree"       # области права: нет, только папка, папка с подпапками

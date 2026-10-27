@@ -20,6 +20,8 @@ import binascii
 import csv
 import dataclasses
 import datetime
+import errno
+import hashlib
 import io
 import ipaddress
 import os
@@ -48,7 +50,7 @@ from . import (about, apidoc, backup, brand, costbook, db, dictionary, directory
 from .config import Settings
 from .ledger import REMOVED, Ledger
 from .logbook import Logbook
-from .watcher import Service
+from .watcher import Service, hidden
 
 STATIC = Path(__file__).parent / "static"
 SKILL = Path(__file__).parent / "skill"      # навык для ИИ-клиентов и тексты для модели — шаблонами
@@ -448,17 +450,24 @@ async def revalidate_pages(request, call_next):
 
 # Личный режим входа не спрашивает: сервис отдаёт всё любому, кто до него достучался. Достучаться может
 # и чужой сайт, открытый в браузере на этом же компьютере. Его домен переводят на 127.0.0.1 (DNS
-# rebinding) — и страница чужого сайта читает сервис как свой; или его страница отправляет сервису
-# форму — а пересборка протокола платная. Поэтому в личном режиме сервис отвечает только по своим
-# адресам: localhost (и имена *.localhost), адрес IP (его чужой домен не подменит), имя компьютера без
-# точки (так его открывают из локальной сети) и адрес из PUBLIC_URL. А запрос, который что-то меняет,
-# со страницы другого сайта — заголовок Origin не того адреса, по которому сервис открыт, и не
-# PUBLIC_URL — отклоняет. Программы (curl, ИИ-клиенты) Origin не шлют и работают как раньше. В
-# корпоративном режиме без входа сервис не отдаёт ничего, а кука входа к чужому домену не уходит.
+# rebinding) — и страница чужого сайта читает сервис как свой. Поэтому в личном режиме сервис отвечает
+# только по своим адресам: localhost (и имена *.localhost), адрес IP (его чужой домен не подменит), имя
+# компьютера без точки (так его открывают из локальной сети) и адрес из PUBLIC_URL. В корпоративном
+# режиме без входа сервис не отдаёт ничего, а кука входа к чужому домену не уходит.
+#
+# Изменяющий запрос со страницы другого сайта (CSRF) сервис не выполняет в обоих режимах. Браузер сам
+# прикладывает к запросу куку входа, с какой бы страницы тот ни ушёл, — и с соседнего поддомена:
+# SameSite=Lax его своим считает. В личном режиме и куки не нужно, а пересборка протокола платная.
+# Чужая страница — заголовок Origin не того адреса, по которому сервис открыт, и не PUBLIC_URL; Origin
+# срезан (прокси, расширение браузера) — Sec-Fetch-Site «cross-site» или «same-site». Запрос с ключом
+# или паролем в заголовке Authorization не проверяется: этот заголовок браузер сам не приложит, а чужой
+# странице поставить его не даст без разрешения CORS, которого у сервиса нет. Программы (curl,
+# ИИ-клиенты) Origin не шлют и работают как раньше. Вход и заявки с чужой страницы — тоже отказ.
 FOREIGN_HOST = ("сервис открыт не по своему адресу: в личном режиме он отвечает по localhost, адресу IP, "
                 "имени компьютера и адресу из PUBLIC_URL в .env")
 FOREIGN_PAGE = "запрос пришёл со страницы другого сайта — сервис его не выполняет"
 CHANGING = ("POST", "PUT", "PATCH", "DELETE")
+FOREIGN_FETCH = ("cross-site", "same-site")
 
 
 def _own_host(host: str) -> bool:
@@ -476,12 +485,30 @@ def _own_host(host: str) -> bool:
             or bool(cfg.public_url) and name == urlsplit(cfg.public_url).hostname)
 
 
+def _netloc(address: str) -> str:
+    """Имя и порт из адреса — без порта по умолчанию: «https://Имя:443» и «https://имя» — один адрес."""
+    parts = urlsplit(address)
+    port = {"http": 80, "https": 443}.get(parts.scheme)
+    netloc = parts.netloc.lower()
+    return netloc.removesuffix(f":{port}") if port else netloc
+
+
 def _own_page(origin: str, host: str) -> bool:
     """Пришёл ли запрос со страницы самого сервиса: Origin — тот адрес, по которому он открыт, или
     PUBLIC_URL (за прокси Host бывает внутренним). Origin «null» — неизвестно откуда, то есть не своя."""
-    seen = urlsplit(origin).netloc.lower()
-    return bool(seen) and (seen == host.lower()
-                           or bool(cfg.public_url) and seen == urlsplit(cfg.public_url).netloc.lower())
+    seen = _netloc(origin)
+    return bool(seen) and (seen == _netloc(f"{urlsplit(origin).scheme}://{host}")
+                           or bool(cfg.public_url) and seen == _netloc(cfg.public_url))
+
+
+def _foreign_page(request: Request) -> bool:
+    """Изменяющий запрос, который браузер отправил со страницы другого сайта сам, без ключа."""
+    if request.method not in CHANGING or "authorization" in request.headers:
+        return False
+    origin = request.headers.get("origin")
+    if origin is None:
+        return request.headers.get("sec-fetch-site", "") in FOREIGN_FETCH
+    return not _own_page(origin, request.headers.get("host", ""))
 
 
 @app.middleware("http")
@@ -490,10 +517,50 @@ async def own_addresses_only(request: Request, call_next):
         host = request.headers.get("host", "")
         if host and not _own_host(host):
             return JSONResponse({"detail": FOREIGN_HOST}, status_code=400)
-        origin = request.headers.get("origin")
-        if request.method in CHANGING and origin is not None and not _own_page(origin, host):
-            return JSONResponse({"detail": FOREIGN_PAGE}, status_code=403)
+    if _foreign_page(request):
+        return JSONResponse({"detail": FOREIGN_PAGE}, status_code=403)
     return await call_next(request)
+
+
+# Заголовки защиты — на каждый ответ. CSP: сценарии — только файлы самого сервиса (встроенных в
+# страницы нет, обработчиков on…= в разметке тоже), стили — свои файлы и атрибуты style (ими
+# страницы пользуются), картинки — свои и blob: (предпросмотр логотипа перед загрузкой), звук и
+# запросы — только к себе; плагинов нет, внутри чужой страницы сервис не открывается
+# (frame-ancestors), форма уходит только сюда. Карту записи — самостоятельный файл со своим
+# сценарием внутри — сервис отдаёт с разрешением ровно этого сценария по хешу (_page_policy).
+# Referrer-Policy same-origin: в адресах страниц — имена папок и записей, на чужой сайт по ссылке
+# из протокола они не уходят ни целиком, ни именем сервера. HSTS — только по HTTPS: схему за прокси
+# uvicorn берёт из X-Forwarded-Proto лишь от адресов FORWARDED_ALLOW_IPS (см. _secure); по HTTP
+# заголовок бессмыслен, а с поддоменами и списком preload — решение владельца домена, не сервиса.
+CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob:; "
+       "media-src 'self'; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; "
+       "form-action 'self'; frame-ancestors 'none'")
+HSTS = "max-age=31536000"
+# Ответы API — данные людей: браузер не кладёт их в кэш на диске (на общем компьютере их прочёл бы
+# следующий). Это и выгрузки (DOCX, PDF, CSV, книга, карта), и звук записи — всё под /api/.
+# Ответ, назначивший себе Cache-Control сам, остаётся как есть.
+NO_STORE = "no-store"
+
+
+def _page_policy(page: str) -> str:
+    """CSP для страницы со своим встроенным сценарием: разрешён ровно он — по хешу SHA-256."""
+    hashes = "".join(f" 'sha256-{base64.b64encode(hashlib.sha256(code.encode()).digest()).decode()}'"
+                     for code in re.findall(r"<script>(.*?)</script>", page, flags=re.S))
+    return CSP.replace("script-src 'self'", "script-src 'self'" + hashes, 1)
+
+
+@app.middleware("http")
+async def protective_headers(request: Request, call_next):
+    response = await call_next(request)
+    headers = response.headers
+    headers.setdefault("Content-Security-Policy", CSP)
+    headers["X-Content-Type-Options"] = "nosniff"
+    headers["Referrer-Policy"] = "same-origin"
+    if request.url.scheme == "https":
+        headers["Strict-Transport-Security"] = HSTS
+    if request.url.path.startswith("/api/") and "cache-control" not in headers:
+        headers["Cache-Control"] = NO_STORE
+    return response
 
 
 def domain_off() -> str:
@@ -756,6 +823,21 @@ def jot(kind: str, who: users.Access, **fields) -> None:
     trail.write(kind, who.login, **fields, **_via(who))
 
 
+# Сбой файловой системы — отказ 500. Клиенту — что не получилось и почему, словами и без путей
+# сервера: текст OSError их содержит («[Errno 13] Permission denied: '/data/inbox/…'»), а клиенту
+# устройство сервера знать незачем. Целиком, с путём, — в журнал работы.
+OS_FAULTS = {errno.EACCES: "нет прав на запись в папку", errno.EPERM: "нет прав на запись в папку",
+             errno.EROFS: "папка подключена только для чтения", errno.ENOSPC: "на диске нет места",
+             errno.ENOENT: "папки или файла уже нет", errno.ENOTEMPTY: "папка не пуста",
+             errno.EIO: "сбой чтения или записи на диске"}
+OS_FAULT_OTHER = "сбой файловой системы, подробности — в журнале работы сервиса"
+
+
+def _os_fault(what: str, e: OSError) -> HTTPException:
+    log(f"ВНИМАНИЕ: {what}: {e}")
+    return HTTPException(500, f"{what}: {OS_FAULTS.get(e.errno, OS_FAULT_OTHER)}")
+
+
 def _base(request: Request) -> str:
     """Адрес сервиса, как его открывают люди: PUBLIC_URL из .env, а не задан — адрес запроса."""
     return cfg.public_url or str(request.base_url).rstrip("/")
@@ -807,7 +889,8 @@ def help_page():
 @app.get("/install-guide")
 def install_guide_page():
     """Инструкция по установке и сопровождению — администратору, там же, где справка. Файл собран
-    из install/README.md (tools/docs_build.py) и самодостаточен: данных установки в нём нет."""
+    из install/README.md (tools/docs_build.py) со сценарием install-guide.js рядом; данных
+    установки в нём нет."""
     return FileResponse(STATIC / "install-guide.html")
 
 
@@ -1229,26 +1312,28 @@ async def make_folder(req: FolderRequest, who: users.Access = Depends(viewer)):
     try:
         await asyncio.to_thread((cfg.inbox / rel).mkdir, parents=True)
     except OSError as e:
-        raise HTTPException(500, f"не удалось создать папку: {e}")
+        raise _os_fault("не удалось создать папку", e)
     log(f"создана папка: {rel}" + (f" ({who.login})" if who.login else ""))
     jot("folder_create", who, folder=rel)
     return {"ok": True, "path": rel}
 
 
 @app.get("/api/upload")
-async def upload_state(name: str, size: int, dir: str = "", who: users.Access = Depends(viewer)):
-    """Сколько байт записи уже принято: с этого места страница продолжает после обрыва."""
+async def upload_state(name: str, size: int, stamp: str, dir: str = "", who: users.Access = Depends(viewer)):
+    """Сколько байт записи уже принято: с этого места страница продолжает после обрыва.
+    stamp — время изменения файла у человека: по нему и по логину загрузка не продолжит чужую
+    с тем же именем и размером (upload.part_path)."""
     rel = _upload_rel(dir, name, who)
     _not_in_ledger(rel)
     try:
-        have = await asyncio.to_thread(upload.received, cfg.inbox, rel, size, cfg.upload_max_bytes)
+        have = await asyncio.to_thread(upload.received, cfg.inbox, rel, size, cfg.upload_max_bytes, who.login, stamp)
     except upload.UploadError as e:
         raise HTTPException(e.status, e.detail)
     return {"offset": have, "chunk": upload.CHUNK_BYTES}
 
 
 @app.put("/api/upload")
-async def upload_chunk(request: Request, name: str, size: int, offset: int, dir: str = "",
+async def upload_chunk(request: Request, name: str, size: int, offset: int, stamp: str, dir: str = "",
                        who: users.Access = Depends(viewer)):
     """Очередная часть записи — телом запроса, как есть."""
     rel = _upload_rel(dir, name, who)
@@ -1263,11 +1348,11 @@ async def upload_chunk(request: Request, name: str, size: int, offset: int, dir:
     try:
         async with upload_lock:
             have, done = await asyncio.to_thread(
-                upload.append, cfg.inbox, rel, size, offset, bytes(data))
+                upload.append, cfg.inbox, rel, size, offset, bytes(data), who.login, stamp)
     except upload.UploadError as e:
         raise HTTPException(e.status, e.detail)
     except OSError as e:
-        raise HTTPException(500, f"не удалось записать файл: {e}")
+        raise _os_fault("не удалось записать файл", e)
     if done:
         log(f"загружена через страницу: {rel} ({size / 1048576:.1f} МБ)"
             + (f" ({who.login})" if who.login else ""))
@@ -1276,10 +1361,10 @@ async def upload_chunk(request: Request, name: str, size: int, offset: int, dir:
 
 
 @app.delete("/api/upload")
-async def upload_cancel(name: str, size: int, dir: str = "", who: users.Access = Depends(viewer)):
+async def upload_cancel(name: str, size: int, stamp: str, dir: str = "", who: users.Access = Depends(viewer)):
     """Человек отменил загрузку: принятое больше не нужно."""
     rel = _upload_rel(dir, name, who)
-    await asyncio.to_thread(upload.cancel, cfg.inbox, rel, size)
+    await asyncio.to_thread(upload.cancel, cfg.inbox, rel, size, who.login, stamp)
     return {"ok": True}
 
 
@@ -1623,11 +1708,13 @@ async def v1_tasks_csv(request: Request, dir: str = "", since: str = "", until: 
                     "Комментарий", "Кто задал срок"])
     for t in tasks:
         owner = (t["who"] or "не назван") + (" (не участвовал)" if t["absent"] else "")
-        sheet.writerow([owner, t["task"], marks.day(t["due"]) if t["due"] else "", t["due_text"] or "",
-                        "" if t["due"] else t["due_date"] or "", "да" if t["overdue"] else "", t["status"] or "",
-                        t["title"] or "", t["date"], t["dir"], PurePosixPath(t["file"]).name, t["at"] or "", t["link"],
-                        "да" if t["done"] else "", t["done_by"] or "", (t["done_at"] or "")[:16].replace("T", " "),
-                        t["comment"] or "", t["due_by"] or ""])
+        row = [owner, t["task"], marks.day(t["due"]) if t["due"] else "", t["due_text"] or "",
+               "" if t["due"] else t["due_date"] or "", "да" if t["overdue"] else "", t["status"] or "",
+               t["title"] or "", t["date"], t["dir"], PurePosixPath(t["file"]).name, t["at"] or "", t["link"],
+               "да" if t["done"] else "", t["done_by"] or "", (t["done_at"] or "")[:16].replace("T", " "),
+               t["comment"] or "", t["due_by"] or ""]
+        # строки протокола и имена записей — не формулы для Excel (costbook.cell)
+        sheet.writerow([costbook.cell(value) for value in row])
     # метка порядка байтов — чтобы Excel прочитал кириллицу
     return Response("\ufeff" + out.getvalue(), media_type="text/csv; charset=utf-8",
                     headers={"Content-Disposition": 'attachment; filename="tasks.csv"'})
@@ -1720,7 +1807,7 @@ async def v1_upload(request: Request, dir: str = "", name: str = "", who: users.
             raise HTTPException(400, "загрузка оборвалась: соединение закрылось раньше, чем файл принят целиком, — "
                                      "отправьте файл заново")
         if isinstance(e, OSError):
-            raise HTTPException(500, f"не удалось записать файл: {e}")
+            raise _os_fault("не удалось записать файл", e)
         raise
     log(f"загружена запросом: {rel} ({size / 1048576:.1f} МБ) ({who.login}"
         + (f", ключ «{who.key}»" if who.key else "") + ")")
@@ -1886,11 +1973,13 @@ def _map(file: str, download: bool, who: users.Access) -> Response:
         page = mindmap.with_org(page, org)
     if download:
         return Response(page, media_type="text/html; charset=utf-8",
-                        headers={"Content-Disposition": "attachment; filename*=UTF-8''" + quote(name, safe="")})
+                        headers={"Content-Disposition": "attachment; filename*=UTF-8''" + quote(name, safe=""),
+                                 "Content-Security-Policy": _page_policy(page)})
     # страницу показывает сам сервис — в шапке кнопка возврата к этой записи; в скачанном файле её нет
     place = {"path": file.rpartition("/")[0], "open": file}
     back = "/?" + urlencode({k: v for k, v in place.items() if v}, quote_via=quote)
-    return Response(mindmap.with_back(page, back), media_type="text/html; charset=utf-8")
+    page = mindmap.with_back(page, back)
+    return Response(page, media_type="text/html; charset=utf-8", headers={"Content-Security-Policy": _page_policy(page)})
 
 
 @app.get("/api/export")
@@ -2067,7 +2156,7 @@ async def _record_action(action, file: str, who: users.Access, *args, also=None)
         except records.RecordError as e:
             raise HTTPException(e.status, e.detail)
         except OSError as e:
-            raise HTTPException(500, f"не получилось: {e}")
+            raise _os_fault("не получилось", e)
 
 
 class RecordRename(BaseModel):
@@ -2913,7 +3002,7 @@ async def admin_folder_rename(req: FolderRename, who: users.Access = Depends(vie
         except folders.FolderError as e:
             raise HTTPException(e.status, e.detail)
         except OSError as e:
-            raise HTTPException(500, f"не удалось переименовать: {e}")
+            raise _os_fault("не удалось переименовать", e)
     if new != old:
         log(f"папка переименована: {old} → {new} ({who.login})")
     return {"ok": True, "path": new}
@@ -2941,7 +3030,7 @@ async def admin_folder_delete(req: FolderDelete, who: users.Access = Depends(vie
         except folders.FolderError as e:
             raise HTTPException(e.status, e.detail)
         except OSError as e:
-            raise HTTPException(500, f"не удалось удалить: {e}")
+            raise _os_fault("не удалось удалить", e)
     log(f"папка удалена в корзину: {folder}, записей {done['records']}, "
         f"лежит в {done['trash']} ({who.login})")
     return {"ok": True, **done}
@@ -3688,7 +3777,7 @@ async def admin_brand_logo(request: Request, who: users.Access = Depends(viewer)
     except brand.BrandError as e:
         raise HTTPException(400, str(e))
     except OSError as e:
-        raise HTTPException(500, f"не удалось записать логотип в папку состояния: {e}")
+        raise _os_fault("не удалось записать логотип в папку состояния", e)
     log(f"оформление: логотип заменён ({who.login}) — {info['format']}, {info['width']}×{info['height']}, "
         f"{info['bytes'] / 1024:.0f} КБ")
     jot("brand_logo", who, format=info["format"], width=info["width"], height=info["height"], size=info["bytes"])
@@ -3710,7 +3799,7 @@ async def admin_brand_name(req: BrandName, who: users.Access = Depends(viewer)):
     except brand.BrandError as e:
         raise HTTPException(400, str(e))
     except OSError as e:
-        raise HTTPException(500, f"не удалось записать оформление в папку состояния: {e}")
+        raise _os_fault("не удалось записать оформление в папку состояния", e)
     log(f"оформление: название организации — «{name}» ({who.login})" if name
         else f"оформление: название организации убрано ({who.login})")
     jot("brand_name", who, name=name, was=was)
@@ -3724,7 +3813,7 @@ async def admin_brand_reset(who: users.Access = Depends(viewer)):
     try:
         await asyncio.to_thread(look.reset, who.login)
     except OSError as e:
-        raise HTTPException(500, f"не удалось записать оформление в папку состояния: {e}")
+        raise _os_fault("не удалось записать оформление в папку состояния", e)
     log(f"оформление: возвращено стандартное ({who.login})")
     jot("brand_reset", who)
     return {"ok": True, **_brand_view()}
@@ -3831,7 +3920,7 @@ def _template_store(item: str, text: str, who: users.Access, how: str) -> dict:
     except templates.TemplateError as e:
         raise HTTPException(400, str(e))
     except OSError as e:
-        raise HTTPException(500, f"не удалось записать файл в папку шаблонов: {e}")
+        raise _os_fault("не удалось записать файл в папку шаблонов", e)
     saved = templates.read(cfg.prompts_dir / file) or ""
     options.note_template(item, who.login, templates.digest(saved))
     if changed:
@@ -3909,7 +3998,7 @@ def _type_store(req: TemplateType, who: users.Access) -> dict:
     except templates.TemplateError as e:
         raise HTTPException(400, str(e))
     except OSError as e:
-        raise HTTPException(500, f"не удалось записать файл в папку шаблонов: {e}")
+        raise _os_fault("не удалось записать файл в папку шаблонов", e)
     options.note_template(key, who.login, templates.digest(templates.read(cfg.prompts_dir / f"{key}.md") or ""))
     log(f"шаблоны: добавлен свой тип «{key}» — {' '.join(req.title.split())} ({who.login})")
     jot("type_create", who, item=key, title=" ".join(req.title.split()), base=req.base if req.text is None else "")
@@ -3934,7 +4023,7 @@ def _type_delete(key: str, who: users.Access) -> dict:
     except templates.TemplateError as e:
         raise HTTPException(400, str(e))
     except OSError as e:
-        raise HTTPException(500, f"не удалось изменить папку шаблонов: {e}")
+        raise _os_fault("не удалось изменить папку шаблонов", e)
     options.note_template(key, who.login, None)
     log(f"шаблоны: свой тип «{key}» удалён ({who.login}); текст шаблона — в папке {templates.HISTORY_DIR}")
     jot("type_delete", who, item=key, title=title)
@@ -3977,6 +4066,17 @@ async def admin_speech_model(req: SpeechModelRequest, who: users.Access = Depend
     return {"ok": True, **_speech_choice()}
 
 
+# Ручной запуск берёт то же, что «Обработка» предлагает в списке файлов (Service.inbox_files): медиафайл
+# входной папки, не временный и не недокопированный, не в служебной папке — корзине (.trash) и
+# недогрузках (.uploads): удалённое и недогруженное в платное распознавание не идут — и не в выходной
+# папке, если она внутри входной. Файл, который ещё дописывается (сканер ждёт, пока он перестанет
+# меняться), не запускается: обрывок ушёл бы в распознавание, а за него платят.
+NOT_RUNNABLE = ("вручную запускаются записи из списка файлов входной папки: медиафайл не из корзины и не из "
+                "недогрузок, не временный и не недокопированный")
+STILL_WRITTEN = ("файл ещё дописывается — сервис возьмёт его в обработку сам, когда он перестанет меняться; "
+                 "ручной запуск — после этого")
+
+
 @app.post("/api/admin/run", dependencies=[Depends(admin_guard)])
 async def admin_run(req: RunRequest, who: users.Access = Depends(viewer)):
     assert service is not None
@@ -3995,6 +4095,10 @@ async def admin_run(req: RunRequest, who: users.Access = Depends(viewer)):
     if not target.is_file():
         raise HTTPException(404, "файл не найден")
     rel = target.relative_to(root).as_posix()
+    if hidden(rel) or service._ignore_reason(target) or service._under_outbox(rel):
+        raise HTTPException(400, NOT_RUNNABLE)
+    if rel in service.pending:
+        raise HTTPException(409, STILL_WRITTEN)
     if any(i.path == rel for i in service.queue) or _in_work(rel):
         raise HTTPException(409, "этот файл уже в очереди или обрабатывается")
     service.enqueue_manual(rel, req.template, req.force, who.login, "manual", req.model or "")

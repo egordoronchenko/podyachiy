@@ -13,11 +13,12 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from pathlib import Path
 
-from . import llm, mindmap, speech
+from . import llm, mindmap, speech, templates
 
 SYSTEM = "Ты аккуратный аналитик. Работаешь только с тем, что есть в тексте."
 
@@ -102,6 +103,10 @@ async def summarize_file(
     header = (f"<!-- протокол: модель {cfg.summary_model}, шаблон {template_key}, "
               f"источник transcript/{stem}.json -->\n\n")
     target = out_dir / f"{stem}.md"
+    # Новый протокол сначала пишется целиком рядом и только потом встаёт на место: обрыв посреди
+    # записи (диск кончился, контейнер остановили) не оставит на месте протокола его половину.
+    fresh = target.with_name(target.name + ".tmp")
+    fresh.write_text(header + md.strip() + "\n" + (f"\n{tail}" if tail else ""), encoding="utf-8")
     if target.exists():
         # Прошлый протокол не затираем: модель от прогона к прогону пишет
         # по-разному, и без старой версии не понять, что при пересборке потерялось.
@@ -109,7 +114,7 @@ async def summarize_file(
         (out_dir / PREV_DIR).mkdir(exist_ok=True)
         target.replace(out_dir / PREV_DIR / f"{stem}.{saved}.md")
         log(f"прошлый протокол сохранён: summary/{PREV_DIR}/{stem}.{saved}.md")
-    target.write_text(header + md.strip() + "\n" + (f"\n{tail}" if tail else ""), encoding="utf-8")
+    os.replace(fresh, target)
     mindmap.write_for(target, noted)
     meta = {
         "success": True,
@@ -123,8 +128,7 @@ async def summarize_file(
         "wall_clock_sec": round(time.perf_counter() - t0, 2),
         "usage": api_usage,
     }
-    (out_dir / f"{stem}.meta.json").write_text(
-        json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    templates._write(out_dir / f"{stem}.meta.json", json.dumps(meta, ensure_ascii=False, indent=2))
     log(f"протокол готов: {len(md)} символов за {meta['wall_clock_sec']:.0f} с, "
         f"меток времени {used}")
     if unknown:

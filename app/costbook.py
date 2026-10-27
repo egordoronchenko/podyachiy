@@ -149,6 +149,18 @@ def sheets(report: dict, runs: list[dict], names: dict[str, str], made_at: datet
 
 # ---------- CSV ----------
 
+# Ячейку CSV, которая начинается с одного из этих знаков, Excel и LibreOffice читают как формулу:
+# имя записи или папки «=HYPERLINK(…)» стало бы ссылкой наружу, «=cmd|…» — запуском программы.
+# Знаки табуляции и перевода строки впереди тоже: программа их отбрасывает и видит формулу за ними.
+FORMULA_START = ("=", "+", "-", "@", "\t", "\r")
+
+
+def cell(text: str) -> str:
+    """Строка для ячейки CSV — всех CSV сервиса: начинается как формула — спереди апостроф, и
+    программа покажет её текстом. Числа сюда не идут: они пишутся числами и остаются ими."""
+    return "'" + text if text.startswith(FORMULA_START) else text
+
+
 def _plain(value, money: bool) -> str:
     if value is None:
         return ""
@@ -158,7 +170,7 @@ def _plain(value, money: bool) -> str:
         return value.isoformat()[:7]
     if isinstance(value, (datetime.datetime, datetime.date)):
         return value.isoformat()
-    return str(value)
+    return cell(value) if isinstance(value, str) else str(value)
 
 
 def to_csv(book: list[tuple[str, list[Table]]]) -> str:

@@ -3,6 +3,7 @@
 import datetime
 import json
 import os
+import re
 import sqlite3
 import tarfile
 import threading
@@ -405,8 +406,8 @@ def test_one_deleted_record_comes_back_from_the_archive_with_its_marks_and_words
         trail.write("record_delete", "ivanov", file=file, trash=".trash/x")
     (cfg.inbox / file).unlink()
     __import__("shutil").rmtree(cfg.outbox / "Проекты" / "план")
-    base.close()
-    assert marks.Store(db.Database(cfg.state_dir)).everything() == {}
+    assert marks.Store(base).everything() == {}
+    base.close()                                                        # команда идёт при остановленном сервисе
 
     with pytest.raises(backup.BackupError, match="в архиве .* нет"):
         backup.record(cfg, made["archive"], "Проекты/нет такой.mp4", quiet)
@@ -421,5 +422,44 @@ def test_one_deleted_record_comes_back_from_the_archive_with_its_marks_and_words
     after = tree(cfg)
     log = "outbox/_logs/podyachiy.log"
     assert {k: v for k, v in after.items() if k != log} == {k: v for k, v in before["files"].items() if k != log}
+    base.close()
     with pytest.raises(backup.BackupError, match="уже есть"):
         backup.record(cfg, made["archive"], file, quiet)               # второй раз возвращать нечего
+
+
+@pytest.mark.parametrize("tail", ["-wal", "-shm", "-journal"])
+def test_restore_refuses_leftover_journal_files_of_a_previous_database(tmp_path, tail):
+    """Базу убрали, а её журнал SQLite остался рядом: при первом открытии он применился бы к
+    восстановленной базе и испортил бы её. Такие файлы убирают вместе с прежней базой."""
+    cfg = install(tmp_path)
+    made = backup.create(cfg, kept=kept, say=quiet)
+    new = types.SimpleNamespace(state_dir=tmp_path / "новый" / "state", inbox=tmp_path / "новый" / "inbox",
+                                outbox=tmp_path / "новый" / "outbox", prompts_dir=tmp_path / "новый" / "prompts",
+                                backup_dir=cfg.backup_dir)
+    new.state_dir.mkdir(parents=True)
+    (new.state_dir / (db.FILE + tail)).write_bytes(b"old journal")
+    with pytest.raises(backup.BackupError, match=re.escape(f"журналы прежней базы ({db.FILE}{tail})")):
+        backup.restore(new, made["archive"], quiet, kept=kept)
+    assert not (new.state_dir / db.FILE).exists() and not new.inbox.exists()
+
+
+def test_one_record_is_not_brought_back_while_the_service_runs(tmp_path):
+    """Сервис держит журнал обработки ещё и в памяти: запись, вписанная в базу у него за спиной,
+    им не видна, а следующая его запись строки по ней затрёт. Пока база открыта сервисом — отказ."""
+    cfg = install(tmp_path)
+    file = "Проекты/план.mp4"
+    made = backup.create(cfg, kept=kept, say=quiet)
+    base = db.Database(cfg.state_dir)
+    with base.write():
+        ledger.Ledger(base).forget(file)
+    (cfg.inbox / file).unlink()
+    __import__("shutil").rmtree(cfg.outbox / "Проекты" / "план")
+    running = db.Database(cfg.state_dir)                                # так базу держит работающий сервис
+    try:
+        with pytest.raises(backup.BackupError, match="сервис работает"):
+            backup.record(cfg, made["archive"], file, quiet)
+    finally:
+        running.close()
+    assert ledger.Ledger(base).get(file) is None and not (cfg.inbox / file).exists()
+    base.close()
+    assert backup.record(cfg, made["archive"], file, quiet)["file"] == file          # остановлен — можно

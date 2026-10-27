@@ -32,7 +32,6 @@ import email.utils
 import hashlib
 import json
 import re
-import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -195,8 +194,8 @@ def fit_terms(model: str, terms: list[str], log: Callable[[str], None] = lambda 
 
 
 def audio_duration(path: Path) -> float:
-    r = subprocess.run(
-        ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
+    r = media.run_ffprobe(
+        ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(path)],
         capture_output=True, text=True, timeout=120,
     )
     try:
@@ -208,7 +207,7 @@ def audio_duration(path: Path) -> float:
 def make_chunk(src: Path, dst: Path, start: float, length: float) -> None:
     media.run_ffmpeg(
         ["-y", "-v", "error", "-ss", str(start), "-t", str(length),
-         "-i", str(src), "-vn", "-ac", "1", "-b:a", BITRATE, str(dst)],
+         "-i", str(src), "-vn", "-ac", "1", "-b:a", BITRATE, "-f", "mp3", str(dst)],
         check=True, timeout=1800,
     )
 

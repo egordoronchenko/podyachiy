@@ -203,13 +203,15 @@ def tree(path: str, folders: set[str]) -> dict:
 
 
 def page_parts(name: str) -> tuple[str, str, str]:
-    """Страница сервиса по частям: заголовок вкладки, разметка тела и её собственный сценарий."""
+    """Страница сервиса по частям: заголовок вкладки, разметка тела и её собственный сценарий —
+    файл рядом со страницей (index.html → index.js): встроенных сценариев у страниц сервиса нет."""
     html = (STATIC / name).read_text(encoding="utf-8")
     title = re.search(r"<title>(.*?)</title>", html, re.S)[1]
     body = re.search(r"<body[^>]*>(.*)</body>", html, re.S)[1]
-    scripts = re.findall(r"<script>(.*?)</script>", body, re.S)
-    assert len(scripts) == 1, f"{name}: ждали один встроенный сценарий"
-    return title, re.sub(r"<script\b.*?</script>", "", body, flags=re.S).strip(), scripts[0]
+    scripts = re.findall(r'<script src="/static/([\w.-]+)"></script>', body)
+    own = Path(name).with_suffix(".js").name
+    assert scripts == ["common.js", own], f"{name}: ждали common.js и {own}, а подключены {scripts}"
+    return title, re.sub(r"<script\b.*?</script>", "", body, flags=re.S).strip(), (STATIC / own).read_text(encoding="utf-8")
 
 
 def build() -> str:

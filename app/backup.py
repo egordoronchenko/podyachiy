@@ -436,6 +436,37 @@ def verify(archive: Path, say=print, into: dict[str, Path] | None = None) -> dic
 
 # ---------- восстановление ----------
 
+# Спутники файла базы — журналы SQLite. Без своей базы они чужие любой другой: SQLite применил бы их к
+# восстановленной при первом же открытии (журнал WAL дописал бы в неё страницы прежней базы,
+# незакрытый журнал отката «вернул» бы их) — и испортил бы её.
+COMPANIONS = ("-wal", "-shm", "-journal")
+
+
+def _stopped(state: Path) -> None:
+    """Сервис над этой базой не работает — или BackupError. Признак — блокировка самого SQLite: каждое
+    соединение, читавшее базу в режиме WAL, держит на её файле разделяемую блокировку, пока открыто, а
+    сервис держит свои соединения открытыми всё время работы. Исключительную блокировку тогда не взять.
+    Тот же признак работает между контейнерами: папку состояния, где блокировки между процессами не
+    держатся, сервис не принимает при запуске (db.probe). Остановленный сервис блокировок не держит,
+    в том числе упавший: их снимает система вместе с процессом."""
+    try:
+        con = sqlite3.connect(state / db.FILE, timeout=0, isolation_level=None)
+    except sqlite3.Error as e:
+        raise BackupError(f"база {state / db.FILE} не открывается: {e}") from e
+    try:
+        con.execute("PRAGMA locking_mode=EXCLUSIVE")
+        con.execute("BEGIN EXCLUSIVE")
+        con.execute("ROLLBACK")
+    except sqlite3.OperationalError as e:
+        if "locked" not in str(e):
+            raise BackupError(f"база {state / db.FILE} не открывается: {e}") from e
+        raise BackupError(f"сервис работает: база {state / db.FILE} открыта им. Запись в базу у работающего сервиса за "
+                          "спиной он не увидит — журнал обработки он держит ещё и в памяти — и следующей своей записью "
+                          "затрёт. Остановите сервис (docker compose stop) и запустите команду через docker compose run") from e
+    finally:
+        con.close()
+
+
 def restore(cfg, archive: Path, say=print, kept=db.kept) -> dict:
     """Разворачивает архив в пустую установку: папки берутся из настроек. Сначала архив проверяется
     целиком, потом раскладывается и сверяется ещё раз — уже разложенным. Отдаёт опись."""
@@ -446,6 +477,11 @@ def restore(cfg, archive: Path, say=print, kept=db.kept) -> dict:
     busy = []
     if (places["state"] / db.FILE).exists():
         busy.append(f"в папке состояния уже есть база ({places['state'] / db.FILE})")
+    else:
+        left = [db.FILE + tail for tail in COMPANIONS if (places["state"] / (db.FILE + tail)).exists()]
+        if left:
+            busy.append(f"в папке состояния остались журналы прежней базы ({', '.join(left)}): SQLite применил бы их к "
+                        "восстановленной и испортил бы её — уберите их вместе с прежней базой")
     for part in ("outbox", "inbox"):
         held = [p.name for p in places[part].iterdir() if p.name not in (logbook.LOG_DIR, upload.PARTS_DIR)] \
             if places[part].is_dir() else []
@@ -496,6 +532,7 @@ def record(cfg, archive: Path, file: str, say=print) -> dict:
     places = roots(cfg)
     if not (places["state"] / db.FILE).is_file():
         raise BackupError(f"базы {places['state'] / db.FILE} нет: возвращать запись некуда")
+    _stopped(places["state"])
     manifest = verify(archive, lambda line: None)
     work = Path(tempfile.mkdtemp(prefix="podyachiy-record-"))
     written: list[Path] = []

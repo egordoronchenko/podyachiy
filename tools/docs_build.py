@@ -4,16 +4,20 @@
 
     install/README.md        → site/podyachiy-install.html   (к визитке, открывается с диска)
                              → app/static/install-guide.html (та же инструкция в сервисе: /install-guide)
+                               и её сценарий app/static/install-guide.js
     install/personal.md      → site/podyachiy-personal.html  (установить для себя, личный режим)
     docs/guide/README.md     → site/podyachiy-guide.html     (руководство пользователя со снимками экрана)
 
 Собранные файлы самодостаточны: стили, шрифт надписи, логотип и снимки лежат внутри, сети не нужно.
+Кроме экземпляра в сервисе: его страницы исполняют только сценарии из файлов сервиса (заголовок
+Content-Security-Policy, app/web.py), поэтому сценарий у него — отдельным файлом рядом, а шрифт,
+логотип и значок — по адресам /static/, как у остальных страниц сервиса.
 В них оглавление с якорями, кнопка «Скопировать» у блоков кода, прокрутка широких таблиц внутри
 таблицы, стили для печати, светлая и тёмная тема (по настройке системы).
 
 Пересобрать после правки любого из трёх текстов, снимков или номера версии:
 
-    python tools/docs_build.py            # записать все четыре файла
+    python tools/docs_build.py            # записать все файлы
     python tools/docs_build.py --check    # ничего не писать; расхождение — код возврата 1
 
 Собранные файлы лежат в репозитории; tests/test_docs.py падает, если они не совпадают с тем, что
@@ -52,6 +56,7 @@ INSTALL_SRC = ROOT / "install" / "README.md"
 GUIDE_SRC = ROOT / "docs" / "guide" / "README.md"
 INSTALL_SITE = SITE / "podyachiy-install.html"
 INSTALL_APP = STATIC / "install-guide.html"
+INSTALL_APP_JS = STATIC / "install-guide.js"
 GUIDE_SITE = SITE / "podyachiy-guide.html"
 PERSONAL_SRC = ROOT / "install" / "personal.md"
 PERSONAL_SITE = SITE / "podyachiy-personal.html"
@@ -606,10 +611,18 @@ def sections(body: str) -> tuple[str, str]:
 HERE = ' aria-current="page"'
 
 
-def page(doc: Doc, *, name: str, nav: list[tuple[str, str, bool]], note: str, description: str) -> str:
-    logo = data_uri(STATIC / "logo-small.png", "image/png")
-    icon = data_uri(STATIC / "favicon.png", "image/png")
-    font = data_uri(STATIC / "fonts" / "Vertograd.woff2", "font/woff2")
+def page(doc: Doc, *, name: str, nav: list[tuple[str, str, bool]], note: str, description: str,
+         served: bool = False) -> str:
+    """Документ одним файлом; served — экземпляр, который отдаёт сервис: сценарий — файлом
+    INSTALL_APP_JS, шрифт и картинки — из /static/ (CSP сервиса не исполнит встроенный сценарий)."""
+    if served:
+        logo, icon, font = "/static/logo-small.png", "/static/favicon.png", "/static/fonts/Vertograd.woff2"
+        script = f'<script src="/static/{INSTALL_APP_JS.name}"></script>'
+    else:
+        logo = data_uri(STATIC / "logo-small.png", "image/png")
+        icon = data_uri(STATIC / "favicon.png", "image/png")
+        font = data_uri(STATIC / "fonts" / "Vertograd.woff2", "font/woff2")
+        script = f"<script>{JS}</script>"
     version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
     intro, body = sections(doc.body)
     links = "".join(f'<a href="{esc(href)}"{HERE if here else ""}>{esc(label)}</a>' for label, href, here in nav)
@@ -644,7 +657,7 @@ def page(doc: Doc, *, name: str, nav: list[tuple[str, str, bool]], note: str, de
 <p class="foot">Подьячий {esc(version)} — открытый код под лицензией MIT. Автор — Доронченко Егор.</p>
 </main>
 </div>
-<script>{JS}</script>
+{script}
 </body>
 </html>
 """
@@ -674,7 +687,8 @@ def build() -> dict[Path, str]:
     out[INSTALL_APP] = page(install, name="установка и сопровождение", description=what,
                             note="Для администратора сервиса.",
                             nav=[("В сервис", "/", False), ("Справка", "/help", False),
-                                 ("Инструкция по установке", "/install-guide", True)])
+                                 ("Инструкция по установке", "/install-guide", True)], served=True)
+    out[INSTALL_APP_JS] = JS.lstrip("\n")
     out[PERSONAL_SITE] = page(
         Doc(PERSONAL_SRC), name="установить для себя", note="Для одного человека на своём компьютере.",
         description="Как поставить сервис «Подьячий» для себя: Docker Desktop, ключ поставщика, две строки в .env, запуск.",

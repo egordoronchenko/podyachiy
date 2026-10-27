@@ -220,6 +220,12 @@ def dir_names(client, path=""):
 ROOT = __import__("pathlib").Path(__file__).resolve().parent.parent
 
 
+def page_source(name: str) -> str:
+    """Страница сервиса целиком: разметка (app/static/<страница>.html) и её сценарий (<страница>.js)."""
+    static = ROOT / "app" / "static"
+    return "".join((static / f"{name}{ext}").read_text(encoding="utf-8") for ext in (".html", ".js"))
+
+
 def seed(web):
     """Шаблоны из поставки — в папку шаблонов, как при первом запуске из образа: в образе они
     лежат в prompts_default, в репозитории — в prompts."""
@@ -484,7 +490,7 @@ def test_records_are_visible_only_in_open_folders(site):
         assert 'class="back"' not in saved.text and "К записи" not in saved.text and "Решили." in saved.text
         assert saved.text == (summary / "вкс.map.html").read_text(encoding="utf-8")
     # главная страница по этому адресу открывает запись: параметры — те, что читает index.html
-    index = (ROOT / "app" / "static" / "index.html").read_text(encoding="utf-8")
+    index = page_source("index")
     assert 'start.get("path")' in index and 'start.get("open")' in index
 
     # чужая запись неотличима от несуществующей
@@ -538,7 +544,7 @@ def test_folder_admin_grants_reading_but_not_administration(site):
 def test_upload_lands_in_own_folder_and_is_written_to_the_journal(site):
     web, admin, ivanov, _ = staffed(site)
     home = f"{HOME}/ivanov"
-    file = {"name": "планёрка.mp3", "size": 10, "dir": home}
+    file = {"name": "планёрка.mp3", "size": 10, "stamp": "1", "dir": home}
     assert ivanov.get("/api/upload", params=file).json()["offset"] == 0
     first = ivanov.put("/api/upload", params={**file, "offset": 0}, content=b"12345")
     assert first.json() == {"offset": 5, "done": False, "file": f"{home}/планёрка.mp3"}
@@ -560,11 +566,11 @@ def test_upload_into_a_closed_folder_is_refused(site):
     web, admin, ivanov, _ = staffed(site)
     admin.post("/api/folder", json={"dir": "Проекты"})
     for folder in (f"{HOME}/petrov", "Проекты", ""):
-        file = {"name": "запись.mp3", "size": 5, "dir": folder}
+        file = {"name": "запись.mp3", "size": 5, "stamp": "1", "dir": folder}
         assert ivanov.get("/api/upload", params=file).status_code == 403, folder
         assert ivanov.put("/api/upload", params={**file, "offset": 0}, content=b"12345").status_code == 403, folder
         assert ivanov.delete("/api/upload", params=file).status_code == 403, folder
-    refused = ivanov.put("/api/upload", params={"name": "вирус.exe", "size": 5, "offset": 0,
+    refused = ivanov.put("/api/upload", params={"name": "вирус.exe", "size": 5, "stamp": "1", "offset": 0,
                                                 "dir": f"{HOME}/ivanov"}, content=b"12345")
     assert refused.status_code == 400
     assert [p for p in web.cfg.inbox.rglob("*") if p.is_file()] == []
@@ -577,7 +583,7 @@ def test_admin_renames_and_deletes_a_folder(site):
     web, admin, ivanov, _ = staffed(site)
     admin.post("/api/folder", json={"dir": "Проекты"})
     admin.post("/api/access", json={"dir": "Проекты", "login": "ivanov", "read": "tree", "upload": "tree"})
-    file = {"name": "вкс.mp3", "size": 5, "dir": "Проекты", "offset": 0}
+    file = {"name": "вкс.mp3", "size": 5, "stamp": "1", "dir": "Проекты", "offset": 0}
     assert ivanov.put("/api/upload", params=file, content=b"12345").json()["done"]
     web.service.ledger.put({"file": "Проекты/вкс.mp3", "status": "ok"})
 
@@ -1038,7 +1044,7 @@ def test_personal_mode_needs_no_login(tmp_path):
         assert client.get("/api/browse").status_code == 200
         assert client.get("/api/admin/status").status_code == 200
         assert client.post("/api/folder", json={"dir": "Совещания"}).status_code == 200
-        done = client.put("/api/upload", params={"name": "запись.mp3", "size": 3, "offset": 0, "dir": "Совещания"},
+        done = client.put("/api/upload", params={"name": "запись.mp3", "size": 3, "stamp": "1", "offset": 0, "dir": "Совещания"},
                           content=b"123")
         assert done.json()["done"] and (web.cfg.inbox / "Совещания" / "запись.mp3").is_file()
         assert not client.get("/api/browse", params={"path": "Совещания"}).json()["manage"]
@@ -1505,7 +1511,7 @@ def test_mail_password_in_the_clear_is_warned_about_at_start_and_in_the_mail_blo
 def test_pages_say_what_the_mail_did():
     """То, что страницы показывают о почте: проверено и в браузере, здесь — чтобы не потерялось."""
     static = ROOT / "app" / "static"
-    login = (static / "login.html").read_text(encoding="utf-8")
+    login = page_source("login")
     assert "Если заявку отклонят, письма не будет" in login
     common = (static / "common.js").read_text(encoding="utf-8")
     # «отправлен не всем» — со знаком предупреждения, а не с галочкой успеха
@@ -1514,7 +1520,7 @@ def test_pages_say_what_the_mail_did():
     # «Не отправлено» стоит над кнопкой «Отправить», объявляется и прокручивается в видимую часть окна
     assert common.index('id="smsg" role="alert"') < common.index('<button id="sgo">')
     assert "msg.scrollIntoView(" in common and "Не отправлено: ${esc(err.message)}" in common
-    admin = (static / "admin.html").read_text(encoding="utf-8")
+    admin = page_source("admin")
     assert "m.warnings.map(" in admin and "done.mail_error" in admin and 'e.what === "link"' in admin
 
 
@@ -2328,7 +2334,7 @@ def test_block_of_previous_tasks_does_not_double_the_registry(site):
     record = ivanov.get("/api/v1/record", params={"file": "Проекты/вкс.mp4"}).json()
     assert len(record["tasks"]) == 2 and "## Поручения прошлого совещания" in record["protocol"]
     # ссылка из раздела и из реестра открывает ту запись на главной — с перемоткой
-    assert "&t=605)" in block and "t = parseInt(start.get(\"t\")" in ivanov.get("/").text
+    assert "&t=605)" in block and "t = parseInt(start.get(\"t\")" in ivanov.get("/static/index.js").text
 
 
 def test_records_listing_carries_the_new_fields(site):
@@ -3461,7 +3467,7 @@ def test_reader_sees_everything_in_the_folder_but_the_page_refuses_his_upload(si
     assert inside["upload"]["enabled"] is False and inside["upload"]["anywhere"] is False
     assert "право загрузки" in inside["upload"]["denied"] and inside["home_upload"] is False
     for folder in ("Проекты", "Проекты/Сметы"):
-        chunk = {"name": "запись.mp3", "size": 5, "dir": folder}
+        chunk = {"name": "запись.mp3", "size": 5, "stamp": "1", "dir": folder}
         asked = ivanov.get("/api/upload", params=chunk)
         assert asked.status_code == 403 and "право загрузки" in asked.json()["detail"], folder
         assert "администратору" in asked.json()["detail"]
@@ -3476,13 +3482,13 @@ def test_reader_with_upload_and_the_folder_admin_upload_on_the_page(site):
                                  (sidorov, "Проекты/Сметы", "от сидорова.mp3"), (admin, "Снабжение", "админ.mp3")):
         inside = client.get("/api/browse", params={"path": folder}).json()["upload"]
         assert inside["enabled"] is True and inside["anywhere"] is True and inside["denied"] == "", name
-        sent = client.put("/api/upload", params={"name": name, "size": 5, "dir": folder, "offset": 0}, content=b"12345")
+        sent = client.put("/api/upload", params={"name": name, "size": 5, "stamp": "1", "dir": folder, "offset": 0}, content=b"12345")
         assert sent.status_code == 200 and sent.json()["done"], name
     assert [(e["by"], e["file"]) for e in web.trail.read() if e["kind"] == "upload"] == [
         ("petrov", "Проекты/от петрова.mp3"), ("petrov", "Проекты/Сметы/смета.mp3"),
         ("sidorov", "Проекты/Сметы/от сидорова.mp3"), ("admin", "Снабжение/админ.mp3")]
     # право загрузки — на свою папку: в закрытую по-прежнему нельзя
-    there = petrov.get("/api/upload", params={"name": "чужое.mp3", "size": 5, "dir": "Снабжение"})
+    there = petrov.get("/api/upload", params={"name": "чужое.mp3", "size": 5, "stamp": "1", "dir": "Снабжение"})
     assert there.status_code == 403 and "не открыта" in there.json()["detail"]
     # читатель с загрузкой остаётся читателем: записью не распоряжается, доступ не раздаёт
     seen = petrov.get("/api/result", params={"file": "Проекты/планёрка.mp4", "kind": "summary"}).json()
@@ -3494,7 +3500,7 @@ def test_reader_with_upload_and_the_folder_admin_upload_on_the_page(site):
 def test_upload_right_follows_its_scope_and_is_taken_back(site):
     web, admin, ivanov, petrov, sidorov = tiers(site)
     admin.post("/api/access", json={"dir": "Проекты", "login": "ivanov", "upload": "only"})
-    put = lambda folder: ivanov.put("/api/upload", params={"name": f"{len(folder)}.mp3", "size": 5, "dir": folder,
+    put = lambda folder: ivanov.put("/api/upload", params={"name": f"{len(folder)}.mp3", "size": 5, "stamp": "1", "dir": folder,
                                                            "offset": 0}, content=b"12345").status_code
     assert put("Проекты") == 200 and put("Проекты/Сметы") == 403           # «только эта папка» — без подпапок
     below = ivanov.get("/api/browse", params={"path": "Проекты/Сметы"}).json()["upload"]
@@ -3506,7 +3512,7 @@ def test_upload_right_follows_its_scope_and_is_taken_back(site):
     admin.post("/api/access", json={"dir": "Проекты", "login": "ivanov", "upload": "tree"})
     assert put("Проекты/Сметы") == 200                                     # наследуется на подпапки
     admin.post("/api/access", json={"dir": "Проекты", "login": "ivanov", "upload": "none"})
-    assert ivanov.get("/api/upload", params={"name": "ещё.mp3", "size": 5, "dir": "Проекты"}).status_code == 403
+    assert ivanov.get("/api/upload", params={"name": "ещё.mp3", "size": 5, "stamp": "1", "dir": "Проекты"}).status_code == 403
     assert "Проекты" in dir_names(ivanov)                                  # чтение при этом осталось
 
 
@@ -3538,7 +3544,7 @@ def test_folder_admin_grants_upload_and_the_grant_is_in_the_journal(site):
 def test_home_folder_takes_uploads_only_when_the_admin_allowed(site):
     web, admin, ivanov, petrov, sidorov = tiers(site)
     home = f"{HOME}/ivanov"
-    chunk = {"name": "личная.mp3", "size": 5, "dir": home}
+    chunk = {"name": "личная.mp3", "size": 5, "stamp": "1", "dir": home}
     refused = ivanov.get("/api/upload", params=chunk)
     assert refused.status_code == 403 and refused.json()["detail"] == web.NO_HOME_UPLOAD
     assert ivanov.put("/api/upload", params={**chunk, "offset": 0}, content=b"12345").status_code == 403
@@ -3657,7 +3663,7 @@ def test_service_started_over_an_old_users_file_gives_reading_only(tmp_path):
         recorded(web, "Проекты/вкс.mp4")
         assert [f["file"] for f in ivanov.get("/api/browse", params={"path": "Проекты"}).json()["files"]] == ["Проекты/вкс.mp4"]
         for folder in ("Проекты", f"{HOME}/ivanov"):
-            sent = ivanov.put("/api/upload", params={"name": "з.mp3", "size": 5, "dir": folder, "offset": 0}, content=b"12345")
+            sent = ivanov.put("/api/upload", params={"name": "з.mp3", "size": 5, "stamp": "1", "dir": folder, "offset": 0}, content=b"12345")
             assert sent.status_code == 403, folder
             assert ivanov.put("/api/v1/upload", params={"dir": folder, "name": "з.mp3"}, content=b"123").status_code == 403
         assert ivanov.get("/api/v1/whoami").json()["can_upload"] is False
@@ -3759,7 +3765,7 @@ def test_personal_mode_uploads_to_the_root_by_request_like_the_button(tmp_path):
         assert sent.status_code == 200 and sent.json()["file"] == "планёрка.mp3"
         assert (web.cfg.inbox / "планёрка.mp3").read_bytes() == b"123"
         # то же самое делает кнопка на странице
-        page = client.put("/api/upload", params={"name": "с кнопки.mp3", "size": 3, "offset": 0}, content=b"123")
+        page = client.put("/api/upload", params={"name": "с кнопки.mp3", "size": 3, "stamp": "1", "offset": 0}, content=b"123")
         assert page.json()["done"] and page.json()["file"] == "с кнопки.mp3"
         again = client.put("/api/v1/upload", params={"name": "планёрка.mp3"}, content=b"123")
         assert again.status_code == 409
@@ -3812,7 +3818,7 @@ def test_me_tells_whether_the_service_address_is_set(tmp_path):
     with running(tmp_path / "set", extra={"PUBLIC_URL": "http://192.0.2.10:8081"}) as (web, client):
         me = client.get("/api/me").json()
         assert me["url_set"] is True and me["url"] == "http://192.0.2.10:8081"
-    help_page = (ROOT / "app" / "static" / "help.html").read_text(encoding="utf-8")
+    help_page = page_source("help")
     assert 'id="ailocal"' in help_page and "me.url_set" in help_page and "PUBLIC_URL" in help_page
 
 
@@ -4155,7 +4161,7 @@ def test_admin_status_holds_no_disk_paths(site, tmp_path):
     assert body["history"][0]["file"] == "Проекты/вкс.mp4" and "output" not in body["history"][0]
     # журнал работы в этой проверке не участвует: в нём сервис сам пишет, куда разложил шаблоны
     assert str(tmp_path) not in json.dumps({k: v for k, v in body.items() if k != "log"}, ensure_ascii=False)
-    page = client.get("/admin").text
+    page = client.get("/admin").text + client.get("/static/admin.js").text
     assert "c.inbox" not in page and "c.outbox" not in page
 
 
@@ -4302,8 +4308,8 @@ def test_nobody_but_the_service_admin_sees_what_a_record_cost(site):
     menu = (static / "common.js").read_text(encoding="utf-8")
     assert re.search(r'\(me && me\.admin \? `<h3>Управление</h3>`[^;]*manage\("costs", "Расходы", "coin"\) \+\s*manage\("templates", "Настройки", "gear", "", \["brand"\]\) : ""\);', menu)
     assert menu.count('"costs"') == 1
-    for name in ("index.html", "tasks.html", "about.html"):
-        text = (static / name).read_text(encoding="utf-8")
+    for name in ("index", "tasks", "about"):
+        text = page_source(name)
         assert "/api/admin/" not in text.replace("/api/admin/names", "") and "money(" not in text, name
         assert "#costs" not in text, name
 
@@ -4373,7 +4379,7 @@ def test_pages_keep_the_order_protocol_map_transcript_and_one_download_group():
     tabs = tabs[:tabs.index("</div>")]
     assert 'k === "summary" && ready && viewData && viewData.has_map ? `<a class="tablink"' in tabs and ">Карта</a>" in tabs
     assert common.count(">Карта</a>") == 1 and 'target="_blank"' not in tabs      # возврат — «назад» и кнопка на карте
-    admin = (static / "admin.html").read_text(encoding="utf-8")
+    admin = page_source("admin")
     group = admin[admin.index('<label id="filelabel">Скачать отчёт целиком</label>'):admin.index('id="costprint"')]
     assert re.findall(r"/api/admin/report\.(\w+)\?\$\{file\}", group) == ["xlsx", "csv"]
     assert admin.count("/api/admin/report.") == 2 and "Скачать CSV" not in admin
@@ -4400,7 +4406,7 @@ def test_admin_sees_the_base_and_the_last_backup_and_a_warning_about_a_network_f
     web.storage_warnings[:] = migrate.storage_warnings(web.cfg, {"type": "cifs", "source": "//server/share", "kind": db.NETWORK})
     warning, = admin.get("/api/admin/status").json()["storage"]["warnings"]
     assert "сетевой папке (cifs)" in warning and "server" not in warning and "локальный диск" in warning
-    page = (ROOT / "app" / "static" / "admin.html").read_text(encoding="utf-8")
+    page = page_source("admin")
     assert 'id="storagewarn"' in page and 'role="alert"' in page and "резервная копия не делалась" in page
 
 
@@ -4590,7 +4596,7 @@ def test_upload_under_the_path_of_a_record_whose_source_was_removed_by_hand_is_r
     home = f"{HOME}/ivanov"
     recorded(web, f"{home}/планёрка.mp3")
     (web.cfg.inbox / home / "планёрка.mp3").unlink()
-    file = {"name": "планёрка.mp3", "size": 5, "dir": home}
+    file = {"name": "планёрка.mp3", "size": 5, "stamp": "1", "dir": home}
     for answer in (ivanov.get("/api/upload", params=file),
                    ivanov.put("/api/upload", params={**file, "offset": 0}, content=b"12345"),
                    ivanov.put("/api/v1/upload", params={"dir": home, "name": "планёрка.mp3"}, content=b"12345")):
@@ -4605,7 +4611,7 @@ def test_upload_finished_after_its_folder_was_renamed_or_deleted_is_refused(site
     for name, act in (("Проекты", lambda: admin.post("/api/admin/folders/rename", json={"dir": "Проекты", "name": "Архив"})),
                       ("Снабжение", lambda: admin.post("/api/admin/folders/delete", json={"dir": "Снабжение"}))):
         admin.post("/api/folder", json={"dir": name})
-        file = {"name": "вкс.mp3", "size": 10, "dir": name}
+        file = {"name": "вкс.mp3", "size": 10, "stamp": "1", "dir": name}
         assert admin.put("/api/upload", params={**file, "offset": 0}, content=b"12345").json()["done"] is False
         assert act().status_code == 200
         late = admin.put("/api/upload", params={**file, "offset": 5}, content=b"67890")

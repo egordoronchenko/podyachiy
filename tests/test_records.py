@@ -1,12 +1,16 @@
 import json
+import os
+import pathlib
 import sqlite3
 import threading
 import types
+import unicodedata
 
 import pytest
 
 from app import db, dictionary, folders, ledger, marks, records, watcher
 from app.ledger import Ledger
+from tests.test_folders import case_blind
 
 FILE = "Проекты отдела/план.mp4"
 
@@ -240,3 +244,60 @@ def test_record_is_not_renamed_or_moved_onto_the_name_of_a_subfolder(tmp_path):
         records.move(cfg, service, FILE, "Снабжение")
     assert e.value.status == 409 and "подпапка" in e.value.detail
     assert (cfg.inbox / FILE).is_file() and list(service.ledger.records) == [FILE]
+
+
+def test_failure_on_the_files_after_the_database_leaves_nothing_half_done(tmp_path, monkeypatch):
+    """Маркер рядом с результатами или опись корзины не записались (диск кончился). Действие тогда не
+    выполнено целиком: база прежняя, файлы на месте. Иначе база уже записала бы действие, а человек
+    получил бы отказ 500 — и, повторив, «записи нет» или «имя занято»."""
+    cfg, service = setup(tmp_path)
+    marker = cfg.outbox / "Проекты отдела" / "план" / f"план{ledger.MARKER_SUFFIX}"
+    marker_before = marker.read_bytes()
+    real = pathlib.Path.write_text
+
+    def full_disk(self, *args, **kwargs):
+        if self.name.endswith(ledger.MARKER_SUFFIX) or self.name == "удалено.json":
+            raise OSError(28, "No space left on device")
+        return real(self, *args, **kwargs)
+
+    def state():
+        files = {p.relative_to(tmp_path).as_posix(): p.read_bytes() for root in (cfg.inbox, cfg.outbox)
+                 for p in root.rglob("*") if p.is_file()}
+        return files, dict(service.ledger.records), Ledger(db.Database(cfg.outbox.parent / "state")).records
+
+    before = state()
+    monkeypatch.setattr(pathlib.Path, "write_text", full_disk)
+    for action, args in ((records.rename, ("Планёрка 06.10",)), (records.move, ("Снабжение",)), (records.remove, ("ivanov",))):
+        with pytest.raises(OSError):
+            action(cfg, service, FILE, *args)
+        assert state() == before, action.__name__
+    assert not (cfg.outbox / folders.TRASH).exists() or not list((cfg.outbox / folders.TRASH).rglob("*"))
+    monkeypatch.undo()
+    new = records.rename(cfg, service, FILE, "Планёрка 06.10")
+    moved = cfg.outbox / "Проекты отдела" / "Планёрка 06.10" / f"Планёрка 06.10{ledger.MARKER_SUFFIX}"
+    assert json.loads(moved.read_text(encoding="utf-8"))["file"] == new and marker_before != moved.read_bytes()
+
+
+def test_rename_that_changes_only_the_case_is_done_on_a_case_blind_volume(tmp_path, monkeypatch):
+    """«план.mp4» → «План.mp4» на томе без различия регистра: «План.mp4» уже «есть» — это она сама.
+    Раньше — отказ «запись с таким именем в этой папке уже есть»."""
+    cfg, service = setup(tmp_path)
+    case_blind(monkeypatch, tmp_path)
+    new = records.rename(cfg, service, FILE, "План")
+    assert new == "Проекты отдела/План.mp4" and list(service.ledger.records) == [new]
+    assert sorted(os.listdir(cfg.inbox / "Проекты отдела")) == ["План.mp4"]
+    out = cfg.outbox / "Проекты отдела"
+    assert os.listdir(out) == ["План"] and sorted(os.listdir(out / "План" / "transcript")) == [
+        "raw", "План.json", "План.names.json", "План.txt"]
+    assert json.loads((out / "План" / f"План{ledger.MARKER_SUFFIX}").read_text(encoding="utf-8"))["file"] == new
+    assert service.ledger.get(new)["stem"] == "План" and service.ledger.get(new)["output"] == str(out / "План")
+    (cfg.inbox / "Проекты отдела" / "итоги.mp4").write_bytes(b"other")
+    with pytest.raises(records.RecordError) as e:
+        records.rename(cfg, service, new, "ИТОГИ")                   # а другая запись с тем же именем — занята
+    assert e.value.status == 409
+
+
+def test_new_record_name_from_a_mac_is_stored_in_one_form(tmp_path):
+    cfg, service = setup(tmp_path)
+    new = records.rename(cfg, service, FILE, unicodedata.normalize("NFD", "Итоги ё"))
+    assert new == "Проекты отдела/Итоги ё.mp4" and (cfg.inbox / new).is_file() and list(service.ledger.records) == [new]

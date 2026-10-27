@@ -25,6 +25,11 @@ from .config import Settings
 MODE = "transcript"
 
 
+class NoSpeechError(media.NoAudioError):
+    """Звук в записи есть, но распознавание не нашло в нём ни слова. Исход тот же, что у записи без
+    звука (no_audio), — окончательный; только деньги за распознавание уже потрачены."""
+
+
 def now_iso() -> str:
     return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
 
@@ -42,7 +47,8 @@ def _load_stage(out_dir: Path, stem: str, stage: str) -> dict | None:
     Нужно после обрыва: контейнер могли перезапустить между расшифровкой
     и протоколом, и платить за уже сделанное второй раз незачем.
     Недописанный при аварии файл не разберётся как JSON — шаг просто
-    выполнится заново.
+    выполнится заново. Удачное распознавание без единой реплики (в записи нет речи) — тоже
+    готовый результат: повтор без force его не оплачивает.
 
     Какой моделью расшифровка сделана, здесь не сверяется: готовая расшифровка
     годится при любой выбранной сейчас модели. Иначе смена модели распознавания
@@ -53,7 +59,7 @@ def _load_stage(out_dir: Path, stem: str, stage: str) -> dict | None:
     """
     data = _load_json(out_dir / stage / f"{stem}.json")
     meta = _load_json(out_dir / stage / f"{stem}.meta.json")
-    if not data.get("segments") or not meta.get("success"):
+    if not isinstance(data.get("segments"), list) or not meta.get("success"):
         return None
     return {"meta": meta, "segments": data["segments"],
             "speakers": data.get("speakers") or [],
@@ -280,6 +286,11 @@ async def process(
             log("шаг 1: расшифровка — беру результат прошлого запуска"
                 + (f" ({t['meta']['model']})" if t["meta"].get("model") else "") + ", в API не отправляю")
         meta = t["meta"]
+        if not t["segments"]:
+            # Распознавание прошло и оплачено, но не услышало ни слова. Исход окончательный, как
+            # у записи без звука: с ошибкой повтор по расписанию распознавал бы тишину снова, за деньги.
+            record.update({"speech_model": meta.get("model"), "audio_duration_sec": meta.get("audio_duration_sec")})
+            raise NoSpeechError("распознавание не нашло в записи речи")
 
         record.update({
             "speech_model": meta.get("model"),
@@ -359,6 +370,9 @@ async def process(
                            "summary_chars": 0})
             log(f"протокол не сделан: {rel} — {e}. Расшифровка на месте и при "
                 f"повторе без force заново оплачена не будет")
+    except NoSpeechError as e:
+        record.update({"status": "no_audio", "error": str(e)})
+        log(f"нет речи: {rel} — {e}. Автоматически не повторяю: распознавание той же тишины снова стоило бы денег")
     except media.NoAudioError as e:
         record.update({"status": "no_audio", "error": str(e)})
         log(f"нет звука: {rel} — {e}. В API не отправляю, деньги не тратятся")

@@ -4,9 +4,14 @@ import asyncio
 import contextlib
 import dataclasses
 import json
+import os
 import sqlite3
+import subprocess
 import types
+import unicodedata
 from pathlib import Path
+
+import pytest
 
 from app import db, dictionary, pipeline, records, watcher
 from app.ledger import Ledger
@@ -324,3 +329,124 @@ def test_new_record_does_not_take_the_results_of_a_gone_one_with_the_same_name(t
     drain(svc)
     assert seen.stems == {"Проекты/вкс.mp3": "вкс.mp3"}
     assert svc.ledger.get("Проекты/вкс.wav")["stem"] == "вкс"                # у прежней — её имя
+
+
+# ---------- имена на диске в разложенной форме (NFD) ----------
+
+def nfd(text: str) -> str:
+    return unicodedata.normalize("NFD", text)
+
+
+def logged(tmp_path, workers=1):
+    svc = service(tmp_path, workers)
+    svc.lines = []
+    svc.log = svc.lines.append
+    return svc
+
+
+def test_new_file_copied_from_a_mac_gets_the_name_in_one_form_before_it_is_taken(tmp_path):
+    """Mac по сети кладёт «Отчёт й/Встреча ё.mp3» разложенными буквами. Страница и база знают имена
+    в составной форме (NFC); запись взята под разложенным именем жила бы отдельно от них. Сканер
+    приводит имя на диске к составной форме — когда файл докопирован, — и берёт запись уже под ним."""
+    svc = logged(tmp_path)
+    (svc.cfg.inbox / nfd("Отчёт й")).mkdir()
+    (svc.cfg.inbox / nfd("Отчёт й") / nfd("Встреча ё.mp3")).write_bytes(b"audio")
+    svc.scan_once()
+    assert svc.queue == [] and list(svc.pending) == [nfd("Отчёт й/Встреча ё.mp3")]   # пока копируется — не трогает
+    assert os.listdir(svc.cfg.inbox) == [nfd("Отчёт й")]
+    svc.scan_once()
+    assert [i.path for i in svc.queue] == ["Отчёт й/Встреча ё.mp3"] and svc.pending == {}
+    assert os.listdir(svc.cfg.inbox) == ["Отчёт й"] and os.listdir(svc.cfg.inbox / "Отчёт й") == ["Встреча ё.mp3"]
+    assert any("составной форме" in line for line in svc.lines)
+
+
+def test_empty_folder_from_a_mac_gets_the_name_in_one_form(tmp_path):
+    svc = logged(tmp_path)
+    (svc.cfg.inbox / nfd("Пустая й")).mkdir()
+    svc.scan_once()
+    assert os.listdir(svc.cfg.inbox) == ["Пустая й"]
+
+
+def test_name_already_known_to_the_ledger_or_taken_in_the_other_form_stays(tmp_path):
+    """Запись, обработанная под разложенным именем до этой версии, на диске не переименовывается:
+    её строка журнала, права и словари — под прежним. И файл, рядом с которым уже лежит тот же в
+    составной форме, — тоже: это два разных файла."""
+    svc = logged(tmp_path)
+    known = nfd("Старое й") + "/вкс.mp3"
+    (svc.cfg.inbox / nfd("Старое й")).mkdir()
+    (svc.cfg.inbox / known).write_bytes(b"audio")
+    svc.ledger.put({"file": known, "stem": "вкс", "status": "ok", "output": "x"})
+    (svc.cfg.inbox / "Встреча ё.mp3").write_bytes(b"first")
+    (svc.cfg.inbox / nfd("Встреча ё.mp3")).write_bytes(b"second")
+    svc.ledger.put({"file": "Встреча ё.mp3", "stem": "Встреча ё", "status": "ok", "output": "y"})
+    for _ in range(3):
+        svc.scan_once()
+    assert sorted(os.listdir(svc.cfg.inbox)) == sorted(["Встреча ё.mp3", nfd("Встреча ё.mp3"), nfd("Старое й")])
+    assert [i.path for i in svc.queue] == [nfd("Встреча ё.mp3")]
+    warned = [line for line in svc.lines if "разложенной форме" in line]
+    assert len(warned) == 2                                             # по разу на имя, не на каждом обходе
+
+
+# ---------- недокопированный файл: копия по сети замерла, размер «устоялся» ----------
+
+def made(tmp_path, name, *args):
+    """Настоящая запись на 20 с (ffmpeg из образа сервиса): синус, у видео — ещё и картинка."""
+    path = tmp_path / "src" / name
+    path.parent.mkdir(exist_ok=True)
+    video = ["-f", "lavfi", "-i", "testsrc=d=20:s=64x48:r=5"] if path.suffix in (".mp4", ".mkv") else []
+    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "sine=f=440:d=20", *video, "-shortest", *args, str(path)],
+                   check=True, timeout=120)
+    return path.read_bytes()
+
+
+CASES = [("встреча.mp4", ()), ("быстрая.mp4", ("-movflags", "+faststart")), ("звонок.m4a", ()), ("созвон.mkv", ()),
+         ("диктофон.mp3", ("-b:a", "64k")), ("микрофон.wav", ()), ("лекция.flac", ())]
+
+
+@pytest.mark.parametrize("cut", ["third", "tail"])
+@pytest.mark.parametrize("name, args", CASES, ids=[Path(n).suffix for n, _ in CASES])
+def test_file_cut_short_is_not_taken_until_it_is_whole(tmp_path, name, args, cut):
+    """Копия по сети замерла на трети или под самый конец: размер и время не меняются, но в файле нет конца. Платно
+    распознавать такой нельзя — сканер ждёт, пишет почему, а докопированный берёт как обычно."""
+    whole = made(tmp_path, name, *args)
+    svc = logged(tmp_path)
+    (svc.cfg.inbox / name).write_bytes(whole[:len(whole) * {"third": 33, "tail": 85}[cut] // 100])
+    for _ in range(3):
+        svc.scan_once()
+    assert svc.queue == [] and list(svc.pending) == [name]
+    waiting = [line for line in svc.lines if "докопирован не до конца" in line]
+    assert len(waiting) == 1 and name in waiting[0]                     # один раз, а не на каждом обходе
+    (svc.cfg.inbox / name).write_bytes(whole)                           # копия дошла до конца
+    svc.scan_once()
+    svc.scan_once()
+    assert [i.path for i in svc.queue] == [name]
+
+
+@pytest.mark.parametrize("name, args", CASES + [("звук.ogg", ()), ("видео-без-звука.mp4", ("-an",))],
+                         ids=[Path(n).suffix for n, _ in CASES] + [".ogg", "no-audio"])
+def test_whole_files_are_taken_at_once(tmp_path, name, args):
+    if name == "видео-без-звука.mp4":
+        path = tmp_path / name
+        subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc=d=5:s=64x48:r=5", str(path)],
+                       check=True, timeout=120)
+        whole = path.read_bytes()
+    else:
+        whole = made(tmp_path, name, *args)
+    svc = logged(tmp_path)
+    (svc.cfg.inbox / name).write_bytes(whole)
+    svc.scan_once()
+    svc.scan_once()
+    assert [i.path for i in svc.queue] == [name]
+    assert not [line for line in svc.lines if "докопирован не до конца" in line]
+
+
+def test_two_files_copied_into_one_folder_from_a_mac_are_both_taken(tmp_path):
+    """Оба файла папки докопированы: каждый ждал бы, пока докопируется другой, — и ни один бы не пошёл."""
+    svc = logged(tmp_path)
+    (svc.cfg.inbox / nfd("Отчёт й")).mkdir()
+    for name in ("первая.mp3", "вторая.mp3"):
+        (svc.cfg.inbox / nfd("Отчёт й") / name).write_bytes(b"audio")
+    for _ in range(4):
+        svc.scan_once()
+    assert sorted(i.path for i in svc.queue) == ["Отчёт й/вторая.mp3", "Отчёт й/первая.mp3"]
+    assert os.listdir(svc.cfg.inbox) == ["Отчёт й"] and svc.pending == {}

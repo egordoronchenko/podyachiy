@@ -20,6 +20,8 @@ Service.scan_lock, а сами функции идут в событийном �
 from __future__ import annotations
 
 import json
+import os
+import secrets
 import shutil
 import time
 from pathlib import Path
@@ -28,6 +30,7 @@ from . import marks, series, upload, users
 
 TRASH = ".trash"
 TRASH_DAYS = 30
+NOTE = "удалено.json"           # опись удалённого рядом с ним в корзине
 # один текст на несуществующую и на закрытую человеку папку: существование чужой не раскрывается
 NO_FOLDER = "такой папки нет или она вам не открыта"
 # папка результатов записи «вкс.mp3» — «вкс»: подпапка «вкс» положила бы свои результаты туда же
@@ -40,6 +43,28 @@ class FolderError(Exception):
     def __init__(self, status: int, detail: str):
         super().__init__(detail)
         self.status, self.detail = status, detail
+
+
+def same_place(old: Path, new: Path) -> bool:
+    """Ведёт ли другое имя к тому же файлу или папке. Так бывает на томах без различия регистра
+    (Windows, macOS, папка Windows в Docker Desktop): «Папка» и «папка» там — одна папка, и новое
+    имя, отличное только регистром, «уже занято» ею самой."""
+    try:
+        return old != new and os.path.samefile(old, new)
+    except OSError:
+        return False
+
+
+def move(old: Path, new: Path) -> None:
+    """Переименование файла или папки. Смена одного регистра (same_place) — через промежуточное
+    имя рядом: не всякий такой том переименовывает «Папку» в «папку» напрямую — иной молча оставляет
+    прежнее имя. Промежуточное имя начинается с точки — сканер такое не смотрит."""
+    if same_place(old, new):
+        step = old.with_name(f".{old.name}.{secrets.token_hex(4)}")
+        old.rename(step)
+        step.rename(new)
+    else:
+        old.rename(new)
 
 
 def _inside(path: str, folder: str) -> bool:
@@ -73,17 +98,18 @@ def rename(cfg, service, people: users.Users, folder: str, name: str, also=None)
     also(новый путь) — что ещё записать в базу той же транзакцией: словари, событие журнала."""
     folder = _path(cfg, folder)
     _check(folder, service, people)
+    name = upload.nfc(name.strip())
     try:
-        upload._check_part(name.strip(), "имя папки")
+        upload._check_part(name, "имя папки")
     except upload.UploadError as e:
         raise FolderError(e.status, e.detail)
     parent = folder.rsplit("/", 1)[0] if "/" in folder else ""
-    target = f"{parent}/{name.strip()}" if parent else name.strip()
+    target = f"{parent}/{name}" if parent else name
     if target == folder:
         return folder
-    if (cfg.inbox / target).exists():
+    if (cfg.inbox / target).exists() and not same_place(cfg.inbox / folder, cfg.inbox / target):
         raise FolderError(409, "папка с таким именем здесь уже есть")
-    if (cfg.outbox / target).exists():
+    if (cfg.outbox / target).exists() and not same_place(cfg.outbox / folder, cfg.outbox / target):
         raise FolderError(409, RESULTS_TAKEN)
     if not (cfg.inbox / folder).is_dir() and not (cfg.outbox / folder).is_dir():
         raise FolderError(404, NO_FOLDER)
@@ -91,7 +117,7 @@ def rename(cfg, service, people: users.Users, folder: str, name: str, also=None)
     try:
         for root in (cfg.inbox, cfg.outbox):
             if (root / folder).is_dir():
-                (root / folder).rename(root / target)
+                move(root / folder, root / target)
                 moved.append(root)
         with service.ledger.db.write():
             service.ledger.move(folder, target, str(cfg.outbox / folder), str(cfg.outbox / target))
@@ -101,7 +127,7 @@ def rename(cfg, service, people: users.Users, folder: str, name: str, also=None)
                 also(target)
     except BaseException:
         for root in reversed(moved):
-            (root / target).rename(root / folder)
+            move(root / target, root / folder)
         raise
     return target
 
@@ -129,6 +155,7 @@ def remove(cfg, service, people: users.Users, folder: str, by: str, also=None) -
     name = folder.rsplit("/", 1)[-1]
     moved = []
     done = {"records": 0, "trash": f"{TRASH}/{stamp}", "keep_days": TRASH_DAYS}
+    note = cfg.outbox / TRASH / stamp
     try:
         for root in (cfg.inbox, cfg.outbox):
             if (root / folder).is_dir():
@@ -145,19 +172,24 @@ def remove(cfg, service, people: users.Users, folder: str, by: str, also=None) -
             done["records"] = len(records)
             if also:
                 also(done)
+            # что это было и откуда — рядом с результатами, чтобы папку можно было вернуть руками.
+            # До записи базы: не записалась опись — удаления нет, а не «удалено, но отказ 500»
+            trash_note(note, {"folder": folder, "by": by, "at": stamp, "moved": [str(binned) for _, binned in moved],
+                              "records": records, "marks": noted})
     except BaseException:
+        (note / NOTE).unlink(missing_ok=True)
         for place, binned in reversed(moved):
             binned.rename(place)
             _tidy(binned.parent)
+        _tidy(note)
         raise
-    # что это было и откуда — рядом с результатами, чтобы папку можно было вернуть руками
-    note = cfg.outbox / TRASH / stamp
-    note.mkdir(parents=True, exist_ok=True)
-    (note / "удалено.json").write_text(json.dumps(
-        {"folder": folder, "by": by, "at": stamp, "moved": [str(binned) for _, binned in moved],
-         "records": records, "marks": noted},
-        ensure_ascii=False, indent=1), encoding="utf-8")
     return done
+
+
+def trash_note(where: Path, what: dict) -> None:
+    """Опись удалённого в папке корзины: что это было, кто и когда удалил, где оно теперь."""
+    where.mkdir(parents=True, exist_ok=True)
+    (where / NOTE).write_text(json.dumps(what, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
 def _tidy(bin_dir: Path) -> None:

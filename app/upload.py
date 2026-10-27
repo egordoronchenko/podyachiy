@@ -4,7 +4,10 @@
 файле внутри входной папки, и только целиком собранная запись переименованием
 становится на своё место — сканер недогруженного файла не увидит. Если связь
 оборвалась или вкладку закрыли, тот же файл, выбранный снова, продолжит
-грузиться с принятого места: временный файл находится по папке, имени и размеру.
+грузиться с принятого места: временный файл находится по папке, имени и размеру записи, а ещё
+по тому, чья это загрузка, — кто грузит и время изменения файла у него (страница присылает его
+вместе с частью). Иначе два разных файла с одним именем и размером — двое людей или один человек
+с двумя файлами — продолжали бы друг друга, и запись склеилась бы из двух половин.
 
 Программа (ИИ-клиент с curl) шлёт запись одним запросом, без частей: тело пишется
 потоком в такой же временный файл и тем же переименованием встаёт на место. Продолжения
@@ -20,6 +23,7 @@ import os
 import secrets
 import shutil
 import time
+import unicodedata
 from pathlib import Path, PurePosixPath
 
 from . import media
@@ -42,6 +46,14 @@ class UploadError(Exception):
         self.status, self.detail = status, detail
 
 
+def nfc(text: str) -> str:
+    """Имя в составной форме Unicode (NFC). macOS присылает «й» и «ё» разложенными (NFD): буква и
+    знак над ней отдельно. На вид то же, а для диска и базы — другое имя: две «одинаковые» папки или
+    записи рядом, права, выданные на одну, не действуют на другую. Все пути, что приходят от людей,
+    проходят через target_rel или folder_rel — там они и приводятся к одной форме."""
+    return unicodedata.normalize("NFC", text)
+
+
 def _check_part(part: str, what: str) -> None:
     if (not part or part != part.strip() or part.startswith((".", "~$")) or part.endswith(".")
             or len(part) > NAME_MAX or any(c in FORBIDDEN or ord(c) < 32 for c in part)):
@@ -50,7 +62,8 @@ def _check_part(part: str, what: str) -> None:
 
 def target_rel(folder: str, name: str, outbox_inside: Path | None) -> str:
     """Путь записи относительно входной папки — или отказ с объяснением."""
-    parts = [p for p in folder.replace("\\", "/").split("/") if p]
+    parts = [nfc(p) for p in folder.replace("\\", "/").split("/") if p]
+    name = nfc(name)
     for p in parts:
         _check_part(p, "имя папки")
     _check_part(name, "имя файла")
@@ -65,7 +78,7 @@ def target_rel(folder: str, name: str, outbox_inside: Path | None) -> str:
 
 def folder_rel(folder: str, outbox_inside: Path | None) -> str:
     """Путь новой папки относительно входной — или отказ с объяснением."""
-    parts = [p for p in folder.replace("\\", "/").split("/") if p]
+    parts = [nfc(p) for p in folder.replace("\\", "/").split("/") if p]
     if not parts:
         raise UploadError(400, "у папки должно быть имя")
     for p in parts:
@@ -85,8 +98,10 @@ def folder_arg(folder: str, outbox_inside: Path | None) -> str:
     return folder_rel(folder, outbox_inside)
 
 
-def part_path(inbox: Path, rel: str, size: int) -> Path:
-    key = hashlib.sha1(f"{rel}\0{size}".encode("utf-8")).hexdigest()[:20]
+def part_path(inbox: Path, rel: str, size: int, owner: str, stamp: str) -> Path:
+    """Временный файл загрузки. owner — логин того, кто грузит; stamp — время изменения файла
+    у него, как его прислала страница: по ним одна загрузка отличается от другой с тем же именем."""
+    key = hashlib.sha1(f"{rel}\0{size}\0{owner}\0{stamp}".encode("utf-8")).hexdigest()[:20]
     return inbox / PARTS_DIR / f"{key}.part"
 
 
@@ -120,7 +135,7 @@ def sweep(inbox: Path, now: float | None = None) -> list[str]:
     return removed
 
 
-def received(inbox: Path, rel: str, size: int, max_bytes: int) -> int:
+def received(inbox: Path, rel: str, size: int, max_bytes: int, owner: str, stamp: str) -> int:
     """Сколько байт этой записи уже принято. Заодно все проверки до начала загрузки."""
     if size <= 0:
         raise UploadError(400, "файл пустой")
@@ -128,7 +143,7 @@ def received(inbox: Path, rel: str, size: int, max_bytes: int) -> int:
         raise UploadError(413, f"файл больше предела {max_bytes / 2**30:.0f} ГБ")
     if (inbox / rel).exists():
         raise UploadError(409, "запись с таким именем в этой папке уже есть")
-    part = part_path(inbox, rel, size)
+    part = part_path(inbox, rel, size, owner, stamp)
     have = part.stat().st_size if part.is_file() else 0
     free = shutil.disk_usage(inbox).free
     if free < size - have:
@@ -136,7 +151,7 @@ def received(inbox: Path, rel: str, size: int, max_bytes: int) -> int:
     return have
 
 
-def append(inbox: Path, rel: str, size: int, offset: int, data: bytes) -> tuple[int, bool]:
+def append(inbox: Path, rel: str, size: int, offset: int, data: bytes, owner: str, stamp: str) -> tuple[int, bool]:
     """Дописывает часть. Возвращает, сколько принято всего и собрана ли запись.
 
     Часть принимается только встык к уже принятому: при расхождении страница
@@ -145,7 +160,7 @@ def append(inbox: Path, rel: str, size: int, offset: int, data: bytes) -> tuple[
     target = inbox / rel
     if target.exists():
         raise UploadError(409, "запись с таким именем в этой папке уже есть")
-    part = part_path(inbox, rel, size)
+    part = part_path(inbox, rel, size, owner, stamp)
     have = part.stat().st_size if part.is_file() else 0
     if offset != have:
         raise UploadError(409, f"часть не встык: принято {have}, пришло с {offset}")
@@ -166,8 +181,8 @@ def append(inbox: Path, rel: str, size: int, offset: int, data: bytes) -> tuple[
     return have, True
 
 
-def cancel(inbox: Path, rel: str, size: int) -> None:
-    part_path(inbox, rel, size).unlink(missing_ok=True)
+def cancel(inbox: Path, rel: str, size: int, owner: str, stamp: str) -> None:
+    part_path(inbox, rel, size, owner, stamp).unlink(missing_ok=True)
 
 
 # ---------- загрузка одним запросом ----------

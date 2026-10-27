@@ -2,7 +2,8 @@
 
 Источник — Markdown (install/README.md, docs/guide/README.md), собранные файлы лежат в репозитории
 и в образе. Проверяется, что они не отстали от источника, что каждая внутренняя ссылка куда-то ведёт
-и что файл ничего не просит из сети: его открывают с диска и из вложения письма.
+и что файл ничего не просит из сети: его открывают с диска и из вложения письма. Экземпляр в сервисе
+(/install-guide) — страница сервиса: сценарий у него отдельным файлом, шрифт и картинки — из /static/.
 """
 import importlib.util
 import re
@@ -17,7 +18,7 @@ docs_build = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(docs_build)
 
 BUILT = docs_build.build()
-FILES = sorted(BUILT, key=str)
+FILES = sorted((path for path in BUILT if path.suffix == ".html"), key=str)
 SIBLINGS = {"podyachiy.html", "podyachiy-demo.html", "podyachiy-guide.html", "podyachiy-install.html",
             "podyachiy-personal.html"}
 SERVICE_PAGES = {"/", "/help", "/install-guide"}
@@ -59,12 +60,12 @@ def parsed(path: Path) -> Page:
 
 
 def test_all_four_documents_are_built():
-    assert {path.relative_to(ROOT).as_posix() for path in FILES} == {
-        "site/podyachiy-install.html", "app/static/install-guide.html", "site/podyachiy-guide.html",
-        "site/podyachiy-personal.html"}
+    assert {path.relative_to(ROOT).as_posix() for path in BUILT} == {
+        "site/podyachiy-install.html", "app/static/install-guide.html", "app/static/install-guide.js",
+        "site/podyachiy-guide.html", "site/podyachiy-personal.html"}
 
 
-@pytest.mark.parametrize("path", FILES, ids=lambda p: p.name)
+@pytest.mark.parametrize("path", sorted(BUILT, key=str), ids=lambda p: p.name)
 def test_built_file_matches_its_source(path):
     """Правили install/README.md, docs/guide/README.md, снимки или VERSION — пересоберите документы."""
     assert path.is_file(), f"нет файла {path.relative_to(ROOT)} — пересоберите: python tools/docs_build.py"
@@ -95,14 +96,22 @@ def test_every_internal_link_resolves(path):
 
 @pytest.mark.parametrize("path", FILES, ids=lambda p: p.name)
 def test_file_asks_nothing_from_the_network(path):
-    """Картинки, шрифт и значок вшиты; сценарий и стили — внутри; адресов в стилях и сценарии нет."""
+    """Картинки, шрифт и значок вшиты; сценарий и стили — внутри; адресов в стилях и сценарии нет.
+    У экземпляра в сервисе всё это — файлы самого сервиса (/static/): встроенный сценарий его
+    страница не исполнит (Content-Security-Policy)."""
     page = parsed(path)
-    assert page.loads and all(value.startswith("data:") for value in page.loads), [v[:60] for v in page.loads if not v.startswith("data:")]
+    own = "/static/" if path == docs_build.INSTALL_APP else "data:"
+    assert page.loads and all(value.startswith(own) for value in page.loads), [v[:60] for v in page.loads if not v.startswith(own)]
     for css in page.styles:
-        assert all(url.strip("\"'").startswith("data:") for url in re.findall(r"url\(([^)]+)\)", css))
+        assert all(url.strip("\"'").startswith(own) for url in re.findall(r"url\(([^)]+)\)", css))
         assert "@import" not in css
     text = path.read_text(encoding="utf-8")
-    script = re.search(r"<script>(.*?)</script>", text, flags=re.S).group(1)
+    if path == docs_build.INSTALL_APP:
+        assert '<script src="/static/install-guide.js"></script>' in text and "<script>" not in text
+        script = docs_build.INSTALL_APP_JS.read_text(encoding="utf-8")
+        assert all((docs_build.STATIC / value.removeprefix("/static/")).is_file() for value in page.loads)
+    else:
+        script = re.search(r"<script>(.*?)</script>", text, flags=re.S).group(1)
     assert not re.search(r"https?://|fetch\(|XMLHttpRequest|import\(|new Image|sendBeacon", script)
     assert text.count("<script") == 1 and "<link rel=\"stylesheet\"" not in text and "<iframe" not in text
 
