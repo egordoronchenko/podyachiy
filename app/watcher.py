@@ -29,6 +29,8 @@ from .ledger import MAX_FAILURES, RETRY_AFTER_SEC, RETRY_STATUSES, Ledger
 # временные файлы копирования: пока идёт передача, имя выглядит так
 TEMP_SUFFIXES = {".tmp", ".part", ".crdownload", ".partial", ".!ut"}
 TEMP_PREFIXES = ("~$",)
+# Исход прогона, который база не приняла, пробуем записать снова не чаще этого
+SAVE_RETRY_SEC = 30
 
 
 def hidden(rel: str) -> bool:
@@ -97,6 +99,14 @@ class Service:
     # Записи в работе: по словарю на обработчик, занятый делом. Меняется только из
     # событийного цикла; сканер и страницы читают копию.
     running: list[dict] = field(default_factory=list)
+    # Исходы прогонов, которые база не приняла (диск полон, папка состояния отвалилась): по
+    # пути записи — (задание, строка журнала обработки, строка до прогона, писать ли прогон в
+    # журнал событий). Пока исход здесь, запись в обработку не идёт: строки журнала у неё нет, и
+    # сканер счёл бы её новой — платный прогон заново, по кругу, а расход первого пропал бы.
+    # Обработчики пробуют записать их снова (_save_unsaved). Живут в памяти: перезапуск
+    # сервиса до записи их теряет.
+    unsaved: dict[str, tuple] = field(default_factory=dict)
+    unsaved_at: float = 0.0      # monotonic: когда последний раз пробовали записать
     scans: int = 0
     last_scan: str | None = None
     skipped_outbox: bool = False
@@ -153,7 +163,8 @@ class Service:
 
         # Сначала очередь, потом работа: обработчик заносит запись в работу раньше, чем
         # убирает из очереди, и при таком порядке чтения она не выпадет из обоих списков.
-        busy = {i.path for i in list(self.queue)} | {j["file"] for j in list(self.running)}
+        busy = ({i.path for i in list(self.queue)} | {j["file"] for j in list(self.running)}
+                | set(list(self.unsaved)))
 
         for p in candidates:
             try:
@@ -253,9 +264,12 @@ class Service:
         следом за ним, а не одновременно с ним по тем же файлам. Обработчики за это
         время берут другие записи.
 
+        Задание по записи, чей исход база ещё не приняла (unsaved), тоже ждёт: и ручной запуск —
+        до записи исхода прежнего прогона.
+
         Без await: между выбором и отметкой другой обработчик вклиниться не может.
         """
-        in_work = {j["file"] for j in self.running}
+        in_work = {j["file"] for j in self.running} | set(self.unsaved)
         for item in list(self.queue):
             if item.path in in_work:
                 continue
@@ -285,11 +299,16 @@ class Service:
 
     async def worker_loop(self) -> None:
         while True:
-            taken = self._take()
-            if taken is None:
+            try:
+                self._save_unsaved()
+                taken = self._take()
+                if taken is None:
+                    await asyncio.sleep(1)
+                    continue
+                await self._process(*taken)
+            except Exception as e:  # обработчик, как и сканер, не должен умирать ни при чём
+                self.log(f"сбой обработчика (продолжаю): {e!r}")
                 await asyncio.sleep(1)
-                continue
-            await self._process(*taken)
 
     async def _process(self, item: QueueItem, job: dict) -> None:
         # строки нескольких записей идут в лог вперемешку — у каждой подпись, чья она
@@ -309,37 +328,69 @@ class Service:
             job["chunks_total"] = total
 
         prev = self.ledger.get(item.path)
-        stem = pipeline.stem_of(self.cfg.inbox, item.path, prev)
         try:
-            record = await pipeline.process(
-                replace(self.cfg, model=item.model or self.speech_model()), item.path, stem, item.template, item.force,
-                item.manual, job_log, on_progress,
-                neighbours=self.ledger.history(limit=len(self.ledger.records)),
-                words=self.words(item.path), marked=self.marked,
-                series=self.series(item.path))
-            # исход записи и её расход — одной транзакцией: строка журнала обработки без
-            # строки расходов означала бы прогон, которого нет в отчёте
+            stem = pipeline.stem_of(self.cfg.inbox, item.path, prev)
+            run = True
+            try:
+                record = await pipeline.process(
+                    replace(self.cfg, model=item.model or self.speech_model()), item.path, stem, item.template,
+                    item.force, item.manual, job_log, on_progress,
+                    neighbours=self.ledger.history(limit=len(self.ledger.records)),
+                    words=self.words(item.path), marked=self.marked,
+                    series=self.series(item.path))
+            except Exception as e:
+                # сюда не должно доходить: pipeline.process сам ловит всё
+                self.log(f"необработанный сбой на {item.path} (продолжаю обход): {e!r}")
+                record = {
+                    "file": item.path, "stem": stem, "status": "error", "error": str(e)[:500],
+                    "started_at": job["started_at"],
+                    "finished_at": pipeline.now_iso(), "cost": {},
+                    "manual": item.manual, "force": item.force,
+                }
+                run = False
+            saved = self._save(item, record, prev, run)
+        finally:
+            # после записи в журнал или в unsaved: иначе сканер успел бы принять запись за новую
+            self.running.remove(job)
+        if saved:
+            self._after(item, record, prev)
+
+    def _save(self, item: QueueItem, record: dict, prev: dict | None, run: bool) -> bool:
+        """Исход прогона — в базу. Исход записи и её расход — одной транзакцией: строка журнала
+        обработки без строки расходов означала бы прогон, которого нет в отчёте. Не приняла
+        база — исход остаётся в unsaved, тот самый, с расходом; записать его снова пробуют
+        обработчики (_save_unsaved)."""
+        kept = dict(record)                 # put дописывает в строку счётчики — для повтора нужна прежняя
+        try:
             with self.ledger.db.write():
                 self.ledger.put(record)
-                self.journal.run(record, item.by, item.reason)
+                if run:
+                    self.journal.run(record, item.by, item.reason)
         except Exception as e:
-            # сюда не должно доходить: pipeline.process сам ловит всё
-            self.log(f"необработанный сбой на {item.path} (продолжаю обход): {e!r}")
-            record = {
-                "file": item.path, "stem": stem, "status": "error", "error": str(e)[:500],
-                "started_at": job["started_at"],
-                "finished_at": pipeline.now_iso(), "cost": {},
-                "manual": item.manual, "force": item.force,
-            }
-            try:
-                self.ledger.put(record)
-            except Exception as again:
-                # база не принимает запись (диск полон, папка состояния отвалилась): обработчик
-                # живёт дальше, а запись сканер возьмёт снова — расшифровка на диске переиспользуется
-                self.log(f"ВНИМАНИЕ: исход обработки {item.path} не записан в базу: {again!r}")
-        finally:
-            # после записи в журнал: иначе сканер успел бы принять запись за новую
-            self.running.remove(job)
+            if item.path not in self.unsaved:
+                self.log(f"ВНИМАНИЕ: исход обработки {item.path} не записан в базу ({e!r}). Он и расход прогона "
+                         f"ждут в памяти сервиса, а запись в обработку снова не идёт, пока исход не записан: "
+                         f"пробую записать раз в {SAVE_RETRY_SEC} с. Проверьте место на диске и папку состояния; "
+                         f"перезапуск сервиса до записи исход потеряет")
+            self.unsaved[item.path] = (item, kept, prev, run)
+            self.unsaved_at = time.monotonic()
+            return False
+        if self.unsaved.pop(item.path, None) is not None:
+            self.log(f"исход обработки {item.path} записан в базу")
+        return True
+
+    def _save_unsaved(self) -> None:
+        """Исходы, которые база не приняла, — ещё раз, не чаще раза в SAVE_RETRY_SEC."""
+        if not self.unsaved or time.monotonic() - self.unsaved_at < SAVE_RETRY_SEC:
+            return
+        self.unsaved_at = time.monotonic()
+        for item, record, prev, run in list(self.unsaved.values()):
+            record = dict(record)
+            if self._save(item, record, prev, run):
+                self._after(item, record, prev)
+
+    def _after(self, item: QueueItem, record: dict, prev: dict | None) -> None:
+        """Исход записан: что будет дальше и кому письмо."""
         self._say_retry_plan(item.path)
         self._announce(item, record, prev)
 

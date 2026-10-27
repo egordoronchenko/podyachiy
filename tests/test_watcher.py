@@ -1,8 +1,10 @@
 """Несколько обработчиков над одной очередью: сколько записей идёт сразу и что одна
 запись двумя обработчиками не идёт. Сама обработка подменена — наружу ничего не уходит."""
 import asyncio
+import contextlib
 import dataclasses
 import json
+import sqlite3
 import types
 from pathlib import Path
 
@@ -195,3 +197,84 @@ def test_rebuild_reuses_the_transcript_found_by_the_stem_from_the_ledger(tmp_pat
     assert record["stem"] == "запись.mp3" and record["reused_transcript"] and record["api_calls"] == 0
     assert record["status"] == "no_summary"              # шаблонов в тесте нет — до модели дело не дошло
     assert any("беру результат прошлого запуска" in line for line in lines)
+
+
+def spin(svc, sec=0.3):
+    """Обработчики работают столько-то секунд — очередь может и не разойтись."""
+    async def go():
+        workers = [asyncio.create_task(svc.worker_loop()) for _ in range(svc.cfg.workers)]
+        await asyncio.sleep(sec)
+        for w in workers:
+            w.cancel()
+    asyncio.run(go())
+
+
+def test_outcome_the_base_did_not_take_is_kept_and_not_paid_for_again(tmp_path, monkeypatch):
+    """База не приняла исход прогона (диск полон, папка состояния отвалилась). Прежде запись
+    оставалась без строки журнала, сканер принимал её за новую и платно обрабатывал снова — и так
+    по кругу, а расход прогона терялся. Теперь исход ждёт в памяти, запись в обработку не идёт,
+    пока он не записан, а записывается он тот самый — с расходом."""
+    monkeypatch.setattr(watcher, "SAVE_RETRY_SEC", 0, raising=False)
+    svc = service(tmp_path, workers=1)
+    lines = []
+    svc.log = lines.append
+    calls = []
+
+    async def process(cfg, rel, stem, template, force, manual, log, on_progress=None, **kw):
+        calls.append((rel, manual))
+        return {"file": rel, "stem": stem, "status": "ok", "cost": {"USD": 0.5}, "finished_at": pipeline.now_iso()}
+    monkeypatch.setattr(pipeline, "process", process)
+    told = []
+    svc.journal.uploader = lambda file: "ivanov"
+    svc.tell = lambda record, kind, login, by_hand: told.append((record["file"], kind, login))
+
+    base, broken = svc.ledger.db, [True]
+    real = base.write
+
+    @contextlib.contextmanager
+    def write():
+        if broken[0]:
+            raise sqlite3.OperationalError("disk I/O error")
+        with real() as con:
+            yield con
+    base.write = write
+
+    (svc.cfg.inbox / "вкс.mp4").write_bytes(b"video")
+    svc.queue.append(watcher.QueueItem(path="вкс.mp4"))
+    spin(svc)
+    assert calls == [("вкс.mp4", False)] and svc.ledger.get("вкс.mp4") is None
+    assert sum("исход обработки вкс.mp4 не записан в базу" in line for line in lines) == 1   # сказано один раз
+    svc.scan_once()
+    svc.scan_once()
+    svc.enqueue_manual("вкс.mp4", None, False, "admin", "manual")
+    spin(svc)
+    assert calls == [("вкс.mp4", False)]                 # ни сканер, ни ручной запуск не платят второй раз
+    assert svc.pending == {} and told == []
+
+    broken[0] = False                                    # база снова принимает
+    spin(svc)
+    first, second = svc.journal.runs[:2]
+    assert (first, second) == (("вкс.mp4", "new"), ("вкс.mp4", "manual"))   # исход того прогона — первым
+    assert calls == [("вкс.mp4", False), ("вкс.mp4", True)]                 # ручной запуск — следом
+    assert svc.ledger.get("вкс.mp4")["cost_total"] == {"USD": 1.0}          # расход первого прогона не потерян
+    assert any("исход обработки вкс.mp4 записан в базу" in line for line in lines)
+    assert told[0] == ("вкс.mp4", "ready", "ivanov")
+
+
+def test_failure_outside_the_pipeline_does_not_kill_the_worker(tmp_path, monkeypatch):
+    """Сбой после прогона (письмо, отметка в базе) у одной записи: обработчик пишет его в журнал
+    работы и берёт следующую. Прежде он молча умирал, и очередь стояла до перезапуска."""
+    svc = service(tmp_path, workers=1)
+    lines = []
+    svc.log = lines.append
+    seen = slow_process(monkeypatch, sec=0)
+
+    def uploader(file):
+        if file == "а.mp4":
+            raise RuntimeError("сломалось")
+        return ""
+    svc.journal.uploader = uploader
+    svc.queue = [watcher.QueueItem(path="а.mp4"), watcher.QueueItem(path="б.mp4")]
+    drain(svc, timeout=3)
+    assert seen.order == ["а.mp4", "б.mp4"] and svc.running == []
+    assert any("сбой обработчика" in line and "сломалось" in line for line in lines)
