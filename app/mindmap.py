@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import html
 import json
+import os
 import re
 from pathlib import Path
 
@@ -596,7 +597,10 @@ def write_for(protocol: Path, noted: dict | None = None) -> Path:
         lines = []      # у старых записей расшифровка в другом виде — файл будет без этой вкладки
     # отметки «выполнено» и сроки, заданные человеком, — в таблице задач: файл скачивают и читают без сервиса
     md = marks.stamp(protocol.read_text(encoding="utf-8"), noted or {})
-    target.write_text(page(md, lines), encoding="utf-8")
+    # через временный файл: оборванная запись не оставит на месте карты её половину
+    tmp = target.with_name(target.name + ".tmp")
+    tmp.write_text(page(md, lines), encoding="utf-8")
+    os.replace(tmp, target)
     return target
 
 

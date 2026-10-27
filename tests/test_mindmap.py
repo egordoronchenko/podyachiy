@@ -1,3 +1,5 @@
+import pytest
+
 from app import mindmap
 
 MD = """<!-- протокол: модель x -->
@@ -138,3 +140,22 @@ def test_file_of_the_previous_page_layout_is_rebuilt(tmp_path):
     # свежий файл не трогается
     stamp = target.stat().st_mtime_ns
     assert mindmap.ensure(protocol).stat().st_mtime_ns == stamp
+
+
+def test_interrupted_write_leaves_the_previous_map_whole(tmp_path, monkeypatch):
+    protocol = tmp_path / "вкс" / "summary" / "вкс.md"
+    protocol.parent.mkdir(parents=True)
+    protocol.write_text(MD, encoding="utf-8")
+    target = mindmap.write_for(protocol)
+    before = target.read_text(encoding="utf-8")
+
+    def cut(self, text, *args, **kwargs):      # диск кончился посреди записи: в файле половина
+        with open(self, "w", encoding="utf-8") as f:
+            f.write(text[:len(text) // 2])
+        raise OSError(28, "No space left on device")
+
+    protocol.write_text(MD + "\n- ещё пункт\n", encoding="utf-8")
+    monkeypatch.setattr(mindmap.Path, "write_text", cut)
+    with pytest.raises(OSError):
+        mindmap.write_for(protocol)
+    assert target.read_text(encoding="utf-8") == before
