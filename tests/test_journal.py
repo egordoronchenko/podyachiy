@@ -2,7 +2,7 @@ import sqlite3
 
 import pytest
 
-from app import db, journal, usage
+from app import db, journal, migrate, usage
 
 usd = lambda v: {"USD": v}
 
@@ -263,3 +263,21 @@ def test_series_is_split_inside_the_period_by_folder_person_and_stage(tmp_path):
     assert list(journal.report(events, "2026-10-01", "2026-10-31", "month")["split"]["folders"]) == ["2026-10"]
     assert journal.report([], bucket="month")["split"] == {"folders": {}, "users": {}, "stages": {}}
     assert journal.report([], bucket="month")["paid_audio"] == {"total": {}, "series": {}}
+
+
+def test_deleted_folder_keeps_its_spending_and_uploaders_away_from_a_new_folder_with_the_same_name(tmp_path):
+    """Папку удалили и завели новую с тем же именем: расходы и авторы загрузок прежней к новой не
+    относятся и при её переименовании за ней не уходят — так же, как у удалённой записи."""
+    j = journal.Journal(db.Database(tmp_path))
+    j.write("upload", "ivanov", file="Проекты/Сметы/а.mp4", size=10)
+    run(j, "Проекты/Сметы/а.mp4", 0.5)
+    j.write("folder_delete", "admin", folder="Проекты", records=1, trash=".trash/x")
+    assert j.uploaded == {}
+    # по тому же пути легла другая запись — мимо страницы: автора у неё нет
+    assert run(j, "Проекты/Сметы/а.mp4", 0.2)["uploaded_by"] == ""
+    j.write("folder_rename", "admin", folder="Проекты", to="Архив")
+    for rep in (j.report(), journal.report(j.read())):               # из базы и проигрыванием событий — одно и то же
+        assert {r["file"]: r["cost"] for r in rep["records"]} == {"Проекты/Сметы/а.mp4": usd(0.5),
+                                                                  "Архив/Сметы/а.mp4": usd(0.2)}
+        assert {u["login"]: u["cost"] for u in rep["users"]} == {"ivanov": usd(0.5), "": usd(0.2)}
+    assert migrate._uploaded(j.read()) == j.uploaded == {}           # перенос в базу сверяет авторов тем же правилом

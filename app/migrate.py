@@ -477,6 +477,8 @@ def _uploaded(events: list[dict]) -> dict[str, str]:
             found[event["to"]] = found.pop(event["file"])
         elif kind == "record_delete":
             found.pop(event["file"], None)
+        elif kind == "folder_delete":
+            found = {f: by for f, by in found.items() if not f.startswith(event["folder"] + "/")}
     return found
 
 
