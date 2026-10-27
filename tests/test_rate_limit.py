@@ -104,12 +104,18 @@ def test_speech_does_not_repeat_a_refused_key(wire, tmp_path, status):
     assert pauses == [] and lines == [] and len(replies) == 1      # второй ответ не запрошен
 
 
-def test_speech_still_repeats_other_refusals(wire, tmp_path):
+def test_speech_does_not_repeat_a_refused_request_but_repeats_a_failure(wire, tmp_path):
     replies, pauses, Client = wire
     chunk = tmp_path / "часть.mp3"
     chunk.write_bytes(b"mp3")
     words = {"words": [], "usage": {"cost": 0.1}}
-    replies += [Reply(400), Reply(404), Reply(200, words)]
+    # плохой запрос повтор не исправит: сразу ошибка, без пауз, второй ответ не запрошен
+    replies += [Reply(400), Reply(200, words)]
+    with pytest.raises(providers.Rejected):
+        asyncio.run(speech.call_stt(Client(), CFG, chunk))
+    assert pauses == [] and len(replies) == 1
+    # сбой поставщика повторяется
+    replies[:] = [Reply(503), Reply(408), Reply(200, words)]
     assert asyncio.run(speech.call_stt(Client(), CFG, chunk)) == words and pauses == [15, 30]
 
 
