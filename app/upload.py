@@ -29,6 +29,11 @@ CHUNK_BYTES = 8 * 1024 * 1024   # размер части, который сер
 STALE_SEC = 7 * 86400           # брошенная недогрузка живёт неделю
 FORBIDDEN = set('<>:"|?*\\/')   # входная папка обычно лежит на Windows
 NAME_MAX = 200
+# Папка загрузки заводится в её начале (первой частью или перед приёмом тела), а в конце её уже
+# не заводят: пропала — значит, её переименовали или удалили, пока шла загрузка. Иначе последняя
+# часть воскрешала бы папку под старым именем рядом с переименованной или на месте удалённой.
+FOLDER_GONE = ("папки, куда шла загрузка, больше нет: её переименовали или удалили, пока файл грузился, — "
+               "выберите папку и загрузите запись заново")
 
 
 class UploadError(Exception):
@@ -146,13 +151,17 @@ def append(inbox: Path, rel: str, size: int, offset: int, data: bytes) -> tuple[
         raise UploadError(409, f"часть не встык: принято {have}, пришло с {offset}")
     if not data or have + len(data) > size:
         raise UploadError(400, "часть не подходит по размеру")
+    if have == 0:
+        target.parent.mkdir(parents=True, exist_ok=True)
+    elif not target.parent.is_dir():
+        part.unlink()           # докачать её уже некуда
+        raise UploadError(409, FOLDER_GONE)
     part.parent.mkdir(exist_ok=True)
     with open(part, "ab") as f:
         f.write(data)
     have += len(data)
     if have < size:
         return have, False
-    target.parent.mkdir(parents=True, exist_ok=True)
     os.rename(part, target)     # в пределах одной папки-тома: запись появляется сразу целой
     return have, True
 
@@ -174,6 +183,7 @@ def stream_start(inbox: Path, rel: str, expected: int | None, max_bytes: int) ->
         free = shutil.disk_usage(inbox).free
         if free < expected:
             raise UploadError(507, f"на диске не хватает места: свободно {free / 2**30:.1f} ГБ")
+    (inbox / rel).parent.mkdir(parents=True, exist_ok=True)
     (inbox / PARTS_DIR).mkdir(exist_ok=True)
     return inbox / PARTS_DIR / f"stream-{secrets.token_hex(10)}.part"
 
@@ -186,6 +196,7 @@ def stream_finish(inbox: Path, rel: str, part: Path) -> int:
     target = inbox / rel
     if target.exists():
         raise UploadError(409, "запись с таким именем в этой папке уже есть")
-    target.parent.mkdir(parents=True, exist_ok=True)
+    if not target.parent.is_dir():
+        raise UploadError(409, FOLDER_GONE)
     os.rename(part, target)
     return size

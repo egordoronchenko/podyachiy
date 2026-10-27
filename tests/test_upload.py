@@ -113,3 +113,28 @@ def test_abandoned_stream_is_swept_like_any_other_part(tmp_path):
     old = part.stat().st_mtime - upload.STALE_SEC - 1
     os.utime(part, (old, old))
     assert upload.sweep(tmp_path) == [part.name] and not part.exists()
+
+
+# ---------- папку переименовали или удалили, пока шла загрузка ----------
+
+def test_upload_finished_after_its_folder_was_renamed_or_deleted_does_not_bring_the_folder_back(tmp_path):
+    """Прежде последняя часть заводила папку заново — под старым именем, рядом с переименованной,
+    или на месте удалённой в корзину. Теперь папка появляется в начале загрузки, а в конце её
+    отсутствие — отказ."""
+    rel = "Проекты/вкс.mp3"
+    assert upload.append(tmp_path, rel, 10, 0, b"12345") == (5, False)
+    assert (tmp_path / "Проекты").is_dir()                          # папка новой загрузки — с первой части
+    (tmp_path / "Проекты").rename(tmp_path / "Архив")                # папку переименовали посреди загрузки
+    with pytest.raises(upload.UploadError) as e:
+        upload.append(tmp_path, rel, 10, 5, b"67890")
+    assert e.value.status == 409 and "переименовали или удалили" in e.value.detail
+    assert not (tmp_path / "Проекты").exists() and not list(tmp_path.rglob("вкс.mp3"))
+    assert not list((tmp_path / upload.PARTS_DIR).glob("*.part"))   # докачать её уже некуда — принятое не держим
+
+    part = upload.stream_start(tmp_path, "Снабжение/итоги.mp3", None, GB)
+    assert (tmp_path / "Снабжение").is_dir()
+    part.write_bytes(b"123")
+    (tmp_path / "Снабжение").rmdir()                                 # папку удалили, пока шло тело
+    with pytest.raises(upload.UploadError) as e:
+        upload.stream_finish(tmp_path, "Снабжение/итоги.mp3", part)
+    assert e.value.status == 409 and not (tmp_path / "Снабжение").exists()
