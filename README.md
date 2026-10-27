@@ -43,7 +43,7 @@
 Пошагово, с проверкой, сетью, HTTPS, почтой и резервной копией — **[install/README.md](install/README.md)**;
 для себя, на своём компьютере и без входа — [install/personal.md](install/personal.md). Поручить
 установку агенту (Claude Code, Cursor, Codex): «Установи Подьячий по
-https://github.com/egordoronchenko/podyachiy/blob/v1.1.0/install/AI-INSTALL.md».
+https://github.com/egordoronchenko/podyachiy/blob/v1.1.1/install/AI-INSTALL.md».
 
 ### Быстрый старт (образ)
 
