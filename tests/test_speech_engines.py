@@ -367,3 +367,87 @@ def test_dictionary_hints_reach_only_the_engine_that_takes_them(provider, tmp_pa
                                       log=lines.append, terms=terms))
     assert json.loads(provider["form"]["provider"]) == {"options": {"elevenlabs": {"diarize": True}}}
     assert not any("подсказки" in ln for ln in lines)
+
+
+# ---------- длинная запись: часть, распознанная до сбоя, второй раз не оплачивается ----------
+
+@pytest.fixture
+def parts(monkeypatch, tmp_path):
+    """Запись на две части; поставщик отвечает по части, а на заказанных частях отказывает.
+    Звук записи — настоящий файл: по нему сверяется, к той ли записи относится сохранённый ответ."""
+    seen = types.SimpleNamespace(asked=[], fail=set(), audio=tmp_path / "запись.audio.mp3")
+    seen.audio.write_bytes(b"mp3" * 100)
+
+    class Reply:
+        def __init__(self, status, data=None):
+            self.status_code, self.data, self.headers = status, data, {}
+            self.text = "" if data else "Insufficient credits"
+
+        def json(self):
+            return self.data
+
+    class Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def post(self, url, **kw):
+            start = float(kw["files"]["file"][1].decode())
+            seen.asked.append(start)
+            if start in seen.fail:
+                return Reply(402)
+            # слово — вне перехлёста частей: сшивка его не отбросит
+            return Reply(200, scribe_reply([scribe_word(f"слово{start:.0f}", 300, 300.5, 0)], 60.0, 0.01))
+
+    monkeypatch.setattr(speech.httpx, "AsyncClient", Client)
+    monkeypatch.setattr(speech, "audio_duration", lambda path: speech.CHUNK_SEC + 600.0)
+    # в части — время её начала: по нему заглушка поставщика знает, какую часть ей прислали
+    monkeypatch.setattr(speech, "make_chunk", lambda src, dst, start, length: dst.write_bytes(str(start).encode()))
+
+    def run(settings=None, lines=None):
+        usage.reset()
+        work = tmp_path / "work"
+        work.mkdir(exist_ok=True)
+        return asyncio.run(speech.transcribe_one(seen.audio, tmp_path, "запись", settings or cfg(SCRIBE), work,
+                                                 log=(lines if lines is not None else []).append))
+    seen.run = run
+    return seen
+
+
+def test_part_recognized_before_a_failure_is_taken_from_its_saved_answer(parts):
+    second = speech.CHUNK_SEC - speech.OVERLAP_SEC
+    parts.fail = {second}
+    with pytest.raises(providers.Down, match="HTTP 402"):
+        parts.run()
+    assert parts.asked == [0.0, second] and usage.snapshot()["cost"] == {"USD": 0.01}   # первая часть оплачена
+
+    parts.fail, parts.asked = set(), []
+    lines = []
+    result = parts.run(lines=lines)
+    assert parts.asked == [second]                                  # за первую часть второй раз не платим
+    assert usage.snapshot()["cost"] == {"USD": 0.01}
+    assert "часть 1/2 — беру ответ прошлого запуска, в API не отправляю" in lines
+    assert result["meta"]["chunks"] == 2
+    text = (parts.audio.parent / "transcript" / "запись.txt").read_text(encoding="utf-8")
+    assert "слово0" in text and f"слово{second:.0f}" in text
+
+
+@pytest.mark.parametrize("change", ["другая модель", "звук извлечён заново", "ответ оборван"])
+def test_saved_answer_of_another_request_is_not_taken(parts, change):
+    """Сохранённый ответ годится, только если запрос был тот же: та же модель, тот же звук записи,
+    та же часть. Иначе — новый запрос, как прежде."""
+    parts.run()
+    parts.asked = []
+    model, again = SCRIBE, [0.0, speech.CHUNK_SEC - speech.OVERLAP_SEC]
+    raw = parts.audio.parent / "transcript" / "raw" / "запись.part01.json"
+    if change == "другая модель":
+        model = NOVA
+    elif change == "звук извлечён заново":                       # полный прогон (force) пишет звук снова
+        parts.audio.write_bytes(b"mp3" * 101)
+    else:                                                       # оборван при аварии ответ первой части
+        raw.write_text(raw.read_text(encoding="utf-8")[:40], encoding="utf-8")
+        again = [0.0]
+    parts.run(cfg(model))
+    assert parts.asked == again

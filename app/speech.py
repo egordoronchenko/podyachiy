@@ -20,7 +20,8 @@
 Каждая часть нумерует говорящих заново, поэтому метки сшиваются по перехлёсту,
 где одни и те же слова размечены дважды. Сырые ответы провайдера по частям
 сохраняются рядом с расшифровкой: сборку из них можно переделать, не оплачивая
-распознавание второй раз.
+распознавание второй раз, а повтор после сбоя на одной из частей берёт готовые
+части из них и заказывает только недостающие.
 """
 from __future__ import annotations
 
@@ -28,6 +29,7 @@ import asyncio
 import datetime
 import difflib
 import email.utils
+import hashlib
 import json
 import re
 import subprocess
@@ -259,6 +261,14 @@ def rate_limit_pause(e: RateLimited, attempt: int) -> float:
     return min(max(RATE_LIMIT_PAUSE_SEC * 2 ** attempt, e.wait), RETRY_AFTER_MAX_SEC)
 
 
+STT_TIMEOUT_SEC = 1800          # на одну попытку: соединение, отправка части, ожидание ответа
+# Повторы у одного поставщика — не дольше этого срока с первой попытки: паузы между
+# быстрыми отказами (15 с, дальше вдвое — меньше восьми минут на все) в него укладываются,
+# а шесть долгих попыток держали бы обработчик часами. Срок вышел — к запасному, а нет
+# его — сбой записи.
+STT_RETRY_WINDOW_SEC = 20 * 60
+
+
 def build_form(cfg, terms: list[str] = ()) -> dict:
     """Поля запроса на распознавание: общие для всех моделей плюс то, чем
     у этой включается разделение говорящих и передаются термины."""
@@ -291,13 +301,14 @@ async def call_stt(client: httpx.AsyncClient, cfg, chunk_path: Path,
 
     async def ask(provider: providers.Provider) -> dict:
         last = ""
+        began = time.monotonic()
         for attempt in range(attempts):
             try:
                 r = await client.post(
                     provider.url("/audio/transcriptions"),
                     headers={"Authorization": f"Bearer {provider.api_key}"},
                     data=form, files={"file": (chunk_path.name, audio, "audio/mpeg")},
-                    timeout=1800,
+                    timeout=STT_TIMEOUT_SEC,
                 )
                 if r.status_code == 429:
                     raise RateLimited(f"HTTP 429: {r.text[:200]}", retry_after(r))
@@ -307,22 +318,36 @@ async def call_stt(client: httpx.AsyncClient, cfg, chunk_path: Path,
                         f"распознавание: HTTP {r.status_code}: поставщик {provider.title} отказал "
                         f"в доступе — проверьте ключ ({provider.key_env} в .env), баланс и открыта "
                         f"ли ключу модель {cfg.model}. Ответ поставщика: {r.text[:200]}", refused=True)
-                if r.status_code >= 500:
+                if r.status_code >= 500 or r.status_code in providers.RETRIED:
                     raise providers.Fault(f"HTTP {r.status_code}: {r.text[:200]}")
                 if r.status_code >= 400:
-                    # причина отказа — в теле ответа: по одному коду её не понять
-                    raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
+                    # плохой запрос, нет модели, файл велик: от повтора ответ не изменится, и
+                    # запасной его не примет так же. Причина — в теле ответа: по коду её не понять
+                    raise providers.Rejected(f"распознавание: HTTP {r.status_code}: {r.text[:200]}")
                 data = r.json()
                 if "error" in data:
                     raise RuntimeError(str(data["error"])[:300])
                 usage.add("speech", cfg.model, data.get("usage"), provider)
                 return data
-            except providers.Down:
+            except (providers.Down, providers.Rejected):
                 raise
+            except httpx.ReadTimeout as e:
+                # Файл ушёл целиком, а ответа нет: поставщик мог уже распознать запись и
+                # списать деньги. Повтор — у него или у запасного — оплатил бы ту же работу
+                # второй раз (а при обрыве по простою соединения — и каждый следующий).
+                # Повторит вся запись — по расписанию после сбоя (ledger.RETRY_AFTER_SEC) или
+                # вручную, и уже распознанные части она возьмёт готовыми (transcribe_one).
+                raise RuntimeError(
+                    f"распознавание: поставщик {provider.title} получил файл, но не ответил за "
+                    f"{STT_TIMEOUT_SEC // 60} мин ({describe_error(e)}). Работу он мог уже выполнить и "
+                    "списать за неё деньги, поэтому запрос сразу не повторяю: повтор оплатил бы её "
+                    "второй раз") from e
             except Exception as e:
                 last = describe_error(e)
-                if attempt == attempts - 1:
-                    # сеть, таймаут, 5xx, 429 — поставщик не ответил; остальное — отказ на сам запрос
+                delay = (rate_limit_pause(e, attempt) if isinstance(e, RateLimited)
+                         else 2 ** attempt * 15)
+                if attempt == attempts - 1 or time.monotonic() - began + delay > STT_RETRY_WINDOW_SEC:
+                    # сеть, таймаут, 5xx, 429 — поставщик не ответил; остальное — негодный ответ
                     failed = providers.Down if providers.is_fault(e) else RuntimeError
                     raise failed(f"распознавание: {last}")
                 if providers.resting(provider):
@@ -330,8 +355,6 @@ async def call_stt(client: httpx.AsyncClient, cfg, chunk_path: Path,
                     raise providers.Down(f"распознавание: {last}")
                 # связь с провайдером пропадает на минуты: четыре быстрых попытки
                 # укладывались в полминуты и сгорали все внутри одного обрыва
-                delay = (rate_limit_pause(e, attempt) if isinstance(e, RateLimited)
-                         else 2 ** attempt * 15)
                 log(f"распознавание: сбой запроса к {provider.title} ({last}), попытка {attempt + 1} "
                     f"из {attempts} — повторяю через {delay:.0f} с")
                 await asyncio.sleep(delay)
@@ -604,6 +627,32 @@ def to_srt(words: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _audio_mark(path: Path) -> dict | None:
+    """Звук записи, по которому режутся части, — размером и временем изменения: полный прогон
+    (force) извлекает его заново, и ответы по прежнему звуку к новому не подходят. Нет файла — None."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
+
+
+def _saved_answer(raw: Path, asked: dict) -> dict | None:
+    """Сохранённый ответ поставщика на ровно такой же запрос части — или None. Оборванный при
+    аварии файл, ответ прежней версии (без примет запроса) и ответ на другой запрос не годятся:
+    часть тогда распознаётся заново."""
+    if asked["audio"] is None:
+        return None
+    try:
+        saved = json.loads(raw.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(saved, dict) or not isinstance(saved.get("response"), dict) \
+            or any(saved.get(k) != v for k, v in asked.items()):
+        return None
+    return saved["response"]
+
+
 async def transcribe_one(
     audio_path: Path,
     out_dir: Path,
@@ -638,15 +687,25 @@ async def transcribe_one(
     if on_progress:
         await on_progress(0, len(plan))
 
+    # Чем был запрос каждой части: тот же звук записи, та же модель с теми же полями формы и
+    # тот же отрезок. Совпало с сохранённым ответом — часть уже оплачена, второй раз её не
+    # заказываем: сбой на части N иначе оплачивал бы заново и части 1…N−1.
+    request = {"audio": _audio_mark(audio_path),
+               "form": hashlib.sha256(json.dumps(build_form(cfg, terms), sort_keys=True,
+                                                 ensure_ascii=False).encode()).hexdigest()}
     async with httpx.AsyncClient() as client:
         for i, (start, length) in enumerate(plan):
-            chunk = work_dir / f"stt_{i:03d}.mp3"
-            await asyncio.to_thread(make_chunk, audio_path, chunk, start, length)
-            data = await call_stt(client, cfg, chunk, log=log, terms=terms)
-            chunk.unlink(missing_ok=True)
-            (raw_dir / f"{stem}.part{i + 1:02d}.json").write_text(
-                json.dumps({"model": cfg.model, "start": start, "length": length,
-                            "response": data}, ensure_ascii=False), encoding="utf-8")
+            raw = raw_dir / f"{stem}.part{i + 1:02d}.json"
+            asked = {"model": cfg.model, "start": start, "length": length, **request}
+            data = _saved_answer(raw, asked)
+            if data is not None:
+                log(f"часть {i + 1}/{len(plan)} — беру ответ прошлого запуска, в API не отправляю")
+            else:
+                chunk = work_dir / f"stt_{i:03d}.mp3"
+                await asyncio.to_thread(make_chunk, audio_path, chunk, start, length)
+                data = await call_stt(client, cfg, chunk, log=log, terms=terms)
+                chunk.unlink(missing_ok=True)
+                raw.write_text(json.dumps({**asked, "response": data}, ensure_ascii=False), encoding="utf-8")
             words = spoken_words(data, cfg.model)
             words_total += len(words)
             new_words, unlabeled = normalize_words(words, offset=start)

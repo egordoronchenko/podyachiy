@@ -152,15 +152,21 @@ FAULTS = {
     "503": Reply(503, text="upstream down"),
     "500": Reply(500),
     "429": Reply(429, text="rate limited"),
+    "408": Reply(408, text="request timeout"),
     "таймаут": httpx.ReadTimeout("время вышло"),
     "нет связи": httpx.ConnectError("соединение не установлено"),
 }
+# Распознавание после таймаута ожидания ответа не повторяет (свой тест ниже); таймаут, пока
+# соединение не установлено или файл не дослан, — сбой, как остальные
+SPEECH_FAULTS = {**{k: v for k, v in FAULTS.items() if k != "таймаут"},
+                 "таймаут соединения": httpx.ConnectTimeout("время вышло"),
+                 "таймаут отправки": httpx.WriteTimeout("время вышло")}
 
 
-@pytest.mark.parametrize("reason", FAULTS)
+@pytest.mark.parametrize("reason", SPEECH_FAULTS)
 def test_speech_goes_to_the_backup_when_the_main_ran_out_of_retries(monkeypatch, net, tmp_path, reason):
     cfg = settings(monkeypatch)
-    net.answers.update({MAIN: FAULTS[reason], SPARE: Reply(200, WORDS)})
+    net.answers.update({MAIN: SPEECH_FAULTS[reason], SPARE: Reply(200, WORDS)})
     lines = []
     assert recognize(cfg, net, tmp_path, lines) == WORDS
     assert net.hosts() == [MAIN] * 6 + [SPARE] and len(net.pauses) == 5       # основной — со всеми своими повторами
@@ -200,6 +206,52 @@ def test_bad_request_and_bad_answer_are_not_the_providers_failure(monkeypatch, n
     assert not isinstance(failed.value, providers.Down)
     assert SPARE not in net.hosts() and not any("запасному" in ln for ln in lines)
     assert providers.state() == {"last_switch": None, "resting_sec": 0}
+
+
+@pytest.mark.parametrize("status", [400, 404, 413, 422])
+def test_request_the_provider_did_not_take_is_not_repeated(monkeypatch, net, tmp_path, status):
+    """Плохой запрос, нет модели, файл велик: от повтора ответ не изменится — одна попытка, без пауз."""
+    cfg = settings(monkeypatch)
+    net.answers.update({MAIN: Reply(status, text="не годится"), SPARE: Reply(200, WORDS)})
+    lines = []
+    with pytest.raises(RuntimeError, match=f"распознавание: HTTP {status}: .*не годится") as failed:
+        recognize(cfg, net, tmp_path, lines)
+    assert not isinstance(failed.value, providers.Down)
+    assert net.hosts() == [MAIN] and net.pauses == [] and lines == []
+
+
+def test_no_answer_to_a_sent_file_is_not_repeated(monkeypatch, net, tmp_path):
+    """Файл ушёл целиком, а ответа нет дольше срока: поставщик мог уже распознать запись и списать
+    деньги. Повтор — у него или у запасного — оплатил бы ту же работу второй раз."""
+    cfg = settings(monkeypatch)
+    net.answers.update({MAIN: httpx.ReadTimeout("время вышло"), SPARE: Reply(200, WORDS)})
+    lines = []
+    with pytest.raises(RuntimeError, match="RouterAI получил файл, но не ответил за 30 мин.*списать.*второй раз") as failed:
+        recognize(cfg, net, tmp_path, lines)
+    assert not isinstance(failed.value, providers.Down)
+    assert net.hosts() == [MAIN] and net.pauses == [] and providers.state()["last_switch"] is None
+
+
+def test_retries_at_one_provider_stop_at_the_common_limit_of_time(monkeypatch, net, tmp_path):
+    """Каждая попытка долгая (поставщик отвечает 503 через десять минут): шесть попыток держали бы
+    обработчик час с лишним. Повторы у одного поставщика укладываются в общий срок."""
+    cfg = settings(monkeypatch)
+    net.answers.update({MAIN: Reply(503, text="upstream down"), SPARE: Reply(200, WORDS)})
+    post = net.Client.post
+
+    async def late(self, url, **kw):
+        net.clock[0] += 600                         # поставщик думал десять минут
+        return await post(self, url, **kw)
+    monkeypatch.setattr(net.Client, "post", late)
+
+    async def sleep(sec):
+        net.pauses.append(sec)
+        net.clock[0] += sec
+    monkeypatch.setattr(llm.asyncio, "sleep", sleep)
+    lines = []
+    assert recognize(cfg, net, tmp_path, lines) == WORDS
+    assert net.hosts() == [MAIN, MAIN, SPARE] and net.pauses == [15]
+    assert any("запрос ушёл запасному" in ln for ln in lines)
 
 
 def test_without_a_backup_the_failure_is_just_the_failure(monkeypatch, net, tmp_path):
@@ -323,9 +375,10 @@ def test_text_refusal_goes_to_the_backup_at_once(monkeypatch, net, status):
 def test_text_bad_request_and_empty_answer_stay_with_the_main(monkeypatch, net):
     cfg = settings(monkeypatch)
     net.answers.update({MAIN: Reply(400, text="response_format не поддержан"), SPARE: Reply(200, TEXT)})
-    with pytest.raises(RuntimeError) as failed:
+    with pytest.raises(RuntimeError, match="HTTP 400.*response_format не поддержан") as failed:
         ask(cfg)
-    assert not isinstance(failed.value, providers.Down) and net.hosts() == [MAIN] * llm.ATTEMPTS
+    # от повтора плохой запрос лучше не станет: одна попытка, без пауз
+    assert not isinstance(failed.value, providers.Down) and net.hosts() == [MAIN] and net.pauses == []
 
     net.calls.clear()
     empty = {"choices": [{"message": {"content": ""}, "finish_reason": "stop"}], "usage": {"cost": 0.1}}

@@ -96,8 +96,9 @@ async def chat(
 async def _ask(provider: providers.Provider, cfg, stage: str, body: dict, budget: int,
                check: Callable[[str], object] | None, log) -> tuple[str, dict]:
     """Вызов у одного поставщика, со всеми повторами. Поставщик не ответил (сеть, таймаут,
-    5xx, 429 после повторов; 401, 402, 403 — сразу) — providers.Down; негодный ответ и
-    отказ на сам запрос — обычная ошибка, запасному такой вызов не передаётся."""
+    5xx, 408, 429 после повторов; 401, 402, 403 — сразу) — providers.Down; негодный ответ и
+    отказ на сам запрос (прочие 4xx — сразу, без повторов: providers.Rejected) — обычная ошибка,
+    запасному такой вызов не передаётся."""
     prefs = cfg.provider_prefs() if provider.routes else {}
     if prefs:
         body["provider"] = prefs
@@ -123,8 +124,12 @@ async def _ask(provider: providers.Provider, cfg, stage: str, body: dict, budget
                         f"HTTP {r.status_code}: поставщик {provider.title} отказал в доступе — "
                         f"проверьте ключ ({provider.key_env} в .env), баланс и открыта ли ключу "
                         f"модель {cfg.summary_model}. Ответ поставщика: {r.text[:200]}", refused=True)
-                if r.status_code >= 500:
+                if r.status_code >= 500 or r.status_code in providers.RETRIED:
                     raise providers.Fault(f"HTTP {r.status_code}")
+                if r.status_code >= 400:
+                    # отказ на сам запрос (поле, которого модель не знает, нет модели): повтор не
+                    # поможет. Причина — в теле ответа
+                    raise providers.Rejected(f"HTTP {r.status_code}: {r.text[:200]}")
                 r.raise_for_status()
                 data = r.json()
                 if "error" in data:
@@ -182,7 +187,7 @@ async def _ask(provider: providers.Provider, cfg, stage: str, body: dict, budget
                     await asyncio.sleep(2 ** attempt * 3)
                     continue
                 raise EmptyAnswerError(last)
-            except (EmptyAnswerError, providers.Down):
+            except (EmptyAnswerError, providers.Down, providers.Rejected):
                 raise
             except Exception as e:
                 last = describe_error(e)
