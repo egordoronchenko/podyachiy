@@ -90,7 +90,7 @@ def norm_login(login: str) -> str:
     администратора, заводящего пользователя, и для заявки на доступ."""
     login = login.strip().lower()
     if login == ADMIN or not LOGIN_RE.fullmatch(login):
-        raise UserError("логин — латинские буквы, цифры, точка, дефис; от 2 до 32 знаков; "
+        raise UserError("логин — латинские буквы, цифры, точка, дефис, подчёркивание; от 2 до 32 знаков, первый — буква или цифра; "
                         "admin занят администратором")
     return login
 

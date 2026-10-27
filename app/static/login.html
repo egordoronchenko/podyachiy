@@ -46,7 +46,7 @@ const RULES = {
     : !/^[^@\s]+@[^@\s]+\.[^@\s.]+$/.test(v) ? "Почта — в виде имя@организация.ru" : "",
   login: v => !v ? "Придумайте логин"
     : v.toLowerCase() === "admin" ? "Логин admin занят администратором — выберите другой"
-    : !/^[a-z0-9][a-z0-9._-]{1,31}$/.test(v.toLowerCase()) ? "Логин — латинские буквы, цифры, точка, дефис; от 2 до 32 знаков" : "",
+    : !/^[a-z0-9][a-z0-9._-]{1,31}$/.test(v.toLowerCase()) ? "Логин — латинские буквы, цифры, точка, дефис, подчёркивание; от 2 до 32 знаков, первый — буква или цифра" : "",
   who: v => !v ? "Укажите логин или почту" : "",
 };
 
@@ -105,7 +105,7 @@ const VIEWS = {
     ${formField("login", "Желаемый логин",
       `<input type="text" id="login" autocomplete="username" autocapitalize="none" spellcheck="false" maxlength="32"
               aria-describedby="login-hint login-err" required>`,
-      "Латинские буквы, цифры, точка, дефис; от 2 до 32 знаков. Например: ivanov", true)}
+      "Латинские буквы, цифры, точка, дефис, подчёркивание; от 2 до 32 знаков. Например: ivanov", true)}
     ${formField("comment", "Комментарий",
       `<textarea id="comment" rows="3" maxlength="500" aria-describedby="comment-hint comment-err"></textarea>`,
       "Необязательно: отдел и для чего нужен сервис")}
