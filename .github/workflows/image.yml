@@ -1,15 +1,13 @@
-# Собирает образ сервиса из этого репозитория и публикует его на Docker Hub.
-# Нужны два секрета репозитория: DOCKERHUB_USERNAME и DOCKERHUB_TOKEN (Settings → Secrets).
-#   тег vX.Y.Z    → :X.Y.Z, :X.Y и :latest — установка по умолчанию берёт :latest, а номером
-#                   её можно закрепить и откатить; предварительный выпуск (v1.2.0-rc1) :latest не двигает
-#   вручную (Run workflow) с ветки master → :latest
-# Обычный пуш в master образ не публикует — только тесты (tests.yml).
+# Собирает образ сервиса из этого репозитория и публикует его на Docker Hub — только вручную
+# (Actions → Образ → Run workflow). Нужны два секрета репозитория: DOCKERHUB_USERNAME и
+# DOCKERHUB_TOKEN (Settings → Secrets); без них запуск упадёт на входе в Docker Hub.
+#   с тега vX.Y.Z → :X.Y.Z, :X.Y и :latest (предварительный выпуск vX.Y.Z-rc1 — без :latest)
+#   с ветки master → :latest
+# Сам тег и выпуск на GitHub (Releases) образ не публикуют: выпуски образа делаются вручную.
 # Образ публикуется, только если в нём проходят тесты.
 name: Образ
 
 on:
-  push:
-    tags: ["v*"]
   workflow_dispatch:
 
 permissions:
