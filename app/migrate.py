@@ -87,6 +87,14 @@ def open_base(cfg, log, kept: bool) -> db.Database:
                 f"файла базы {state / db.FILE} нет, хотя раньше он был: рядом лежит папка «{sorted(state.glob(KEEP + '*'))[0].name}» "
                 "с файлами, перенесёнными в базу. С пустой базой сервис счёл бы все записи новыми и обработал "
                 "их заново, за деньги. Восстановите базу из резервной копии (install/README.md, раздел 12)")
+        elif (done := _results(cfg)) is not None:
+            raise db.Refusal(
+                f"файла базы {state / db.FILE} нет, а в папке результатов {cfg.outbox} уже есть результаты обработки "
+                f"(например, {done}): база была и пропала, или подключена не та папка состояния. С пустой базой "
+                "сервис счёл бы все записи новыми и заново, за деньги, собрал бы по ним протоколы, а пользователи, "
+                "права и расходы пропали бы. Восстановите базу из резервной копии (install/README.md, раздел 12) "
+                "или проверьте HOST_STATE в .env: он должен указывать на папку state этой установки. Начать с "
+                "чистого листа можно, только убрав (переименовав) и папку результатов")
     base = db.Database(state, log)
     try:
         base.check()
@@ -117,6 +125,17 @@ def _present(cfg) -> list[tuple[str, str]]:
 
 def found_names(cfg) -> list[str]:
     return [name for _, name in _present(cfg)]
+
+
+def _results(cfg) -> str | None:
+    """Маркер обработанной записи в папке результатов (в том числе в корзине) — путь внутри неё,
+    или None. Маркер пишет каждый прогон рядом с результатами (ledger.write_marker), а строку
+    журнала обработки — в базу: есть маркер — была и база. Первого найденного достаточно — всю
+    папку не обходим."""
+    for path in Path(cfg.outbox).rglob("*" + ledger.MARKER_SUFFIX):
+        if path.is_file():
+            return path.relative_to(cfg.outbox).as_posix()
+    return None
 
 
 def _json(path: Path):

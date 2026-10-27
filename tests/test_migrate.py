@@ -350,6 +350,47 @@ def test_lost_base_is_not_replaced_by_an_empty_one(tmp_path):
     assert not (cfg.state_dir / db.FILE).exists()
 
 
+def put_marker(cfg, rel: str) -> None:
+    """Маркер готовой записи рядом с её результатами — как пишет сервис (ledger.write_marker)."""
+    folder, stem = os.path.split(rel)
+    stem = os.path.splitext(stem)[0]
+    ledger.write_marker(cfg.outbox / folder / stem, stem, {"file": rel, "status": "ok"})
+
+
+def test_lost_base_over_results_in_the_outbox_is_refused(tmp_path):
+    """Базы нет, переноса не было, а в папке результатов — маркеры готовых записей: база была и
+    пропала, или подключена не та папка состояния. С пустой базой сервис счёл бы все записи
+    новыми и заново, за деньги, собрал бы по ним протоколы. Запуск отказан, база не создана."""
+    cfg = legacy.setup(tmp_path)
+    put_marker(cfg, "Проекты/Сметы/вкс.mp4")
+    before = tree(cfg)
+    with pytest.raises(db.Refusal, match=r"файла базы .* нет, а в папке результатов .* уже есть результаты обработки "
+                                         r"\(например, Проекты/Сметы/вкс/вкс\.done\.json\).*за деньги.*"
+                                         r"Восстановите базу из резервной копии.*HOST_STATE"):
+        legacy.start(cfg)
+    assert tree(cfg) == before and not (cfg.state_dir / db.FILE).exists()
+    # маркер в корзине — тоже след прежней базы
+    (cfg.outbox / "Проекты").rename(cfg.outbox / ".trash")
+    with pytest.raises(db.Refusal, match="уже есть результаты обработки"):
+        legacy.start(cfg)
+
+
+def test_results_in_the_outbox_do_not_stop_the_move_from_files_or_a_restored_base(tmp_path):
+    """Законные запуски поверх готовых результатов: перенос прежних файлов состояния в базу (маркеры
+    писала и прежняя версия) и база, восстановленная из копии вместе с папкой результатов."""
+    cfg = old_install(tmp_path)
+    put_marker(cfg, "Проекты/план.mp4")
+    lines = []
+    legacy.start(cfg, lines).close()
+    assert any(line.startswith("перенос в базу завершён") for line in lines)
+    legacy.start(cfg).close()                                       # база есть — маркеры её не касаются
+    # пустая папка результатов (только журнал работы) — новая установка
+    fresh = legacy.setup(tmp_path / "новая")
+    (fresh.outbox / "_logs").mkdir()
+    (fresh.outbox / "_logs" / "podyachiy.log").write_text("строка\n", encoding="utf-8")
+    legacy.start(fresh).close()
+
+
 def test_state_folder_inside_the_container_is_refused_before_anything_is_touched(tmp_path):
     cfg = old_install(tmp_path)
     before = tree(cfg)
