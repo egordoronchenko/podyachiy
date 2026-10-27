@@ -273,6 +273,51 @@ def test_wrong_password_is_refused_and_written_to_the_journal(site):
     assert [e["kind"] for e in web.trail.read()] == ["login_failed"] * 3
 
 
+def test_password_guessing_stops_before_the_password_is_checked(site, monkeypatch):
+    """Неудачных входов паролем — не больше предела на логин и на адрес клиента за 15 минут; дальше —
+    отказ 429 сразу, без сверки пароля: подбирать пароль некому, а нагрузить сервис расчётом scrypt
+    нечем. Одни и те же пределы — у страницы входа и у логина с паролем в самом запросе (HTTP Basic)."""
+    web, admin, ivanov, _ = staffed(site)
+    checked = []
+    real = web.people.verify
+    monkeypatch.setattr(web.people, "verify", lambda login, password: checked.append(login) or real(login, password))
+    guest = TestClient(web.app)
+    for n in range(web.password_fails_by_login.limit):
+        attempt = (guest.post("/api/login", json={"login": "ivanov", "password": f"не тот {n}"}) if n % 2
+                   else guest.get("/api/v1/whoami", auth=("Ivanov", f"не тот {n}")))
+        assert attempt.status_code == 401, n
+    checked.clear()
+    for stopped in (guest.post("/api/login", json={"login": "ivanov", "password": PASSWORD}),
+                    guest.get("/api/v1/whoami", auth=("ivanov", PASSWORD))):
+        assert stopped.status_code == 429 and stopped.json()["detail"] == web.PASSWORD_TOO_OFTEN
+    assert checked == [] and web.trail.read()[-1]["reason"] == "слишком много неудачных попыток"
+    # вошедшего раньше предел не касается, другой логин с того же адреса входит
+    assert ivanov.get("/api/browse").status_code == 200
+    assert guest.get("/api/v1/whoami", auth=("petrov", PASSWORD)).json()["login"] == "petrov"
+
+    # с одного адреса — не больше предела неудачных входов на все логины вместе
+    for n in range(web.password_fails_by_address.limit - web.password_fails_by_login.limit):
+        assert guest.post("/api/login", json={"login": f"nobody{n}", "password": "не тот"}).status_code == 401
+    assert guest.post("/api/login", json={"login": "petrov", "password": PASSWORD}).status_code == 429
+    elsewhere = TestClient(web.app, client=("10.0.0.7", 50000))
+    assert elsewhere.post("/api/login", json={"login": "petrov", "password": PASSWORD}).status_code == 200
+
+
+def test_key_guessing_is_limited_by_address(site):
+    """Неверных ключей с одного адреса — не больше предела за 15 минут, дальше ключ с этого адреса
+    не проверяется вовсе; с других адресов ключи работают."""
+    web, admin, _, _ = staffed(site)
+    robot, issued = keyed(web, admin)
+    for n in range(web.key_fails_by_address.limit):
+        wrong = TestClient(web.app, headers={"Authorization": f"Bearer {keys.PREFIX}wrong-{n}"})
+        assert wrong.get("/api/v1/whoami").status_code == 401, n
+    stopped = robot.get("/api/v1/whoami")
+    assert stopped.status_code == 429 and stopped.json()["detail"] == web.KEY_TOO_OFTEN
+    elsewhere = TestClient(web.app, client=("10.0.0.7", 50000), headers={"Authorization": f"Bearer {issued['key']}"})
+    assert elsewhere.get("/api/v1/whoami").json()["login"] == "admin"
+    assert admin.get("/api/browse").status_code == 200                # кука — не ключ
+
+
 def test_admin_login_sets_the_cookie_and_me_shows_him(site):
     _, client = site
     entered = client.post("/api/login", json={"login": " Admin ", "password": ADMIN_PASSWORD})
@@ -999,6 +1044,42 @@ def test_personal_mode_needs_no_login(tmp_path):
         assert not client.get("/api/browse", params={"path": "Совещания"}).json()["manage"]
 
 
+def test_personal_mode_serves_only_its_own_addresses_and_pages(tmp_path):
+    """Входа в личном режиме нет — значит, чужой сайт, открытый в браузере, не должен ни читать сервис
+    через свой домен, переведённый на этот компьютер (DNS rebinding), ни слать ему формы: пересборка
+    протокола платная. Сервис отвечает только по своим адресам — localhost, адресу IP, имени без точки
+    в локальной сети и адресу из PUBLIC_URL, — а запрос, который что-то меняет, со страницы чужого
+    сайта отклоняет. Программы (curl, ИИ-клиенты) заголовка Origin не шлют и работают как раньше."""
+    with running(tmp_path, mode="personal", extra={"PUBLIC_URL": "https://meetings.example.test"}) as (web, client):
+        for host in ("localhost:8080", "127.0.0.1:8080", "[::1]:8080", "192.0.2.10:8080", "[2001:db8::7]",
+                     "meetings.example.test", "MEETINGS.example.test:443", "office-pc:8080", "podyachiy.localhost"):
+            assert client.get("/api/browse", headers={"host": host}).status_code == 200, host
+        for host in ("evil.example", "evil.example:8080", "localhost.evil.example", "meetings.example.test.evil.example",
+                     "192.0.2.10.nip.example"):
+            refused = client.get("/", headers={"host": host})
+            assert refused.status_code == 400 and refused.json()["detail"] == web.FOREIGN_HOST, host
+
+        for origin in ("https://evil.example", "null", "http://localhost:8081"):
+            for method, path, kw in (("POST", "/api/folder", {"json": {"dir": "Чужая"}}),
+                                     ("POST", "/api/v1/speakers", {"params": {"file": "Совещания/запись.mp3", "rebuild": "true"}}),
+                                     ("PUT", "/api/v1/upload", {"params": {"name": "чужая.mp3"}, "content": b"123"})):
+                refused = client.request(method, path, headers={"host": "localhost:8080", "origin": origin}, **kw)
+                assert refused.status_code == 403 and refused.json()["detail"] == web.FOREIGN_PAGE, (origin, path)
+        assert not (web.cfg.inbox / "Чужая").exists() and not (web.cfg.inbox / "чужая.mp3").exists()
+        # чтение чужой странице и так не достаётся: браузер не отдаст ей ответ без CORS
+        assert client.get("/api/browse", headers={"host": "localhost:8080", "origin": "https://evil.example"}).status_code == 200
+
+        for host, origin, folder in (("localhost:8080", "http://localhost:8080", "Своя"),
+                                     ("127.0.0.1:8080", "https://meetings.example.test", "За прокси"),
+                                     ("localhost:8080", None, "Без Origin")):
+            headers = {"host": host, **({"origin": origin} if origin else {})}
+            assert client.post("/api/folder", json={"dir": folder}, headers=headers).status_code == 200, folder
+
+    with running(tmp_path / "corporate") as (web, client):
+        # в корпоративном режиме без входа не отдаётся ничего: адрес запроса проверять незачем
+        assert client.get("/api/status", headers={"host": "evil.example"}).status_code == 200
+
+
 # ---------- сервис работает сразу после установки ----------
 
 def test_fresh_install_works_in_both_modes_and_nothing_asks_for_payment(tmp_path):
@@ -1619,11 +1700,11 @@ def test_manage_key_runs_the_service_but_leaves_passwords_keys_and_deletion_to_t
     steward, _ = keyed(web, admin, "Claude Code", 30, manage=True)
     plain, _ = keyed(web, admin, "обычный")
 
-    # заводит пользователя с первым паролем, даёт право на папку, меняет имя и роль
-    new = {"login": "sidorov", "name": "Сидоров", "password": PASSWORD}
+    # заводит пользователя (без пароля: его задают ссылкой со страницы), даёт право на папку, меняет имя
+    new = {"login": "sidorov", "name": "Сидоров"}
     assert plain.post("/api/admin/users/save", json=new).status_code == 403 and "sidorov" not in web.people.users
     assert steward.post("/api/admin/users/save", json=new).status_code == 200
-    assert enter(web, "sidorov").get("/api/me").json()["name"] == "Сидоров"
+    assert web.people.users["sidorov"]["name"] == "Сидоров" and web.people.users["sidorov"]["password"] == ""
     grant = {"dir": "Проекты", "login": "sidorov", "read": "tree", "manage": "only"}
     assert plain.post("/api/access", json=grant).json()["detail"] == web.BY_KEY_ONLY_READS
     assert steward.post("/api/access", json=grant).status_code == 200
@@ -1670,6 +1751,41 @@ def test_manage_key_approves_a_request_but_gets_no_password_link(site):
     assert done.status_code == 200 and done.json()["link"] is None and done.json()["link_on_page"] is True
     assert "sidorov" in web.people.users and "link" not in web.people.users["sidorov"]
     shown = admin.post("/api/admin/users/link", json={"login": "sidorov"})         # ссылку выпускает человек
+    assert shown.status_code == 200 and shown.json()["link"]["token"]
+
+
+def test_manage_key_opens_no_way_onto_the_page(site):
+    """Ключ с управлением не становится входом на страницу ни под чьим именем: он не задаёт пароль
+    даже новому пользователю, не назначает и не снимает администраторов и не меняет почту (на неё
+    «Забыл пароль» прислал бы ссылку на пароль). Это делает администратор сам на странице; новому
+    ключом заведённому пароль — его ссылкой «задать пароль»."""
+    web, admin, ivanov, _ = staffed(site)
+    admin.post("/api/admin/users/save", json={"login": "petrov", "email": "petrov@example.test", "admin": True})
+    steward, _ = keyed(web, admin, "Claude Code", 30, manage=True)
+    for body in ({"login": "sidorov", "name": "Сидоров", "password": PASSWORD},
+                 {"login": "sidorov", "admin": True},
+                 {"login": "sidorov", "email": "sidorov@example.test"},
+                 {"login": "ivanov", "admin": True},
+                 {"login": "petrov", "admin": False},
+                 {"login": "petrov", "email": "chuzhoy@example.test"},
+                 {"login": "petrov", "email": ""},
+                 {"login": "ivanov", "password": "новый-пароль-1"}):
+        refused = steward.post("/api/admin/users/save", json=body)
+        assert refused.status_code == 403 and refused.json()["detail"] == web.PAGE_ONLY, body
+    assert "sidorov" not in web.people.users and not web.people.users["ivanov"]["admin"]
+    assert web.people.users["petrov"]["admin"] and web.people.users["petrov"]["email"] == "petrov@example.test"
+
+    # заводит без пароля; то, чего не меняет, передать можно
+    made = steward.post("/api/admin/users/save", json={"login": "sidorov", "name": "Сидоров", "admin": False,
+                                                        "home_upload": True})
+    assert made.status_code == 200
+    sidorov = web.people.users["sidorov"]
+    assert (sidorov["password"], sidorov["admin"], sidorov["email"], sidorov["home_upload"]) == ("", False, "", True)
+    assert TestClient(web.app).post("/api/login", json={"login": "sidorov", "password": ""}).status_code == 401
+    same = {"login": "petrov", "name": "Петров П.", "admin": True, "email": " Petrov@Example.test "}
+    assert steward.post("/api/admin/users/save", json=same).status_code == 200
+    assert web.people.users["petrov"]["name"] == "Петров П." and web.people.users["petrov"]["email"] == "petrov@example.test"
+    shown = admin.post("/api/admin/users/link", json={"login": "sidorov"})
     assert shown.status_code == 200 and shown.json()["link"]["token"]
 
 
@@ -1880,7 +1996,8 @@ def test_tree_and_status_follow_a_record_through_processing(site, monkeypatch):
     assert ready["state"] == "ready" and ready["done"] and ready["finished_at"] == "2026-10-09T12:00:00+03:00"
     web.service.ledger.put({"file": new, "status": "error", "error": "нет связи", "finished_at": "2026-10-10T12:00:00+03:00"})
     failed = ivanov.get("/api/v1/status", params={"file": new}).json()
-    assert failed["state"] == "error" and failed["error"] == "нет связи" and failed["done"]
+    assert failed["state"] == "error" and failed["error"] == web.FAILED_HIDDEN and failed["done"]
+    assert admin.get("/api/v1/status", params={"file": new}).json()["error"] == "нет связи"
 
     for path in (new, "Проекты/нет.mp4", "Снабжение/итоги.mp4", "../x.mp4"):
         assert petrov.get("/api/v1/status", params={"file": path}).status_code == 404, path
@@ -1890,6 +2007,80 @@ def test_tree_and_status_follow_a_record_through_processing(site, monkeypatch):
 
 def flat(node):
     return [node] + [n for child in node.get("folders", []) for n in flat(child)]
+
+
+def test_dots_in_a_path_lead_nowhere_outside_the_open_folder(site):
+    """Путь с «..» не выводит из открытой папки ни в списке папок, ни в ходе обработки: иначе читатель
+    «Проектов» по «Проекты/..» видел бы имена закрытых папок, а дальше — каталоги самого контейнера,
+    а по ходу обработки узнавал бы, лежит ли файл в чужой папке."""
+    web, admin, ivanov, _ = filled(site)
+    (web.cfg.inbox / "Снабжение" / "Тайное").mkdir()
+    (web.cfg.inbox / "Снабжение" / "новая.mp4").write_bytes(b"video")
+    for bad in ("Проекты/..", "Проекты/../Снабжение", "Проекты/../../..", "..", "Проекты/./Сметы"):
+        refused = ivanov.get("/api/browse", params={"path": bad})
+        assert refused.status_code == 400 and "Снабжение" not in refused.text and "Тайное" not in refused.text, bad
+        assert admin.get("/api/browse", params={"path": bad}).status_code == 400, bad
+    assert dir_names(ivanov, "Проекты") == ["Сметы"]                  # обычный путь — как был
+    for bad in ("Проекты/../Снабжение/новая.mp4", "Проекты/../Снабжение/итоги.mp4"):
+        assert ivanov.get("/api/v1/status", params={"file": bad}).status_code == 404, bad
+    assert admin.get("/api/v1/status", params={"file": "Снабжение/новая.mp4"}).json()["state"] == "uploaded"
+
+
+def test_dots_in_a_folder_path_change_nothing_anywhere(site):
+    """Переименование, удаление и права папки — по той же проверке пути: «..» не уводит переименование
+    за пределы входной папки, не обходит защиту папки личных папок и не ложится в базу кривым путём."""
+    web, admin, ivanov, petrov = filled(site)
+    admin.post("/api/access", json={"dir": "Проекты", "login": "ivanov", "manage": "tree"})
+    steward, _ = keyed(web, admin, "Claude Code", 30, manage=True)
+    for bad in (f"Проекты/../{HOME}", "../outbox", "Проекты/..", "Проекты/../Снабжение", ".trash"):
+        refused = steward.post("/api/admin/folders/rename", json={"dir": bad, "name": "Другое"})
+        assert refused.status_code == 400, bad
+        assert admin.post("/api/admin/folders/delete", json={"dir": bad}).status_code == 400, bad
+        for client in (admin, ivanov):
+            given = client.post("/api/access", json={"dir": bad, "login": "petrov", "read": "tree"})
+            assert given.status_code == 400, bad
+            assert client.get("/api/access", params={"dir": bad}).status_code == 400, bad
+    assert (web.cfg.inbox / HOME / "ivanov").is_dir() and (web.cfg.outbox / "Снабжение" / "итоги").is_dir()
+    assert not list(web.cfg.inbox.parent.glob("Другое")) and not (web.cfg.inbox / "Другое").exists()
+    assert web.people.users["petrov"]["read"] == {} and petrov.get("/api/browse", params={"path": "Снабжение"}).json()["files"] == []
+    assert sorted(web.service.ledger.records) == sorted(["Проекты/Сметы/Архив/смета.mp4", "Проекты/вкс.mp4",
+                                                         f"{HOME}/petrov/личное.mp4", "Снабжение/итоги.mp4"])
+
+
+def test_provider_reply_in_a_failure_is_shown_only_to_who_sees_costs(site):
+    """В тексте сбоя бывает ответ поставщика как есть — с балансом счёта при 402. Суммы видит только
+    администратор сервиса — сам или ключом «с управлением»; остальным, даже обычному ключу
+    администратора, — общий текст без ответа поставщика. «Нет звука» пишет сам сервис — его видят все."""
+    web, admin, ivanov, _ = filled(site)
+    reply = ("распознавание: HTTP 402: поставщик OpenRouter отказал в доступе — проверьте ключ (OPENAI_API_KEY "
+             'в .env), баланс и открыта ли ключу модель deepgram/nova-3. Ответ поставщика: {"error":{"message":'
+             '"Insufficient credits: balance 0.12 USD"}}')
+    silent = "в дорожке нет звука (пиковый уровень -91 дБ)"
+    for name, status, error in (("сбой.mp4", "error", reply), ("без протокола.mp4", "no_summary", reply),
+                                ("тишина.mp4", "no_audio", silent)):
+        (web.cfg.inbox / "Проекты" / name).write_bytes(b"video")
+        web.service.ledger.put({"file": f"Проекты/{name}", "status": status, "error": error,
+                                "finished_at": "2026-10-10T12:00:00+03:00"})
+    plain, _ = keyed(web, admin, "обычный")
+    steward, _ = keyed(web, admin, "с управлением", 30, manage=True)
+    reader, _ = keyed(web, ivanov)
+
+    def errors(client) -> dict:
+        shown = {f["name"]: f["error"] for f in client.get("/api/browse", params={"path": "Проекты"}).json()["files"]}
+        listed = {r["name"]: r["error"] for r in client.get("/api/v1/records", params={"dir": "Проекты"}).json()["records"]}
+        for name in ("сбой.mp4", "без протокола.mp4", "тишина.mp4"):
+            file = f"Проекты/{name}"
+            one = client.get("/api/v1/record", params={"file": file}).json()["error"]
+            state = client.get("/api/v1/status", params={"file": file}).json()["error"]
+            assert shown[name] == listed[name] == one == state, (name, shown[name], listed[name], one, state)
+        return {name: shown[name] for name in ("сбой.mp4", "без протокола.mp4", "тишина.mp4")}
+
+    for client in (admin, steward):
+        assert errors(client) == {"сбой.mp4": reply, "без протокола.mp4": reply, "тишина.mp4": silent}
+    for client in (ivanov, reader, plain):
+        seen = errors(client)
+        assert seen["тишина.mp4"] == silent and "balance" not in str(seen) and "402" not in str(seen)
+        assert seen["сбой.mp4"] == web.FAILED_HIDDEN and seen["без протокола.mp4"] == web.NO_SUMMARY_HIDDEN
 
 
 def test_record_gives_protocol_tasks_links_and_the_html_file(site):

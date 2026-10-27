@@ -10,7 +10,7 @@ from app.ledger import Ledger
 
 
 def setup(tmp_path):
-    cfg = types.SimpleNamespace(inbox=tmp_path / "in", outbox=tmp_path / "out")
+    cfg = types.SimpleNamespace(inbox=tmp_path / "in", outbox=tmp_path / "out", outbox_inside_inbox=None)
     for rel in ("Проекты отдела/Сметы/запись.mp4", "Проекты отдела/план.mp4", "Снабжение/вкс.mp4"):
         (cfg.inbox / rel).parent.mkdir(parents=True, exist_ok=True)
         (cfg.inbox / rel).write_bytes(b"video")
@@ -94,6 +94,24 @@ def test_busy_protected_and_missing_folders_are_refused(tmp_path):
     for folder in ("", users.HOME_ROOT, f"{users.HOME_ROOT}/ivanov", "Нет такой"):
         with pytest.raises(folders.FolderError):
             folders.remove(cfg, service, people, folder, "admin")
+
+
+def test_dots_and_hidden_names_in_the_path_are_refused_before_anything_moves(tmp_path):
+    """Путь папки проверяется так же, как у новой папки: «..» не уводит переименование за пределы
+    входной папки и не обходит защиту папки личных папок, служебные папки не трогаются."""
+    cfg, service, people = setup(tmp_path)
+    (cfg.inbox / users.HOME_ROOT / "ivanov").mkdir(parents=True)
+    (cfg.inbox / ".trash").mkdir()
+    for folder in (f"Снабжение/../{users.HOME_ROOT}", "../out", "Снабжение/..", "Снабжение/./", ".trash"):
+        for act in (lambda: folders.rename(cfg, service, people, folder, "Другое"),
+                    lambda: folders.remove(cfg, service, people, folder, "admin")):
+            with pytest.raises(folders.FolderError) as e:
+                act()
+            assert e.value.status == 400, folder
+    assert (cfg.inbox / users.HOME_ROOT / "ivanov").is_dir() and (cfg.outbox / "Снабжение" / "вкс").is_dir()
+    assert not (tmp_path / "Другое").exists() and not (cfg.inbox / "Другое").exists()
+    assert sorted(service.ledger.records) == ["Проекты отдела/Сметы/запись.mp4", "Проекты отдела/план.mp4",
+                                              "Снабжение/вкс.mp4"]
 
 
 def test_trash_is_emptied_after_the_keep_period_only(tmp_path):

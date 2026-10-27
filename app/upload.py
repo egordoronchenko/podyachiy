@@ -71,6 +71,15 @@ def folder_rel(folder: str, outbox_inside: Path | None) -> str:
     return rel
 
 
+def folder_arg(folder: str, outbox_inside: Path | None) -> str:
+    """Папка из запроса: пусто — корень записей, иначе — проверка folder_rel. Одна на все пути папок,
+    что приходят снаружи: «..», скрытые и служебные имена и папка результатов не проходят — иначе
+    путь вывел бы из открытой человеку папки или за пределы входной."""
+    if not folder.replace("\\", "/").strip("/ "):
+        return ""
+    return folder_rel(folder, outbox_inside)
+
+
 def part_path(inbox: Path, rel: str, size: int) -> Path:
     key = hashlib.sha1(f"{rel}\0{size}".encode("utf-8")).hexdigest()[:20]
     return inbox / PARTS_DIR / f"{key}.part"

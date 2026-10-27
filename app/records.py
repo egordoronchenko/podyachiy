@@ -133,10 +133,12 @@ def rename(cfg, service, file: str, name: str, also=None) -> str:
 
 def move(cfg, service, file: str, folder: str, also=None) -> str:
     """Запись под тем же именем в другой папке. Возвращает новый путь. also — как у rename."""
-    folder = users.norm_folder(folder)
-    hidden = any(part.startswith(".") for part in folder.split("/"))
-    inside = cfg.outbox_inside_inbox
-    if hidden or folder == users.HOME_ROOT or (inside is not None and Path(folder).is_relative_to(inside)):
+    try:
+        # та же проверка пути, что у новой папки: «..», скрытые и служебные имена, папка результатов
+        folder = upload.folder_arg(folder, cfg.outbox_inside_inbox)
+    except upload.UploadError:
+        raise RecordError(400, "в эту папку записи не кладут")
+    if folder == users.HOME_ROOT:
         raise RecordError(400, "в эту папку записи не кладут")
     if not (cfg.inbox / folder).is_dir():
         raise RecordError(404, folders.NO_FOLDER)

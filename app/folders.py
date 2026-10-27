@@ -42,6 +42,15 @@ def _inside(path: str, folder: str) -> bool:
     return path == folder or path.startswith(folder + "/")
 
 
+def _path(cfg, folder: str) -> str:
+    """Путь папки из запроса — той же проверкой, что у новой папки (upload.folder_arg): «..» увёл бы
+    переезд за пределы входной папки, а «Проекты/../Пользовательские» обошёл бы защиту ниже."""
+    try:
+        return upload.folder_arg(folder, cfg.outbox_inside_inbox)
+    except upload.UploadError as e:
+        raise FolderError(e.status, e.detail)
+
+
 def _check(folder: str, service, people: users.Users) -> None:
     if not folder:
         raise FolderError(400, "корень не переименовать и не удалить")
@@ -58,7 +67,7 @@ def _check(folder: str, service, people: users.Users) -> None:
 def rename(cfg, service, people: users.Users, folder: str, name: str, also=None) -> str:
     """Новое имя папки на том же месте. Возвращает новый путь.
     also(новый путь) — что ещё записать в базу той же транзакцией: словари, событие журнала."""
-    folder = users.norm_folder(folder)
+    folder = _path(cfg, folder)
     _check(folder, service, people)
     try:
         upload._check_part(name.strip(), "имя папки")
@@ -106,7 +115,7 @@ def trash_stamp(cfg) -> str:
 def remove(cfg, service, people: users.Users, folder: str, by: str, also=None) -> dict:
     """Папка со всем содержимым уходит в корзину. Возвращает, сколько чего убрано.
     also(что убрано) — что ещё записать в базу той же транзакцией: словари, событие журнала."""
-    folder = users.norm_folder(folder)
+    folder = _path(cfg, folder)
     _check(folder, service, people)
     if not (cfg.inbox / folder).is_dir() and not (cfg.outbox / folder).is_dir():
         raise FolderError(404, NO_FOLDER)

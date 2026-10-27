@@ -21,6 +21,7 @@ import csv
 import dataclasses
 import datetime
 import io
+import ipaddress
 import os
 import re
 import shutil
@@ -35,7 +36,7 @@ from urllib.parse import quote, urlencode, urlsplit
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, PlainTextResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -95,11 +96,25 @@ domain = directory.Directory(cfg, log)           # вход под учётно�
 # сервиса стала бы инструментом подбора доменных паролей и — хуже — блокировки чужих учётных
 # записей: контроллер блокирует запись после нескольких неверных паролей подряд (обычный порог —
 # 5–10 за 15–30 минут). Сервис отправляет в домен не больше 4 неверных паролей на один логин
-# за 15 минут — ниже обычного порога блокировки. Считаются только отказы; локальных учётных
-# записей и admin предел не касается: они — запасной вход, и запереть его посторонний не должен.
+# за 15 минут — ниже обычного порога блокировки. Считаются только отказы.
 DOMAIN_FAILS_SEC = 15 * 60
 domain_fails_by_login = signup.Throttle(4, DOMAIN_FAILS_SEC)
 domain_fails_by_address = signup.Throttle(30, DOMAIN_FAILS_SEC)
+# Пароли локальных учётных записей и admin — свои пределы, общие для страницы входа и логина с
+# паролем в самом запросе (HTTP Basic): иначе пароль подбирали бы без конца, а каждая сверка — это
+# scrypt на десятки миллисекунд, и поток неверных паролей занял бы ими весь сервис. Считаются только
+# отказы; предел исчерпан — отказ 429 сразу, пароль не сверяется. На логин предел выше доменного:
+# блокировки в домене здесь нет, а запереть человека посторонний может лишь на 15 минут. Адрес
+# клиента за прокси и в Docker Desktop общий на всех — об этом ниже, у форм без входа. Ключей доступа
+# не подобрать (в них 256 случайных бит), но и поток неверных ключей ограничен по адресу.
+PASSWORD_FAILS_SEC = 15 * 60
+password_fails_by_login = signup.Throttle(10, PASSWORD_FAILS_SEC)
+password_fails_by_address = signup.Throttle(30, PASSWORD_FAILS_SEC)
+key_fails_by_address = signup.Throttle(60, PASSWORD_FAILS_SEC)
+PASSWORD_TOO_OFTEN = (f"слишком много неудачных попыток входа — подождите {PASSWORD_FAILS_SEC // 60} минут "
+                      "и проверьте логин и пароль")
+KEY_TOO_OFTEN = (f"слишком много запросов с неверным ключом доступа с вашего адреса — подождите "
+                 f"{PASSWORD_FAILS_SEC // 60} минут и проверьте ключ в настройках клиента")
 # Вошедшего под учётной записью домена сервис перепроверяет в домене: вход действует 30 дней, а
 # отключённый в домене или исключённый из группы доступа должен потерять доступ быстро. Не чаще
 # раза в столько секунд на человека (LDAP_RECHECK_MIN, по умолчанию 15 минут) при его обращении
@@ -431,6 +446,56 @@ async def revalidate_pages(request, call_next):
     return response
 
 
+# Личный режим входа не спрашивает: сервис отдаёт всё любому, кто до него достучался. Достучаться может
+# и чужой сайт, открытый в браузере на этом же компьютере. Его домен переводят на 127.0.0.1 (DNS
+# rebinding) — и страница чужого сайта читает сервис как свой; или его страница отправляет сервису
+# форму — а пересборка протокола платная. Поэтому в личном режиме сервис отвечает только по своим
+# адресам: localhost (и имена *.localhost), адрес IP (его чужой домен не подменит), имя компьютера без
+# точки (так его открывают из локальной сети) и адрес из PUBLIC_URL. А запрос, который что-то меняет,
+# со страницы другого сайта — заголовок Origin не того адреса, по которому сервис открыт, и не
+# PUBLIC_URL — отклоняет. Программы (curl, ИИ-клиенты) Origin не шлют и работают как раньше. В
+# корпоративном режиме без входа сервис не отдаёт ничего, а кука входа к чужому домену не уходит.
+FOREIGN_HOST = ("сервис открыт не по своему адресу: в личном режиме он отвечает по localhost, адресу IP, "
+                "имени компьютера и адресу из PUBLIC_URL в .env")
+FOREIGN_PAGE = "запрос пришёл со страницы другого сайта — сервис его не выполняет"
+CHANGING = ("POST", "PUT", "PATCH", "DELETE")
+
+
+def _own_host(host: str) -> bool:
+    """Свой ли это адрес сервиса — заголовок Host запроса."""
+    try:
+        name = urlsplit(f"//{host}").hostname or ""
+    except ValueError:
+        return False
+    try:
+        ipaddress.ip_address(name)
+        return True
+    except ValueError:
+        pass
+    return ("." not in name or name.endswith(".localhost")
+            or bool(cfg.public_url) and name == urlsplit(cfg.public_url).hostname)
+
+
+def _own_page(origin: str, host: str) -> bool:
+    """Пришёл ли запрос со страницы самого сервиса: Origin — тот адрес, по которому он открыт, или
+    PUBLIC_URL (за прокси Host бывает внутренним). Origin «null» — неизвестно откуда, то есть не своя."""
+    seen = urlsplit(origin).netloc.lower()
+    return bool(seen) and (seen == host.lower()
+                           or bool(cfg.public_url) and seen == urlsplit(cfg.public_url).netloc.lower())
+
+
+@app.middleware("http")
+async def own_addresses_only(request: Request, call_next):
+    if cfg.personal:
+        host = request.headers.get("host", "")
+        if host and not _own_host(host):
+            return JSONResponse({"detail": FOREIGN_HOST}, status_code=400)
+        origin = request.headers.get("origin")
+        if request.method in CHANGING and origin is not None and not _own_page(origin, host):
+            return JSONResponse({"detail": FOREIGN_PAGE}, status_code=403)
+    return await call_next(request)
+
+
 def domain_off() -> str:
     """Почему вход под учётной записью домена выключен для всей установки; пусто — включён.
     Возможность корпоративного режима."""
@@ -540,11 +605,16 @@ async def _basic(request: Request) -> users.Access | None:
         login, _, password = base64.b64decode(header[6:]).decode("utf-8").partition(":")
     except (binascii.Error, ValueError):
         return None
+    login, address = login.strip().lower(), _client(request)
+    if password_fails_by_login.full(login) or password_fails_by_address.full(address):
+        raise HTTPException(429, PASSWORD_TOO_OFTEN)
     # scrypt считается десятки миллисекунд — не в событийном цикле
     if not await asyncio.to_thread(people.verify, login, password):
+        password_fails_by_login.allow(login)
+        password_fails_by_address.allow(address)
         await asyncio.sleep(WRONG_PASSWORD_DELAY_SEC)
         return None
-    return people.access(login.strip().lower())
+    return people.access(login)
 
 
 async def _bearer(request: Request) -> users.Access | None:
@@ -552,8 +622,12 @@ async def _bearer(request: Request) -> users.Access | None:
     header = request.headers.get("authorization", "")
     if not header.lower().startswith("bearer "):
         return None
+    address = _client(request)
+    if key_fails_by_address.full(address):
+        raise HTTPException(429, KEY_TOO_OFTEN)
     who = await asyncio.to_thread(people.by_key, header[7:].strip())
     if who is None:
+        key_fails_by_address.allow(address)
         await asyncio.sleep(WRONG_PASSWORD_DELAY_SEC)
     return who
 
@@ -598,7 +672,8 @@ def _upload_denied(who: users.Access, folder: str) -> str:
 
 
 PAGE_ONLY = ("это делается только на странице сервиса, даже ключом с управлением: ключи доступа, пароли "
-             "и ссылки на пароль, удаление записей и папок, отправка протокола на почту")
+             "и ссылки на пароль, роль администратора сервиса и почта пользователя, удаление записей и папок, "
+             "отправка протокола на почту")
 
 
 async def viewer(request: Request) -> users.Access:
@@ -894,6 +969,51 @@ def _parent_of(rel: str) -> str:
     return "" if p == "." else p
 
 
+def _dir(value: str) -> str:
+    """Папка из параметра запроса: пусто — корень записей. Проверка одна на все адреса — та же, что у
+    новой папки (upload.folder_arg): права сверяются по началу пути, и «Проекты/..» иначе прошёл бы
+    у читателя «Проектов» как его папка, а вёл бы к корню записей и выше. Негодный путь — 400."""
+    try:
+        return upload.folder_arg(value, cfg.outbox_inside_inbox)
+    except upload.UploadError as e:
+        raise HTTPException(e.status, e.detail)
+
+
+def _uploaded(file: str) -> bool:
+    """Лежит ли во входной папке файл записи, до которой сервис ещё не дошёл. Путь — той же проверкой,
+    что при загрузке (upload.target_rel): с «..» и скрытыми частями он из открытой папки не выведет."""
+    try:
+        canonical = upload.target_rel(_parent_of(file), PurePosixPath(file).name, cfg.outbox_inside_inbox) == file
+    except upload.UploadError:
+        return False
+    return canonical and (cfg.inbox / file).is_file()
+
+
+# Текст сбоя обработки — каким его видит человек. В нём бывает ответ поставщика как есть, а в ответе —
+# баланс счёта (при 402) и суммы, а их видит только тот, кому открыты расходы. Остальным — общий текст
+# по исходу записи. «Нет звука» пишет сам сервис, денег в этом тексте нет — его видят все.
+FAILED_HIDDEN = "обработать запись не удалось — причину видит администратор сервиса"
+NO_SUMMARY_HIDDEN = "протокол собрать не удалось — причину видит администратор сервиса"
+
+
+def _sees_costs(who: users.Access) -> bool:
+    """Открыты ли человеку суммы и расходы: администратору сервиса — самому или его ключу «с управлением»
+    (как у costs_guard)."""
+    return who.admin and (not who.key or who.key_kind == keys.MANAGE)
+
+
+def _failure(rec: dict, who: users.Access) -> str | None:
+    error = rec.get("error")
+    if not error or _sees_costs(who) or rec.get("status") == "no_audio":
+        return error
+    return NO_SUMMARY_HIDDEN if rec.get("status") == "no_summary" else FAILED_HIDDEN
+
+
+def _shown(rec: dict, who: users.Access) -> dict:
+    """Строка журнала обработки с текстом сбоя, каким его видит этот человек."""
+    return {**rec, "error": _failure(rec, who)} if rec.get("error") else rec
+
+
 FLAT_LIMIT = 300     # «все записи» — это недавние: глубже ищут поиском или идут в папку
 
 # какие результаты имеет смысл открывать при таком исходе обработки
@@ -916,7 +1036,7 @@ def browse(path: str = "", flat: bool = False, who: users.Access = Depends(viewe
     flat — «все записи»: в списке всё, что человеку открыто, из всех папок сразу.
     """
     assert service is not None
-    rel = "" if flat else path.strip("/")
+    rel = "" if flat else _dir(path)
     prefix = f"{rel}/" if rel else ""
     dirs: dict[str, dict] = {}
     files: list[dict] = []
@@ -953,7 +1073,7 @@ def browse(path: str = "", flat: bool = False, who: users.Access = Depends(viewe
                 "timestamps": rec.get("timestamps"),
                 "timestamps_unknown": rec.get("timestamps_unknown"),
                 "runs": rec.get("runs"),
-                "error": rec.get("error"),
+                "error": _failure(rec, who),
             })
         if parent == rel:
             continue
@@ -1214,12 +1334,9 @@ def _folder_arg(value: str, who: users.Access) -> str:
     человеку и лежит на диске либо названа в его правах, или если в ней или глубже лежит
     открытая ему запись или папка: до той нужно как-то дойти от корня."""
     assert service is not None
-    if not users.norm_folder(value):
+    folder = _dir(value)
+    if not folder:
         return ""
-    try:
-        folder = upload.folder_rel(value, cfg.outbox_inside_inbox)
-    except upload.UploadError as e:
-        raise HTTPException(e.status, e.detail)
     on_disk = who.sees(folder) and ((cfg.inbox / folder).is_dir() or (cfg.outbox / folder).is_dir())
     paths = (list(service.ledger.records) + list(service.pending) + [i.path for i in list(service.queue)]
              + [j["file"] for j in list(service.running)])
@@ -1341,7 +1458,8 @@ def v1_records(request: Request, since: str = "", dir: str = "", who: users.Acce
     except ValueError:
         raise HTTPException(400, "since: нужен момент в виде 2026-03-12T14:30:00+03:00")
     return {"now": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
-            "records": external.listing(_visible(who), moment, _folder_arg(dir, who), _base(request))}
+            "records": external.listing([_shown(r, who) for r in _visible(who)], moment, _folder_arg(dir, who),
+                                        _base(request))}
 
 
 @app.get("/api/v1/record")
@@ -1353,7 +1471,7 @@ def v1_record(request: Request, file: str, transcript: bool = False, who: users.
     """
     record = _record(file, who)
     protocol = _protocol(file, record)
-    out = {**external.brief(record, _base(request)), "protocol": protocol,
+    out = {**external.brief(_shown(record, who), _base(request)), "protocol": protocol,
            "tasks": _marked(file, record, protocol) if protocol else [],
            "can_mark": who.owns(_parent_of(file))}
     out["links"]["audio"] = (_base(request) + "/api/audio?" + urlencode({"file": file}, quote_via=quote)
@@ -1505,11 +1623,10 @@ def v1_status(file: str, who: users.Access = Depends(viewer)):
     state = _in_progress(who).get(file)
     record = service.ledger.get(file)
     if state is None and record is not None:
-        state = {"state": external.state_of(record), "error": record.get("error"),
+        state = {"state": external.state_of(record), "error": _failure(record, who),
                  "finished_at": record.get("finished_at")}
     if state is None:
-        target, root = (cfg.inbox / file).resolve(), cfg.inbox.resolve()
-        if root not in target.parents or not target.is_file():
+        if not _uploaded(file):
             raise gone
         state = {"state": "uploaded"}
     return {"file": file, **state, "text": external.STATE_TEXT[state["state"]],
@@ -1957,7 +2074,7 @@ async def _move(file: str, dir: str, who: users.Access) -> dict:
         jot("record_move", who, file=file, to=new)
 
     _record(file, who)
-    if not who.owns(users.norm_folder(dir)):
+    if not who.owns(_dir(dir)):
         raise HTTPException(403, "переносить можно в папку, где вы владелец или администратор")
     new = await _record_action(records.move, file, who, dir, also=also)
     if new != file:
@@ -2384,8 +2501,13 @@ async def _sign_in(typed: str, password: str, request: Request) -> tuple[users.A
 
     local = short == users.ADMIN or people.source(short) == users.LOCAL
     if off or (local and plain == short):
+        address = _client(request)
+        if password_fails_by_login.full(plain) or password_fails_by_address.full(address):
+            raise refuse("слишком много неудачных попыток", 429, PASSWORD_TOO_OFTEN)
         # scrypt считается десятки миллисекунд — не в событийном цикле
         if not await asyncio.to_thread(people.verify, plain, password):
+            password_fails_by_login.allow(plain)
+            password_fails_by_address.allow(address)
             raise refuse()
         return people.access(plain), {}
     if local:
@@ -2652,7 +2774,7 @@ async def link_use(req: LinkRequest):
 @app.get("/api/access")
 def access_list(dir: str, who: users.Access = Depends(steward)):
     """Кому открыта папка — для администратора и для локального администратора этой папки."""
-    folder = users.norm_folder(dir)
+    folder = _dir(dir)
     if not who.admin and (not folder or not who.rules(folder)):
         raise HTTPException(403, "раздавать доступ к этой папке вы не можете")
     return {"path": folder, "can_manage": who.admin,
@@ -2672,7 +2794,7 @@ async def access_set(req: AccessRequest, who: users.Access = Depends(steward)):
     """Права человека на папку. Чтение и загрузку раздаёт и администратор папки,
     администрирование — только администратор сервиса: иначе администратор папки плодил бы
     себе равных."""
-    folder = users.norm_folder(req.dir)
+    folder = _dir(req.dir)
     if not who.admin and (not folder or not who.rules(folder)):
         raise HTTPException(403, "раздавать доступ к этой папке вы не можете")
     if req.manage is not None and not who.admin:
@@ -2758,7 +2880,7 @@ async def admin_folder_rename(req: FolderRename, who: users.Access = Depends(vie
     assert service is not None
     if not upload_ready:
         raise HTTPException(503, "входная папка доступна только для чтения")
-    old = users.norm_folder(req.dir)
+    old = _dir(req.dir)
 
     def also(new: str) -> None:
         words.move_folder(old, new)
@@ -2766,7 +2888,7 @@ async def admin_folder_rename(req: FolderRename, who: users.Access = Depends(vie
 
     async with scan_paused():
         try:
-            new = folders.rename(cfg, service, people, req.dir, req.name, also=also)
+            new = folders.rename(cfg, service, people, old, req.name, also=also)
         except folders.FolderError as e:
             raise HTTPException(e.status, e.detail)
         except OSError as e:
@@ -2786,18 +2908,20 @@ async def admin_folder_delete(req: FolderDelete, who: users.Access = Depends(vie
     assert service is not None
     if not upload_ready:
         raise HTTPException(503, "входная папка доступна только для чтения")
+    folder = _dir(req.dir)
+
     def also(done: dict) -> None:
-        words.drop_folder(users.norm_folder(req.dir))
-        jot("folder_delete", who, folder=users.norm_folder(req.dir), records=done["records"], trash=done["trash"])
+        words.drop_folder(folder)
+        jot("folder_delete", who, folder=folder, records=done["records"], trash=done["trash"])
 
     async with scan_paused():
         try:
-            done = folders.remove(cfg, service, people, req.dir, who.login, also=also)
+            done = folders.remove(cfg, service, people, folder, who.login, also=also)
         except folders.FolderError as e:
             raise HTTPException(e.status, e.detail)
         except OSError as e:
             raise HTTPException(500, f"не удалось удалить: {e}")
-    log(f"папка удалена в корзину: {users.norm_folder(req.dir)}, записей {done['records']}, "
+    log(f"папка удалена в корзину: {folder}, записей {done['records']}, "
         f"лежит в {done['trash']} ({who.login})")
     return {"ok": True, **done}
 
@@ -2898,15 +3022,19 @@ class UserRequest(BaseModel):
 async def admin_user_save(req: UserRequest, who: users.Access = Depends(viewer)):
     """Завести пользователя или поменять ему имя, почту, пароль, роль и загрузку в личную папку;
     чего в запросе нет, то у существующего не меняется. Права на папки — по папкам.
-    Ключом с управлением пользователя заводят и правят, но пароль существующему не меняют."""
+
+    Ключом с управлением пользователя заводят и правят, но входа на страницу ключ не даёт ни под чьим
+    именем: пароля он не задаёт даже новому, роли администратора не даёт и не снимает, почту не
+    меняет — на неё «Забыл пароль» прислал бы ссылку на пароль. Заведённому ключом пароль задаётся
+    ссылкой, которую администратор выпускает на странице."""
     known = people.get(req.login.strip().lower())
     new = known is None
-    if who.key and req.password and not new:
-        # ключом с управлением пользователя заводят (с первым паролем), но пароль не меняют
-        raise HTTPException(403, PAGE_ONLY)
     name = req.name if req.name is not None else "" if new else known["name"]
     admin = req.admin if req.admin is not None else False if new else known["admin"]
     email = req.email
+    if who.key and (req.password or admin != (False if new else known["admin"])
+                    or (email is not None and email.strip().lower() != ("" if new else known["email"]))):
+        raise HTTPException(403, PAGE_ONLY)
     if not new and people.source(req.login.strip().lower()) == users.DOMAIN:
         # у учётной записи домена ФИО и почта приходят из домена при каждом входе, пароля в сервисе
         # нет (put откажет), а роль при заданной группе администраторов определяет группа
@@ -2916,7 +3044,8 @@ async def admin_user_save(req: UserRequest, who: users.Access = Depends(viewer))
                                      "добавьте человека в группу или уберите из неё")
     try:
         was = None if new else known["home_upload"]
-        await asyncio.to_thread(people.put, req.login, name, req.password, admin, email, False,
+        # ключом новый заводится без пароля, как по одобренной заявке: пароль — ссылкой со страницы
+        await asyncio.to_thread(people.put, req.login, name, req.password, admin, email, bool(who.key),
                                 req.home_upload)
     except users.UserError as e:
         raise HTTPException(400, str(e))
@@ -3246,12 +3375,14 @@ NO_DICT_EDIT = "словарь правит владелец папки или �
 
 def _dict_folder(path: str, who: users.Access) -> str:
     """Папка, у которой может быть словарь. Закрытая человеку неотличима от несуществующей."""
-    folder = users.norm_folder(path)
+    try:
+        folder = upload.folder_arg(path, cfg.outbox_inside_inbox)
+    except upload.UploadError:
+        raise HTTPException(404, folders.NO_FOLDER)         # путь с «..» и служебная папка — тоже «нет такой»
     if not folder:
         raise HTTPException(400, "у корня записей своего словаря нет: общий словарь сервиса — в настройках, "
                                  "его правит администратор")
-    hidden = any(part.startswith(".") for part in folder.split("/"))
-    if hidden or not who.sees(folder) or not ((cfg.inbox / folder).is_dir() or (cfg.outbox / folder).is_dir()):
+    if not who.sees(folder) or not ((cfg.inbox / folder).is_dir() or (cfg.outbox / folder).is_dir()):
         raise HTTPException(404, folders.NO_FOLDER)
     return folder
 
@@ -3263,9 +3394,7 @@ def _dict_record(file: str, who: users.Access) -> dict | None:
     assert service is not None
     if service.ledger.get(file) is not None:
         return _record(file, who)
-    canonical = bool(file) and file == users.norm_folder(file) and not any(p.startswith(".") for p in file.split("/"))
-    if not (canonical and who.sees(_parent_of(file)) and PurePosixPath(file).suffix.lower() in media.MEDIA_EXTS
-            and (cfg.inbox / file).is_file()):
+    if not (_uploaded(file) and who.sees(_parent_of(file))):
         raise HTTPException(404, "такой записи нет")
     return None
 
@@ -3489,7 +3618,7 @@ async def admin_journal(limit: int = 200, kind: str = "", by: str = "", file: st
     события (kind), по тому, кто сделал (by), по записи (file), папке с подпапками (dir),
     по пользователю, о котором событие (login), и по дням (since, until)."""
     return {"events": await asyncio.to_thread(trail.actions, max(1, min(limit, 2000)), kind, by, file,
-                                              users.norm_folder(dir), login, _day(since), _day(until))}
+                                              _dir(dir), login, _day(since), _day(until))}
 
 
 # ---------- оформление: логотип и название организации ----------
