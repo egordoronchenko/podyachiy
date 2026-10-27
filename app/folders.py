@@ -30,6 +30,10 @@ TRASH = ".trash"
 TRASH_DAYS = 30
 # один текст на несуществующую и на закрытую человеку папку: существование чужой не раскрывается
 NO_FOLDER = "такой папки нет или она вам не открыта"
+# папка результатов записи «вкс.mp3» — «вкс»: подпапка «вкс» положила бы свои результаты туда же
+RESULTS_TAKEN = ("это имя занято среди результатов: так называется запись в этой папке (имя без расширения) "
+                 "или папка, от которой остались одни результаты, — у новой папки результаты легли бы туда же; "
+                 "выберите другое имя")
 
 
 class FolderError(Exception):
@@ -77,8 +81,10 @@ def rename(cfg, service, people: users.Users, folder: str, name: str, also=None)
     target = f"{parent}/{name.strip()}" if parent else name.strip()
     if target == folder:
         return folder
-    if (cfg.inbox / target).exists() or (cfg.outbox / target).exists():
+    if (cfg.inbox / target).exists():
         raise FolderError(409, "папка с таким именем здесь уже есть")
+    if (cfg.outbox / target).exists():
+        raise FolderError(409, RESULTS_TAKEN)
     if not (cfg.inbox / folder).is_dir() and not (cfg.outbox / folder).is_dir():
         raise FolderError(404, NO_FOLDER)
     moved = []

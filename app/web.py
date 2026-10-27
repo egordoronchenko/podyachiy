@@ -1190,6 +1190,18 @@ def _upload_rel(folder: str, name: str, who: users.Access) -> str:
     return rel
 
 
+# Журнал обработки ведётся по пути: файл, загруженный по пути записи, чей исходник убрали с диска
+# руками, сервис счёл бы уже обработанным и в работу не взял бы никогда.
+UPLOAD_KNOWN = ("запись с таким именем в этой папке уже есть в журнале обработки (её файл могли убрать с диска "
+                "вручную) — загрузите запись под другим именем или сначала удалите прежнюю запись на странице")
+
+
+def _not_in_ledger(rel: str) -> None:
+    assert service is not None
+    if service.ledger.get(rel) is not None:
+        raise HTTPException(409, UPLOAD_KNOWN)
+
+
 class FolderRequest(BaseModel):
     dir: str
 
@@ -1208,6 +1220,11 @@ async def make_folder(req: FolderRequest, who: users.Access = Depends(viewer)):
                                  "администрирование с подпапками")
     if (cfg.inbox / rel).exists():
         raise HTTPException(409, "такая папка уже есть")
+    # новая папка и каждая заводимая заодно над ней — не на месте результатов записи с тем же именем
+    parts = rel.split("/")
+    made = [p for p in ("/".join(parts[:n]) for n in range(1, len(parts) + 1)) if not (cfg.inbox / p).exists()]
+    if any((cfg.outbox / p).exists() for p in made):
+        raise HTTPException(409, folders.RESULTS_TAKEN)
     try:
         await asyncio.to_thread((cfg.inbox / rel).mkdir, parents=True)
     except OSError as e:
@@ -1221,6 +1238,7 @@ async def make_folder(req: FolderRequest, who: users.Access = Depends(viewer)):
 async def upload_state(name: str, size: int, dir: str = "", who: users.Access = Depends(viewer)):
     """Сколько байт записи уже принято: с этого места страница продолжает после обрыва."""
     rel = _upload_rel(dir, name, who)
+    _not_in_ledger(rel)
     try:
         have = await asyncio.to_thread(upload.received, cfg.inbox, rel, size, cfg.upload_max_bytes)
     except upload.UploadError as e:
@@ -1233,6 +1251,7 @@ async def upload_chunk(request: Request, name: str, size: int, offset: int, dir:
                        who: users.Access = Depends(viewer)):
     """Очередная часть записи — телом запроса, как есть."""
     rel = _upload_rel(dir, name, who)
+    _not_in_ledger(rel)
     if size > cfg.upload_max_bytes:
         raise HTTPException(413, f"файл больше предела {cfg.upload_max_bytes / 2**30:.0f} ГБ")
     data = bytearray()
@@ -1674,6 +1693,7 @@ async def v1_upload(request: Request, dir: str = "", name: str = "", who: users.
                                else "Папок, открытых вам для загрузки, сейчас нет: право загрузки выдаёт "
                                     "администратор папки или сервиса"))
     rel = _upload_rel(dir, name, who)
+    _not_in_ledger(rel)
     length = request.headers.get("content-length", "")
     try:
         part = await asyncio.to_thread(upload.stream_start, cfg.inbox, rel,

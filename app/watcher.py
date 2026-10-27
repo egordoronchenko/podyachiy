@@ -329,7 +329,8 @@ class Service:
 
         prev = self.ledger.get(item.path)
         try:
-            stem = pipeline.stem_of(self.cfg.inbox, item.path, prev)
+            stem = (pipeline.stem_of(self.cfg.inbox, item.path, prev) if prev
+                    else pipeline.stem_for(self.cfg.inbox, item.path, self.ledger.records))
             run = True
             try:
                 record = await pipeline.process(

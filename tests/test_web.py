@@ -4565,3 +4565,51 @@ def test_series_and_the_block_have_no_limits_in_personal_mode(tmp_path):
         assert client.post("/api/folder/series", json={"dir": "Планёрки", "on": False}).json()["series"] is False
         recorded(web, "Планёрки/вкс.mp4")
         assert client.post("/api/record/previous_tasks", json={"file": "Планёрки/вкс.mp4", "on": False}).json()["removed"]
+
+
+# ---------- папки и записи с одним именем, пути после ручного удаления ----------
+
+def test_folder_named_like_the_results_of_a_record_is_refused(site):
+    """«Проекты/вкс.mp3» с результатами в «Проекты/вкс»: подпапка «вкс» положила бы свои результаты
+    туда же, и удаление записи уносило бы их в корзину вместе с её собственными."""
+    web, admin, _, _ = staffed(site)
+    for path in ("Проекты", "Проекты/Архив"):
+        admin.post("/api/folder", json={"dir": path})
+    recorded(web, "Проекты/вкс.mp3")
+    for answer in (admin.post("/api/folder", json={"dir": "Проекты/вкс"}),
+                   admin.post("/api/admin/folders/rename", json={"dir": "Проекты/Архив", "name": "вкс"})):
+        assert answer.status_code == 409 and answer.json()["detail"] == folders.RESULTS_TAKEN
+    assert not (web.cfg.inbox / "Проекты/вкс").exists() and (web.cfg.inbox / "Проекты/Архив").is_dir()
+    assert admin.post("/api/folder", json={"dir": "Проекты/вкс 2"}).status_code == 200
+
+
+def test_upload_under_the_path_of_a_record_whose_source_was_removed_by_hand_is_refused(site):
+    """Исходник убрали с диска руками, строка журнала осталась. Файл, загруженный по тому же пути,
+    сервис считал бы уже обработанным и не взял бы в работу никогда."""
+    web, _, ivanov, _ = staffed(site)
+    home = f"{HOME}/ivanov"
+    recorded(web, f"{home}/планёрка.mp3")
+    (web.cfg.inbox / home / "планёрка.mp3").unlink()
+    file = {"name": "планёрка.mp3", "size": 5, "dir": home}
+    for answer in (ivanov.get("/api/upload", params=file),
+                   ivanov.put("/api/upload", params={**file, "offset": 0}, content=b"12345"),
+                   ivanov.put("/api/v1/upload", params={"dir": home, "name": "планёрка.mp3"}, content=b"12345")):
+        assert answer.status_code == 409 and answer.json()["detail"] == web.UPLOAD_KNOWN
+    assert not (web.cfg.inbox / home / "планёрка.mp3").exists()
+    assert not list((web.cfg.inbox / upload.PARTS_DIR).glob("*.part"))
+    assert ivanov.put("/api/upload", params={**file, "name": "планёрка 2.mp3", "offset": 0}, content=b"12345").json()["done"]
+
+
+def test_upload_finished_after_its_folder_was_renamed_or_deleted_is_refused(site):
+    web, admin, _, _ = staffed(site)
+    for name, act in (("Проекты", lambda: admin.post("/api/admin/folders/rename", json={"dir": "Проекты", "name": "Архив"})),
+                      ("Снабжение", lambda: admin.post("/api/admin/folders/delete", json={"dir": "Снабжение"}))):
+        admin.post("/api/folder", json={"dir": name})
+        file = {"name": "вкс.mp3", "size": 10, "dir": name}
+        assert admin.put("/api/upload", params={**file, "offset": 0}, content=b"12345").json()["done"] is False
+        assert act().status_code == 200
+        late = admin.put("/api/upload", params={**file, "offset": 5}, content=b"67890")
+        assert late.status_code == 409 and late.json()["detail"] == upload.FOLDER_GONE, name
+        assert not (web.cfg.inbox / name).exists(), name
+    assert not list(web.cfg.inbox.rglob("вкс.mp3"))
+    assert not [e for e in web.trail.read() if e["kind"] == "upload"]

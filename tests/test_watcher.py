@@ -8,7 +8,7 @@ import sqlite3
 import types
 from pathlib import Path
 
-from app import db, dictionary, pipeline, watcher
+from app import db, dictionary, pipeline, records, watcher
 from app.ledger import Ledger
 
 
@@ -168,11 +168,11 @@ def test_processed_record_keeps_its_stem_whatever_the_neighbours(tmp_path, monke
     svc.ledger.put({"file": "запись.mp4", "stem": "запись", "status": "ok"})
     # «запись.mp3» обработана при соседке — и останется «запись.mp3», даже когда соседку уберут
     svc.ledger.put({"file": "запись.mp3", "stem": "запись.mp3", "status": "ok"})
-    assert pipeline.stem_for(svc.cfg.inbox, "запись.mp4") == "запись.mp4"      # вычисленное имя разошлось бы
+    assert pipeline.stem_for(svc.cfg.inbox, "запись.mp4", {}) == "запись.mp4"      # вычисленное имя разошлось бы
     svc.enqueue_manual("запись.mp4", None, False, "admin", "rebuild")
     drain(svc)
     (svc.cfg.inbox / "запись.mp4").unlink()
-    assert pipeline.stem_for(svc.cfg.inbox, "запись.mp3") == "запись"
+    assert pipeline.stem_for(svc.cfg.inbox, "запись.mp3", {}) == "запись"
     svc.enqueue_manual("запись.mp3", None, False, "admin", "rebuild")
     svc.queue.append(watcher.QueueItem(path="новая.mp4"))                    # новой записи имя вычисляется
     drain(svc)
@@ -278,3 +278,49 @@ def test_failure_outside_the_pipeline_does_not_kill_the_worker(tmp_path, monkeyp
     drain(svc, timeout=3)
     assert seen.order == ["а.mp4", "б.mp4"] and svc.running == []
     assert any("сбой обработчика" in line and "сломалось" in line for line in lines)
+
+
+# ---------- имя папки результатов у новой записи ----------
+
+def results_process(monkeypatch):
+    """Обработка-заглушка, которая кладёт протокол в папку результатов, как настоящая."""
+    async def process(cfg, rel, stem, template, force, manual, log, on_progress=None, **kw):
+        out = cfg.outbox / Path(rel).parent / stem
+        (out / "summary").mkdir(parents=True, exist_ok=True)
+        (out / "summary" / f"{stem}.md").write_text("# Протокол", encoding="utf-8")
+        return {"file": rel, "stem": stem, "status": "ok", "output": str(out), "cost": {},
+                "finished_at": pipeline.now_iso()}
+    monkeypatch.setattr(pipeline, "process", process)
+
+
+def test_record_named_like_a_subfolder_does_not_share_its_results_folder(tmp_path, monkeypatch):
+    """«Сметы.mp4» рядом с подпапкой «Сметы»: результаты обеих легли бы в одну папку «Сметы», и
+    удаление записи уносило бы в корзину результаты подпапки, а удаление подпапки — результаты записи."""
+    svc = service(tmp_path, workers=1)
+    results_process(monkeypatch)
+    (svc.cfg.inbox / "Проекты" / "Сметы").mkdir(parents=True)
+    for rel in ("Проекты/Сметы/акт.mp4", "Проекты/Сметы.mp4"):
+        (svc.cfg.inbox / rel).write_bytes(b"video")
+        svc.queue.append(watcher.QueueItem(path=rel))
+    drain(svc)
+    assert svc.ledger.get("Проекты/Сметы.mp4")["stem"] == "Сметы.mp4"
+    records.remove(svc.cfg, svc, "Проекты/Сметы.mp4", "admin")
+    assert (svc.cfg.outbox / "Проекты/Сметы/акт/summary/акт.md").is_file()      # результаты подпапки на месте
+    # подпапка, которой на диске уже нет, а её записи в журнале есть, имя тоже занимает
+    (svc.cfg.inbox / "Проекты/Сметы/акт.mp4").unlink()
+    (svc.cfg.inbox / "Проекты/Сметы").rmdir()
+    assert pipeline.stem_for(svc.cfg.inbox, "Проекты/Сметы.mp4", svc.ledger.records) == "Сметы.mp4"
+
+
+def test_new_record_does_not_take_the_results_of_a_gone_one_with_the_same_name(tmp_path, monkeypatch):
+    """Исходник «вкс.wav» убрали с диска руками, а его строка в журнале и результаты «вкс» остались.
+    Новая «вкс.mp3» в той же папке взяла бы его готовую расшифровку и протокол."""
+    svc = service(tmp_path, workers=1)
+    seen = slow_process(monkeypatch, sec=0)
+    svc.ledger.put({"file": "Проекты/вкс.wav", "stem": "вкс", "status": "ok"})
+    (svc.cfg.inbox / "Проекты").mkdir()
+    (svc.cfg.inbox / "Проекты/вкс.mp3").write_bytes(b"audio")
+    svc.queue.append(watcher.QueueItem(path="Проекты/вкс.mp3"))
+    drain(svc)
+    assert seen.stems == {"Проекты/вкс.mp3": "вкс.mp3"}
+    assert svc.ledger.get("Проекты/вкс.wav")["stem"] == "вкс"                # у прежней — её имя

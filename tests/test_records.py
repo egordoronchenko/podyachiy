@@ -225,3 +225,18 @@ def test_rename_move_and_delete_that_fail_midway_put_the_files_back(tmp_path, mo
     monkeypatch.undo()
     new = records.rename(cfg, service, FILE, "Планёрка 06.10")
     assert list(noted.everything()) == [new] and service.ledger.get(new)["stem"] == "Планёрка 06.10"
+
+
+def test_record_is_not_renamed_or_moved_onto_the_name_of_a_subfolder(tmp_path):
+    """Подпапка «Сметы» ещё без результатов: запись «Сметы.mp4» рядом с ней положила бы свои результаты
+    в папку «Сметы», куда лягут и результаты записей подпапки."""
+    cfg, service = setup(tmp_path)
+    (cfg.inbox / "Проекты отдела" / "Сметы").mkdir()
+    (cfg.inbox / "Снабжение" / "план").mkdir()
+    with pytest.raises(records.RecordError) as e:
+        records.rename(cfg, service, FILE, "Сметы")
+    assert e.value.status == 409 and "подпапка" in e.value.detail
+    with pytest.raises(records.RecordError) as e:
+        records.move(cfg, service, FILE, "Снабжение")
+    assert e.value.status == 409 and "подпапка" in e.value.detail
+    assert (cfg.inbox / FILE).is_file() and list(service.ledger.records) == [FILE]

@@ -73,13 +73,9 @@ def source_note(src: Path) -> str:
     return f"«{src.name}», сохранён {saved}"
 
 
-def stem_for(inbox: Path, rel: str) -> str:
-    """Имя папки результата для новой записи. При совпадении имён без расширения
-    в одной папке (запись.mp4 и запись.mp3) берётся полное имя файла, чтобы
-    результаты двух разных записей не легли друг на друга.
-
-    Ответ зависит от соседей по папке, поэтому годится только для записи, которой
-    ещё нет в журнале обработки. Для остальных — stem_of."""
+def _by_neighbours(inbox: Path, rel: str) -> str:
+    """Имя папки результата по соседям-файлам: при совпадении имён без расширения
+    в одной папке (запись.mp4 и запись.mp3) — полное имя файла."""
     p = Path(rel)
     stem = p.stem
     try:
@@ -89,6 +85,36 @@ def stem_for(inbox: Path, rel: str) -> str:
     except OSError:
         return stem
     return p.name if len(same) > 1 else stem
+
+
+def stem_for(inbox: Path, rel: str, known: dict[str, dict]) -> str:
+    """Имя папки результата для новой записи. При совпадении имён без расширения
+    в одной папке (запись.mp4 и запись.mp3) берётся полное имя файла, чтобы
+    результаты двух разных записей не легли друг на друга.
+
+    Полное имя берётся и тогда, когда имя без расширения уже занято (known — журнал
+    обработки): подпапкой рядом — её результаты лежат в папке результатов с тем же
+    именем — или записью из журнала, чей исходник убрали с диска, а результаты остались.
+    Иначе запись «Сметы.mp4» делила бы папку результатов с подпапкой «Сметы», и удаление
+    одной уносило бы в корзину результаты другой, а новая «вкс.mp3» взяла бы готовую
+    расшифровку и протокол прежней «вкс.wav».
+
+    Ответ зависит от соседей по папке, поэтому годится только для записи, которой
+    ещё нет в журнале обработки. Для остальных — stem_of."""
+    stem = _by_neighbours(inbox, rel)
+    folder = rel.rpartition("/")[0]
+    prefix = folder + "/" if folder else ""
+    taken = set()
+    try:
+        taken.update(c.name.lower() for c in (inbox / folder).iterdir() if c.is_dir())
+    except OSError:
+        pass
+    for file, record in known.items():
+        if file == rel or not file.startswith(prefix):
+            continue
+        inner = file[len(prefix):]
+        taken.add(inner.split("/", 1)[0].lower() if "/" in inner else stem_of(inbox, file, record).lower())
+    return Path(rel).name if stem.lower() in taken else stem
 
 
 def protocol_path(cfg: Settings, rel: str, record: dict | None) -> Path:
@@ -144,8 +170,11 @@ def stem_of(inbox: Path, rel: str, record: dict | None) -> str:
 
     Вычислять каждый раз нельзя: «запись.mp3» рядом с «запись.mp4» получает имя
     «запись.mp3», а стоит соседку удалить или перенести — имя стало бы «запись»,
-    прошлая расшифровка не нашлась бы, и пересборка распознала бы запись заново за деньги."""
-    return (record or {}).get("stem") or stem_for(inbox, rel)
+    прошлая расшифровка не нашлась бы, и пересборка распознала бы запись заново за деньги.
+
+    Строка без имени (из файлов состояния до базы) — по соседям-файлам, как тогда
+    и вычислялось."""
+    return (record or {}).get("stem") or _by_neighbours(inbox, rel)
 
 
 async def process(

@@ -26,6 +26,8 @@ from pathlib import Path, PurePosixPath
 from . import folders, ledger, marks, media, pipeline, upload, users
 
 ERROR_SUFFIX = ".error.json"
+SUBFOLDER_TAKEN = ("в этой папке есть подпапка с таким именем: результаты записи и подпапки легли бы в одно место — "
+                   "выберите другое имя")
 
 
 class RecordError(Exception):
@@ -71,6 +73,9 @@ def _relocate(cfg, service, file: str, target: str, also=None) -> str:
     if (twins or (cfg.inbox / target).exists() or service.ledger.get(target) is not None
             or (new_out.exists() and new_out != old_out)):
         raise RecordError(409, "запись с таким именем в этой папке уже есть")
+    # подпапка с тем же именем: её результаты лягут в ту же папку результатов, что и у записи
+    if any(p.is_dir() and p.name.lower() == new_stem.lower() for p in (here.iterdir() if here.is_dir() else ())):
+        raise RecordError(409, SUBFOLDER_TAKEN)
 
     moved = dict(record, file=target, stem=new_stem)
     for field, value in record.items():
