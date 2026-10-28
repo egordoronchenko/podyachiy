@@ -4,8 +4,8 @@
 Записи появляются так же, как после настоящей обработки: расшифровка, разбор, подписи
 говорящих, протокол, карта, отметки у поручений, строки журнала обработки и журнала
 расходов — теми же функциями приложения, только текст расшифровки и протокола взят
-отсюда, а не от моделей. Исходных файлов во входной папке нет: список записей строится
-по журналу обработки, а без исходника сервис ничего не отправит на распознавание.
+отсюда, а не от моделей. Исходник каждой записи во входной папке — заглушка в несколько байт
+(PLACEHOLDER): звука в ней нет, а список записей не помечает исходник отсутствующим.
 У каждой записи два прогона, как в жизни: первый — сам сервис, второй — пересборка
 протокола после того, как человек подписал говорящих.
 
@@ -74,6 +74,11 @@ def later(moment: str, sec: float) -> str:
 def span(sec: float) -> str:
     minutes = round(sec / 60)
     return f"{minutes // 60} ч {minutes % 60:02d} мин" if minutes >= 60 else f"{minutes} мин"
+
+
+# Исходник демонстрационной записи: не звук, а метка, что запись выдумана. Размер её и пишется в строку
+# журнала обработки (source_size) — с ним сервис сличает исходник на диске.
+PLACEHOLDER = "демонстрационная запись: звука нет\n".encode("utf-8")
 
 
 def out_dir(cfg: Settings, rec: dict) -> Path:
@@ -215,7 +220,7 @@ def row(cfg: Settings, rec: dict, kinds: dict, state: dict, started: str, wall: 
     return {
         "file": rec["file"], "stem": stem, "output": str(out_dir(cfg, rec)), "mode": pipeline.MODE,
         "template": rec["kind"], "template_auto": True, "manual": not first, "force": False,
-        "source_size": state["size"], "started_at": started, "finished_at": later(started, wall),
+        "source_size": len(PLACEHOLDER), "started_at": started, "finished_at": later(started, wall),
         "duration_sec": round(wall, 2), "audio_duration_sec": heard["audio_duration_sec"],
         "cost": paid["cost"], "status": "ok", "error": None, "reused_transcript": not first,
         "speech_model": heard["model"], "speakers": heard["speakers"], "segments": heard["segments"],
@@ -300,6 +305,9 @@ def plan(cfg: Settings, kinds: dict, book: ledger.Ledger, trail: journal.Journal
                 md = md.replace("{%s}" % anchor, f"[{clock}]")
             assert "{" not in md, f"{rec['file']}: в протоколе осталась метка {md[md.index('{'):][:12]}"
             state["md"], state["protocol"] = md, {"chars": len(md), "marks": len(set(summarize.MARK_RE.findall(md)))}
+            source = cfg.inbox / rec["file"]
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_bytes(PLACEHOLDER)
             record = row(cfg, rec, kinds, state, started, wall, first=True)
             with book.db.write():
                 book.put(record)
@@ -398,8 +406,8 @@ def main(notes: Path) -> None:
         *(f"| {login} | {name} | {kind} | {days} | `{token}` |" for login, name, kind, days, token in issued), "",
         "## Чего в демонстрации нет", "",
         "- Звука: проигрыватель на странице записи не появляется, метки времени никуда не перематывают.",
-        "- Исходных файлов: кнопку «Пересобрать протокол» и повторный запуск не нажимать — запись уйдёт в ошибку",
-        "  («файл не найден во входной папке»). Вернуть её — запустить наполнение заново.", "",
+        "- Исходных файлов: на их месте заглушки без звука. Кнопку «Пересобрать протокол» и повторный запуск",
+        "  не нажимать — запись уйдёт в ошибку. Вернуть её — запустить наполнение заново.", "",
         "## Наполнить заново", "",
         "Команды — в начале файла `tools/demo_seed.py` в репозитории. Пароли и ключи при этом меняются,",
         "этот файл переписывается.", ""]), encoding="utf-8")
