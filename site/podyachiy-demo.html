@@ -528,7 +528,8 @@ button.ghost { background: transparent; color: var(--ink-2); border-color: var(-
 button.ghost:hover:not(:disabled) { background: var(--surface-2); color: var(--ink); }
 button.icon { min-height: 34px; padding: 6px; width: 34px; display: grid; place-items: center; }
 label { display: block; font-size: 12.5px; color: var(--ink-3); margin: 12px 0 5px; font-weight: 550; }
-input[type=text], input[type=search], input[type=password], input[type=date], input[type=email], select, textarea {
+input[type=text], input[type=search], input[type=password], input[type=date], input[type=email], input[type=time],
+input[type=number], select, textarea {
   width: 100%; max-width: 560px; min-height: 38px; padding: 8px 11px;
   font: inherit; font-size: 13.5px; color: var(--ink);
   background: var(--surface-2); border: 1px solid var(--line-2); border-radius: 8px;
@@ -647,6 +648,19 @@ a.open:hover { border-bottom-color: var(--primary); }
   font-family: var(--mono); font-size: 12.5px; line-height: 1.65;
   white-space: pre-wrap; word-break: break-word; margin: 8px 0; color: var(--ink-2);
 }
+/* блок кода из Markdown (common.js mdToHtml) — в протоколе и в описании API: фон и рамка из переменных
+   (обе темы), длинный блок прокручивается внутри себя, страница вширь не едет. Блок можно выбрать с
+   клавиатуры (tabindex) и прокрутить стрелками — рамка фокуса видна. В протоколе строки переносятся: там
+   это текст, не код с отступами; в описании API отступы JSON сохраняются, переносятся только .wrap */
+.doc pre:not(.plain), .apibody pre {
+  font-family: var(--mono); font-size: 12.5px; line-height: 1.6; color: var(--ink);
+  background: var(--surface-2); border: 1px solid var(--line); border-radius: 8px;
+  padding: 10px 12px; margin: 8px 0; max-width: 100%; max-height: 340px; overflow: auto;
+  white-space: pre; tab-size: 2;
+}
+.doc pre:not(.plain), .apibody pre.wrap { white-space: pre-wrap; overflow-wrap: anywhere; }
+.doc pre code, .apibody pre code { border: 0; padding: 0; background: none; font: inherit; color: inherit; }
+.doc pre:focus-visible, .apibody pre:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
 /* подписи говорящих над расшифровкой */
 .nhint {
   display: flex; align-items: center; gap: 9px; flex-wrap: wrap; margin: 10px 0 4px;
@@ -732,6 +746,7 @@ body.three { padding: 0; overflow: hidden; }
 }
 button.nav { width: 100%; background: none; border: none; cursor: pointer; font-family: inherit; text-align: left; }
 .nav.sm { min-height: 34px; font-size: 13px; font-weight: 500; }
+@media (max-width: 860px) { .nav.sm { min-height: 44px; } }   /* на телефоне — пальцем, не мышью */
 .nav:focus-visible { outline: 2px solid var(--primary); outline-offset: -2px; }
 .nav span:first-of-type { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .nav:hover { background: var(--surface-2); color: var(--ink); }
@@ -998,6 +1013,21 @@ pre.smtperr:empty { display: none; }
 /* на телефоне и сенсорном экране — по пальцу */
 @media (max-width: 600px), (pointer: coarse) {
   .c2 .hrow button, .c2 .hrow a.linkbtn { min-height: 44px; padding: 6px 12px; }
+}
+
+/* ---------- корзина: окно со страницы записей ---------- */
+#trash .veil { z-index: 30; }
+#trash .modal { width: min(640px, 100%); }
+#trash .modal header { display: flex; align-items: center; gap: 12px; }
+#trash .modal header h2 { margin: 0; flex: 1; font-size: 16px; text-transform: none; letter-spacing: 0; color: var(--ink); }
+#trash .modal .body { padding: 14px 18px 18px; overflow: auto; }
+#trash .keyrow .msg { grid-column: 1 / -1; margin-top: 4px; }
+#trash .keyrow .msg:empty { display: none; }
+#trash .keyrow .kact button { display: inline-flex; align-items: center; gap: 6px; }
+#trash .msg.err::before { content: "Ошибка: "; font-weight: 600; }
+@media (max-width: 560px), (pointer: coarse) {
+  #trash .veil { padding: 10px; }
+  #trash .keyrow .kact button, #trash .row button { min-height: 44px; }
 }
 
 /* ---------- серия совещаний: кнопка в шапке папки и её окно ---------- */
@@ -1338,6 +1368,41 @@ pre.aboutcopy {
   .modal .title .acts { flex: 0 1 auto; flex-wrap: wrap; justify-content: flex-end; margin-left: auto; }
 }
 
+/* резервная копия на «Обработке»: поля расписания в ряд, на телефоне — столбиком и в рост пальца;
+   кнопки очереди («Снять из очереди», «Отменить прогон») на телефоне — тоже */
+.bkstate { font-size: 13.5px; color: var(--ink-2); line-height: 1.5; }
+.bkgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 0 14px; max-width: 680px; }
+.jobacts { margin-top: 10px; }
+.jobacts button.dangerlink { margin-left: 0; }
+@media (max-width: 600px), (pointer: coarse) {
+  #backup input:not([type=checkbox]), #backup select, #backup button, #backup .check { min-height: 44px; }
+  #queue .rowacts button, #running button { min-height: 44px; }
+}
+
+/* правка протокола и его версии в окне записи: поле в рост текста, во всю ширину и на телефоне */
+.protobar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 2px 0 10px; }
+.protobar .dim { flex: 1 1 220px; display: flex; align-items: center; gap: 6px; font-size: 13px; }
+.protobar .dim:empty { display: none; }
+.protobar .dim svg { flex: none; }
+.protoed label { margin-top: 4px; }
+.protoed .row { margin: 8px 0 6px; }
+.protoed .prevbar.ask { margin: 6px 0 8px; }
+.protoed .ferr { display: block; line-height: 1.5; }
+.protoed .ferr button { margin: 6px 0 0; color: var(--ink); }
+textarea.protoarea { min-height: 240px; overflow: hidden; resize: none; margin-top: 6px; }
+.protover .row.apart { justify-content: space-between; margin-top: 0; }
+.protover h3, .pshown h3 { margin: 0; font-size: 15px; }
+.protover h3:focus, .pshown h3:focus { outline: none; }
+.doc .protover .edvers { max-width: none; margin: 8px 0 0; padding: 0; }
+.protover .msg:empty { display: none; }
+.pshown { margin-top: 14px; padding: 10px 12px; border: 1px dashed var(--line-2); border-radius: 8px; background: var(--surface-2); }
+.pshown .row { margin: 8px 0 10px; }
+.nhint .fhint { flex-basis: 100%; margin: 0; }
+@media (max-width: 600px), (pointer: coarse) {
+  .protobar button, .protoed .row button, .protover button, .pshown button { min-height: 44px; }
+  textarea.protoarea { font-size: 16px; }
+}
+
 </style>
 <style>
 /* Демонстрация: полоска-предупреждение сверху, сообщение «недоступно», окно карты.
@@ -1387,6 +1452,8 @@ body.three > .app3, body.three > .shell { flex: 1 1 auto; min-height: 0; height:
           title="Переносить ли в новый протокол незакрытые поручения предыдущей записи этой папки">Серия<span class="sw" id="srstate"></span></button>
         <button class="ghost" id="acbtn" hidden title="Кому открыта эта папка">Доступ</button>
         <button class="ghost" id="mkbtn" hidden title="Создать подпапку здесь">Новая папка</button>
+        <button class="ghost" id="trbtn" aria-haspopup="dialog"
+          title="Удалённые записи и папки: их можно вернуть на прежнее место, пока срок хранения не вышел">Корзина</button>
       </div>
       <input type="search" id="q" placeholder="Поиск по всем записям" aria-label="Поиск по протоколам и расшифровкам всех записей">
     </div>
@@ -1413,6 +1480,7 @@ body.three > .app3, body.three > .shell { flex: 1 1 auto; min-height: 0; height:
 <div id="access" hidden></div>
 <div id="series" hidden></div>
 <div id="recact" hidden></div>
+<div id="trash" hidden></div>
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 </template>
 <template id="demo-page:/tasks" data-title="Подьячий — поручения (демонстрация)">
@@ -1452,6 +1520,8 @@ body.three > .app3, body.three > .shell { flex: 1 1 auto; min-height: 0; height:
       <div class="count" id="count" role="status" aria-live="polite">Загружаю…</div>
       <button type="button" class="ghost" id="reset" hidden>Сбросить отбор</button>
       <a class="linkbtn" id="csv" href="/api/v1/tasks.csv" title="Те же строки с тем же отбором — файлом для Excel"></a>
+      <a class="linkbtn" id="ics" href="/api/v1/tasks.ics"
+        title="Поручения с датой срока из того же отбора — событиями на день срока, файлом для Outlook, Google и других календарей. Повторный импорт обновляет события, а не дублирует их"></a>
     </div>
     <div id="list"></div>
   </div>
@@ -1849,6 +1919,20 @@ function newPassword() {
   return out;
 }
 
+/* Флажок «Отозвать мои ключи доступа» — при смене пароля (login.js) и на странице «задать пароль»
+   (set-password.js), только тому, у кого ключи есть. По умолчанию выключен: на ключах работают
+   интеграции человека (1С, ИИ-клиенты), и обрывать их без его слова нельзя; а если пароль мог узнать
+   кто-то ещё, пояснение подсказывает отозвать и ключи — ключом входят без пароля. */
+function revokeBox(count) {
+  if (!count) return "";
+  const word = count % 10 === 1 && count % 100 !== 11 ? "ключ"
+    : [2, 3, 4].includes(count % 10) && ![12, 13, 14].includes(count % 100) ? "ключа" : "ключей";
+  return `<label class="check"><input type="checkbox" id="revoke" aria-describedby="revoke-hint">
+      <span><b>Отозвать мои ключи доступа<\/b> — у вас ${count} ${word}<\/span><\/label>
+    <div class="fhint" id="revoke-hint">Программы и ИИ-клиенты, которые входят этими ключами, перестанут работать, пока
+      вы не выпустите новые. Отзовите, если пароль или ключ мог узнать кто-то ещё: ключом входят без пароля.<\/div>`;
+}
+
 // ---------- кто вошёл ----------
 let me = null;      // ответ /api/me: кто сейчас вошёл
 
@@ -1873,44 +1957,96 @@ async function initUser() {
   acts.innerHTML = `<button class="nav sm" id="keysbtn">${icon("key", 15)}<span>Ключи доступа<\/span><\/button>` +
     (me.login === "admin" ? "" :
       // у учётной записи домена пароля в сервисе нет: он меняется в домене
-      `${me.mail ? `<button class="nav sm" id="notifybtn" role="switch"><\/button>` : ""}
+      `${me.mail ? `<button class="nav sm" id="notifybtn" role="switch"><\/button>
+         <button class="nav sm" id="duebtn" role="switch"><\/button>` : ""}
        ${me.domain_account ? "" : `<a class="nav sm" href="/login?change">${icon("gear", 15)}<span>Сменить пароль<\/span><\/a>`}`) +
-    `<button class="nav sm" id="logout">${icon("back", 15)}<span>Выйти<\/span><\/button>`;
+    `<button class="nav sm" id="logout">${icon("back", 15)}<span>Выйти<\/span><\/button>
+     <button class="nav sm" id="logoutall" aria-expanded="false" aria-controls="logoutask">${icon("users", 15)}<span>Выйти везде<\/span><\/button>
+     <div id="logoutask" role="alertdialog" aria-labelledby="logoutasktext" hidden><\/div>`;
   drawNotify();
   document.getElementById("logout").onclick = async () => {
     await api("/api/logout", {});
     location.href = "/login";
   };
+  document.getElementById("logoutall").onclick = () => askLogoutAll(true);
   document.getElementById("keysbtn").onclick = openKeys;
   if (location.hash === "#keys") openKeys();      // сюда ведут справка и инструкция навыка
 }
 
-const ruDay = iso => iso ? `${iso.slice(8, 10)}.${iso.slice(5, 7)}.${iso.slice(0, 4)}` : "";
-
-/* ---------- письма о готовности записи ----------
-   Переключатель в меню учётной записи: «Уведомления на почту: когда моя запись готова».
-   Включён, пока человек сам не отключит; без почты в учётной записи письму идти некуда —
-   тогда он стоит выключенным и говорит, почему. Состояние написано словом, не только цветом. */
-function drawNotify() {
-  const btn = document.getElementById("notifybtn");
-  if (!btn) return;
-  const on = !!(me.email && me.notify_ready);
-  btn.setAttribute("aria-checked", on);
-  btn.setAttribute("aria-label", "Уведомления на почту: когда моя запись готова");
-  btn.title = me.email
-    ? `Уведомления на почту: когда моя запись готова — письмо со ссылкой и кратким итогом на ${me.email}`
-    : "Уведомления на почту: в вашей учётной записи не указана почта — попросите администратора её вписать";
-  btn.innerHTML = `${icon("mail", 15)}<span>Письма о готовности<\/span>
-    <span class="sw${on ? " on" : ""}" aria-hidden="true">${me.email ? (on ? "вкл" : "выкл") : "нет почты"}<\/span>`;
-  btn.onclick = async () => {
-    if (!me.email) { alert(btn.title); return; }
-    btn.disabled = true;
-    try { me.notify_ready = (await api("/api/notify", { ready: !me.notify_ready })).notify_ready; }
-    catch (e) { alert("Не сохранилось: " + e.message); }
-    btn.disabled = false;
-    drawNotify();
-    btn.focus();
+/* «Выйти везде»: входы на других браузерах и устройствах перестают действовать, этот остаётся.
+   Сначала — подтверждение тут же, под кнопкой: по ошибке человек выкинул бы себя с телефона и
+   ноутбука. Ключи доступа не трогаются — об этом сказано, чтобы не ждали, что программы отключатся. */
+function askLogoutAll(open) {
+  const box = document.getElementById("logoutask"), btn = document.getElementById("logoutall");
+  btn.setAttribute("aria-expanded", String(open));
+  box.hidden = !open;
+  if (!open) { box.innerHTML = ""; btn.focus(); return; }
+  box.innerHTML = `<div class="note dangerbox" id="logoutasktext">Выйти на всех остальных браузерах и устройствах?
+      Этот браузер останется во входе. Ключи доступа продолжат работать — их отзывают в окне «Ключи доступа».<\/div>
+    <div class="row"><button type="button" class="danger" id="logoutallgo">Выйти на остальных<\/button>
+      <button type="button" class="ghost" id="logoutallno">Отмена<\/button><\/div>
+    <div class="msg" id="logoutallmsg" aria-live="polite"><\/div>`;
+  document.getElementById("logoutallno").onclick = () => askLogoutAll(false);
+  box.onkeydown = e => { if (e.key === "Escape") { e.stopPropagation(); askLogoutAll(false); } };
+  const go = document.getElementById("logoutallgo");
+  go.onclick = async () => {
+    go.disabled = true;
+    go.textContent = "Выхожу…";
+    try {
+      await api("/api/logout/all", {});
+      box.innerHTML = `<div class="msg ok" role="status" tabindex="-1" id="logoutalldone">Готово: на остальных браузерах и
+        устройствах вход больше не действует. Здесь вы остались во входе.<\/div>`;
+      document.getElementById("logoutalldone").focus();
+      btn.setAttribute("aria-expanded", "false");
+    } catch (err) {
+      go.disabled = false;
+      go.textContent = "Выйти на остальных";
+      const msg = document.getElementById("logoutallmsg");
+      msg.setAttribute("role", "alert");
+      say("logoutallmsg", "err", "Не получилось: " + err.message);
+    }
   };
+  document.getElementById("logoutallno").focus();     // случайный Enter никого не выкинет
+}
+
+const ruDay = iso =>iso ? `${iso.slice(8, 10)}.${iso.slice(5, 7)}.${iso.slice(0, 4)}` : "";
+
+/* ---------- письма о готовности записи и напоминания о сроках ----------
+   Два переключателя в меню учётной записи: «Письма о готовности» (когда моя запись готова) и
+   «Напоминания о сроках» (раз в день — мои поручения со сроком сегодня, завтра и просроченные).
+   Включены, пока человек сам не отключит; без почты в учётной записи письму идти некуда —
+   тогда они стоят выключенными и говорят, почему. Состояние написано словом, не только цветом. */
+const NOTIFY_SWITCHES = [
+  { id: "notifybtn", field: "notify_ready", send: "ready", icon: "mail", label: "Письма о готовности",
+    what: "Уведомления на почту: когда моя запись готова",
+    hint: "письмо со ссылкой и кратким итогом" },
+  { id: "duebtn", field: "notify_due", send: "due", icon: "clock", label: "Напоминания о сроках",
+    what: "Напоминания на почту о сроках моих поручений",
+    hint: "раз в день, утром, — поручения на вас со сроком сегодня, завтра и просроченные; только когда есть о чём напомнить" },
+];
+
+function drawNotify() {
+  for (const sw of NOTIFY_SWITCHES) {
+    const btn = document.getElementById(sw.id);
+    if (!btn) continue;
+    const on = !!(me.email && me[sw.field]);
+    btn.setAttribute("aria-checked", on);
+    btn.setAttribute("aria-label", sw.what);
+    btn.title = me.email
+      ? `${sw.what} — ${sw.hint}, на ${me.email}`
+      : `${sw.what}: в вашей учётной записи не указана почта — попросите администратора её вписать`;
+    btn.innerHTML = `${icon(sw.icon, 15)}<span>${sw.label}<\/span>
+      <span class="sw${on ? " on" : ""}" aria-hidden="true">${me.email ? (on ? "вкл" : "выкл") : "нет почты"}<\/span>`;
+    btn.onclick = async () => {
+      if (!me.email) { alert(btn.title); return; }
+      btn.disabled = true;
+      try { me[sw.field] = (await api("/api/notify", { [sw.send]: !me[sw.field] }))[sw.field]; }
+      catch (e) { alert("Не сохранилось: " + e.message); }
+      btn.disabled = false;
+      drawNotify();
+      btn.focus();
+    };
+  }
 }
 
 /* ---------- протокол на почту ----------
@@ -2446,10 +2582,18 @@ function mdToHtml(src) {
   const flushList = () => { if (list) { html += "<\/" + list + ">"; list = null; } };
   const flushTable = () => { if (table) { html += "<\/table>"; table = false; } };
   const flushAll = () => { flushPara(); flushList(); flushTable(); };
+  // блок кода ``` … ``` — как есть, с отступами; прокручивается сам, а не страница (с клавиатуры тоже)
+  let code = null;
 
   // n — номер строки текста: по нему строка таблицы задач находит свою отметку «выполнено» (markTasks)
   for (const [n, raw] of src.replace(/\r/g, "").split("\n").entries()) {
     const line = raw.trimEnd();
+    if (line.trim().startsWith("```")) {
+      if (code === null) { flushAll(); code = []; }
+      else { html += `<pre tabindex="0" aria-label="Пример кода"><code>${esc(code.join("\n"))}<\/code><\/pre>`; code = null; }
+      continue;
+    }
+    if (code !== null) { code.push(line); continue; }
     if (!line.trim()) { flushAll(); continue; }
     if (line.trim().startsWith("<\!--")) continue;           // служебный заголовок файла
     if (line.trim().startsWith("|")) {
@@ -2490,6 +2634,7 @@ function mdToHtml(src) {
     }
   }
   flushAll();
+  if (code !== null) html += `<pre tabindex="0" aria-label="Пример кода"><code>${esc(code.join("\n"))}<\/code><\/pre>`;
   return html;
 }
 
@@ -2618,6 +2763,9 @@ let onViewerChange = null;
 /* Переименовать, перенести, удалить запись: кнопки появляются у хозяина записи на той
    странице, которая умеет эти действия показать, — она и задаёт обработчик. */
 let onRecordAction = null;
+/* Правка текста протокола и его версии — тоже у страницы записей: {body() — разметка вместо протокола
+   или "" (показать протокол как есть), drawn(doc, своё ли на месте) — после того, как окно нарисовано}. */
+let protocolPane = null;
 
 async function openViewer(file, kind, silent) {
   const wasOpen = !!viewFile;
@@ -2675,6 +2823,16 @@ function say(id, kind, text) {
   if (el) { el.className = "msg " + kind; el.textContent = text; }
 }
 
+/* Протокол правили вручную (d.edited — кто и когда): пересборка соберёт его моделью заново, а правленый
+   текст уйдёт в версии протокола. Об этом — у каждой кнопки, которая пересобирает, до нажатия. */
+function handEdited(d) {
+  const e = d && d.edited;
+  if (!e) return "";
+  return `<div class="fhint warnhint">${icon("alert", 13)}<span>Протокол правили вручную (${esc(e.by)}, ${markDay(e.at)}
+    ${esc(e.at.slice(11, 16))}): пересборка соберёт его заново, а ручные правки уйдут в версии протокола — вернуть их
+    можно кнопкой «Версии» на вкладке «Протокол».<\/span><\/div>`;
+}
+
 /* Протокол строится по подписям на момент сборки. Поправили подписи после —
    протокол с ними расходится, и об этом надо сказать на любой вкладке. */
 function staleBar() {
@@ -2686,7 +2844,7 @@ function staleBar() {
     : viewData.dict_newer ? "Словарь записи правили" : "ФИО правили";
   return `<div class="nhint warn">${icon("alert", 14)}
     <span>${what} после того, как собран протокол, — в нём этих правок ещё нет<\/span>
-    ${canRebuild() ? `<button class="copybtn" id="rebuild">Пересобрать протокол<\/button>
+    ${canRebuild() ? `<button class="copybtn" id="rebuild">Пересобрать протокол<\/button>${handEdited(viewData)}
     <div class="msg" id="rbmsg" role="status"><\/div>` : canSign() ? `<span class="dim">${REBUILD_BY}<\/span>` : ""}<\/div>`;
 }
 
@@ -2767,7 +2925,7 @@ function namesPanel() {
       <button id="nsave">${canRebuild() ? "Сохранить и пересобрать протокол" : "Сохранить подписи"}<\/button>
       <button class="ghost" id="nclose">Закрыть<\/button>
     <\/div>
-    ${canRebuild() ? "" : `<div class="fhint">${REBUILD_BY} — подписи сохранятся, протокол останется прежним.<\/div>`}
+    ${canRebuild() ? handEdited(viewData) : `<div class="fhint">${REBUILD_BY} — подписи сохранятся, протокол останется прежним.<\/div>`}
     <div class="msg" id="nmsg" role="status"><\/div>
   <\/section>`;
 }
@@ -2811,11 +2969,15 @@ function fillDoc() {
   const top = doc.scrollTop;
   viewText = viewData.text;
   let body;
-  if (viewKind === "summary") body = mdToHtml(viewData.text);
+  // правка протокола и его версии (страница записей, protocolPane) заменяют собой показ протокола
+  const pane = viewKind === "summary" && protocolPane && protocolPane.body();
+  if (pane) body = pane;
+  else if (viewKind === "summary") body = mdToHtml(viewData.text);
   else if (viewKind === "transcript" && (viewData.lines || []).length) body = transcriptHtml();
   else body = `<pre class="plain">${esc(viewData.text)}<\/pre>`;
   doc.innerHTML = staleBar() + namesHint() + namesPanel() + body;
-  if (viewKind === "summary") { markTasks(doc); markPrevious(doc); }
+  if (viewKind === "summary" && !pane) { markTasks(doc); markPrevious(doc); }
+  if (viewKind === "summary" && protocolPane) protocolPane.drawn(doc, !!pane);
   doc.scrollTop = top;
 }
 
@@ -3013,12 +3175,16 @@ async function sendNames(body, msg, draft) {
     // текст с подписями собирает сервер — после правки просто берём его заново
     if (viewKind === "summary") Object.assign(viewData, { names_newer: d.names_newer, rebuilding: d.rebuilding });
     else await refresh();
-    return true;
+    return d;
   } catch (e) {
     say(msg, "err", e.message);
-    return false;
+    return null;
   }
 }
+
+// подписанные ФИО, которых не было в словаре папки, сервер добавляет туда сам — сказать об этом
+const dictAdded = d => d.dictionary_added && d.dictionary_added.length
+  ? ` В словарь папки добавлено: ${d.dictionary_added.join(", ")} — должность допишите кнопкой «Словарь».` : "";
 
 async function refresh() {
   const d = await api(`/api/result?file=${encodeURIComponent(viewFile)}&kind=${viewKind}`);
@@ -3030,12 +3196,12 @@ async function saveNames() {
   document.getElementById("nsave").disabled = true;
   say("nmsg", "", "Сохраняю…");
   const again = canRebuild();
-  const ok = await sendNames({ parts, rebuild: again }, "nmsg", () => { namesDraft = parts; });
-  if (!ok) { const b = document.getElementById("nsave"); if (b) b.disabled = false; return; }
+  const d = await sendNames({ parts, rebuild: again }, "nmsg", () => { namesDraft = parts; });
+  if (!d) { const b = document.getElementById("nsave"); if (b) b.disabled = false; return; }
   namesDraft = {};
   fillDoc();
-  say("nmsg", "ok", again ? "Сохранено. Протокол пересобирается — обновится через несколько минут."
-    : "Подписи сохранены. Протокол не пересобирался.");
+  say("nmsg", "ok", (again ? "Сохранено. Протокол пересобирается — обновится через несколько минут."
+    : "Подписи сохранены. Протокол не пересобирался.") + dictAdded(d));
 }
 
 async function saveLine(reset) {
@@ -3210,6 +3376,7 @@ function drawDict(note) {
           title="Платный вызов модели; запись заново не распознаётся">Сохранить и пересобрать протокол<\/button>` : ""}
         <button type="button" class="ghost" id="dccancel">Закрыть<\/button>
       <\/div>
+      ${rec && d.can_rebuild ? handEdited(d) : ""}
       <div class="msg${note ? " " + note.kind : ""}" id="dcmsg" role="status">${note ? esc(note.text) : ""}<\/div>
       ${rec && d.processed && !d.can_rebuild ? `<div class="fhint">${REBUILD_BY}.<\/div>` : ""}
       ${dictChanged(d)}`;
@@ -3288,7 +3455,7 @@ function initViewer() {
     // Escape при вопросе «убрать раздел?» — это «Отмена», а не закрытие записи
     if (e.key === "Escape" && prevAsk) { prevAsk = false; fillDoc(); focusIn("#prevdrop"); return; }
     // в поле ввода Escape гасит подсказку браузера, а не закрывает окно с правками
-    if (e.key === "Escape" && viewFile && !(e.target.matches && e.target.matches("input"))) closeViewer();
+    if (e.key === "Escape" && viewFile && !(e.target.matches && e.target.matches("input, textarea"))) closeViewer();
     if ((e.key === "Enter" || e.key === " ") && e.target.closest && e.target.closest("a.open")) open(e);
     const mark = e.target.closest && e.target.closest("a.ts");
     if ((e.key === "Enter" || e.key === " ") && mark) { e.preventDefault(); playFrom(+mark.dataset.sec); }
@@ -3465,6 +3632,15 @@ function render() {
   renderFiles();
 }
 
+const SOURCE_LABELS = { changed: "исходник изменился", missing: "исходник отсутствует" };
+const SOURCE_HINTS = {
+  changed: "Файл записи во входной папке изменился после обработки: его докопировали или перезаписали. Протокол и " +
+    "расшифровка сделаны по прежнему файлу, заново сервис сам его не распознаёт — это стоило бы денег. Нужно по " +
+    "новому файлу — администратор сервиса запускает запись вручную с перезаписью.",
+  missing: "Файла записи нет во входной папке: его убрали или переименовали мимо сервиса. Протокол и расшифровка на " +
+    "месте, но пересобрать их не выйдет, пока файл не вернут.",
+};
+
 function renderFiles() {
   const busyHere = (data.pending || []).filter(p => !data.path || p.dir === data.path);
   const box = document.getElementById("files");
@@ -3474,8 +3650,10 @@ function renderFiles() {
     return;
   }
   box.innerHTML = busyHere.map(p => {
-      const label = { copying: "копируется", queued: "в очереди", running: "обрабатывается" }[p.state];
-      const note = p.state === "copying"
+      const label = { copying: "копируется", held: "отложена", queued: "в очереди", running: "обрабатывается" }[p.state];
+      // отложенная (похожа на недокопированную, ждёт решения администратора) — почему, словами от сервиса
+      const note = p.state === "held" ? p.note
+        : p.state === "copying"
         ? `не меняется ${p.quiet_sec} с из ${p.stable_sec}`
         : p.state === "running"
           ? (p.chunks_total ? `часть ${p.chunks_done} из ${p.chunks_total}` : (p.step || "готовлю звук"))
@@ -3485,13 +3663,17 @@ function renderFiles() {
         <div class="g">${esc(note)}<\/div>
         ${p.state === "running" && p.chunks_total
           ? `<div class="bar" style="margin-top:4px"><i style="width:${100 * p.chunks_done / p.chunks_total}%"><\/i><\/div>` : ""}
-        <div class="m"><span class="badge working">${icon(p.state === "copying" ? "copy" : "clock", 13)}${label}<\/span><\/div>
+        <div class="m"><span class="badge ${p.state === "held" ? "no_audio" : "working"}">${
+          icon(p.state === "copying" ? "copy" : p.state === "held" ? "alert" : "clock", 13)}${label}<\/span><\/div>
       <\/div>`;
     }).join("") +
     data.files.map(f => {
       const tags = [];
       if (f.status !== "ok") tags.push(`<span class="badge ${esc(f.status)}">${icon(STATUS_ICONS[f.status] || "alert", 13)}${
         esc(STATUS_LABELS[f.status] || f.status)}<\/span>`);
+      // файл записи во входной папке: изменился после обработки или пропал — словами на метке, подробно — в подсказке
+      if (f.source) tags.push(`<span class="tag warn" title="${esc(SOURCE_HINTS[f.source] || "")}">${
+        esc(SOURCE_LABELS[f.source] || f.source)}<\/span>`);
       if (f.speakers_unreliable) tags.push(`<span class="tag warn">метки ненадёжны<\/span>`);
       if (f.crowded_meeting) tags.push(`<span class="tag warn">многолюдно<\/span>`);
       if (f.type_unsure) tags.push(`<span class="tag warn" title="${
@@ -3570,7 +3752,7 @@ let upBusy = false, upSeq = 0;
 const big = n => n >= 2 ** 30 ? (n / 2 ** 30).toFixed(2).replace(".", ",") + " ГБ" : mb(n);
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const upUrl = u => `/api/upload?dir=${encodeURIComponent(u.dir)}&name=${
-  encodeURIComponent(u.file.name)}&size=${u.file.size}`;
+  encodeURIComponent(u.file.name)}&size=${u.file.size}&stamp=${u.file.lastModified}`;
 
 function addUploads(list) {
   const rules = data && data.upload;
@@ -4069,6 +4251,114 @@ function plural(n, one, few, many) {
 }
 
 
+/* ---------- корзина ----------
+   Удалённые записи и папки, которые человек может вернуть: запись — хозяин её папки, папку —
+   администратор сервиса. «Вернуть» — сразу, без подтверждения: действие обратимо, вернувшееся
+   снова удаляют. Итог — строкой под списком (aria-live), отказ — под строкой той записи (role="alert").
+   Обработка при возврате не запускается: протокол и расшифровка возвращаются с диска. */
+let trashOpen = false, trashItems = [], trashKeep = 30, trashDone = null;
+
+const trashWhere = item => item.dir ? `в папке «${item.dir}»` : "в корне";
+const trashBack = item => item.dir ? `в папку «${item.dir}»` : "в корень";
+
+function closeTrash() {
+  if (!trashOpen) return;
+  trashOpen = false;
+  const box = document.getElementById("trash");
+  box.hidden = true;
+  box.innerHTML = "";
+  document.getElementById("trbtn").focus();
+}
+
+function drawTrash(focusId) {
+  const box = document.getElementById("trash");
+  box.hidden = false;
+  const rows = trashItems.map((item, i) => `<li class="keyrow">
+      <div class="kmain"><b>${esc(item.kind === "folder" ? item.name : (item.title || item.name))}<\/b>
+        <span class="dim">${item.kind === "folder"
+          ? `папка, ${item.records} ${plural(item.records, "запись", "записи", "записей")}` : item.title ? esc(item.name) : ""}<\/span><\/div>
+      <div class="kmeta dim">${esc(trashWhere(item))} · удалено ${ruDay(item.at)} ${esc(item.at.slice(11, 16))}${
+        item.by ? ", " + esc(item.by) : ""} · хранится до ${ruDay(item.until)}${item.partial
+          ? " · удалено до версии 1.2.0: вернётся без словаря, прав на папку и автора загрузки" : ""}<\/div>
+      <div class="kact"><button type="button" data-restore="${i}" id="trgo${i}">${icon("undo", 15)}<span>Вернуть<\/span><\/button><\/div>
+      <div class="msg" id="trmsg${i}"><\/div>
+    <\/li>`).join("");
+  box.innerHTML = `<div class="veil" id="trveil"><div class="modal" role="dialog" aria-modal="true" aria-labelledby="trtitle">
+    <header><h2 id="trtitle">Корзина<\/h2>
+      <button class="ghost icon" id="trclose" aria-label="Закрыть">${icon("close", 15)}<\/button><\/header>
+    <div class="body">
+      <p class="klead">Удалённое хранится ${trashKeep} ${plural(trashKeep, "день", "дня", "дней")}, потом стирается само.
+        «Вернуть» кладёт запись или папку на прежнее место со всем, что было: протокол, расшифровка, подписи
+        говорящих, отметки и сроки поручений, словарь, права на папку. Заново ничего не обрабатывается и не оплачивается.<\/p>
+      ${trashItems.length ? `<ul class="keylist">${rows}<\/ul>`
+        : `<p class="kempty dim">Здесь нет ничего, что вы можете вернуть. Запись возвращает владелец её папки,
+           папку — администратор сервиса.<\/p>`}
+      <div class="msg${trashDone ? " " + trashDone.kind : ""}" id="trdone" role="status" aria-live="polite">${
+        trashDone ? esc(trashDone.text) : ""}<\/div>
+      <div class="row"><button type="button" class="ghost" id="trok">Закрыть<\/button><\/div>
+    <\/div><\/div><\/div>`;
+  const target = (focusId && document.getElementById(focusId)) || box.querySelector("[data-restore]")
+    || document.getElementById("trok");
+  target.focus();
+}
+
+async function openTrash() {
+  trashOpen = true;
+  trashDone = null;
+  try {
+    const d = await api("/api/trash");
+    trashItems = d.items;
+    trashKeep = d.keep_days;
+  } catch (e) {
+    trashItems = [];
+    trashDone = { kind: "err", text: "Корзина не открылась: " + e.message };
+  }
+  if (trashOpen) drawTrash();
+}
+
+async function restoreFromTrash(i) {
+  const item = trashItems[i], btn = document.getElementById("trgo" + i);
+  btn.disabled = true;
+  btn.lastElementChild.textContent = "Возвращаю…";
+  try {
+    const d = await api("/api/trash/restore", { id: item.id });
+    trashDone = { kind: "ok", text: d.kind === "folder"
+      ? `Папка «${item.name}» вернулась ${trashBack(item)}, записей в ней: ${d.records}.`
+      : `Запись «${item.title || item.name}» вернулась ${trashBack(item)}.` };
+    trashItems.splice(i, 1);
+    if (trashOpen) drawTrash();
+    load();
+  } catch (e) {
+    btn.disabled = false;
+    btn.lastElementChild.textContent = "Вернуть";
+    const msg = document.getElementById("trmsg" + i);
+    msg.setAttribute("role", "alert");
+    say("trmsg" + i, "err", "Не вернулось: " + e.message);
+  }
+}
+
+document.getElementById("trbtn").onclick = () => (trashOpen ? closeTrash() : openTrash());
+const trashBox = document.getElementById("trash");
+let trashDownOnVeil = false;
+trashBox.addEventListener("mousedown", e => { trashDownOnVeil = e.target.id === "trveil"; });
+trashBox.addEventListener("click", e => {
+  if (e.target.closest("#trclose, #trok") || (e.target.id === "trveil" && trashDownOnVeil)) return closeTrash();
+  const go = e.target.closest("[data-restore]");
+  if (go && !go.disabled) restoreFromTrash(+go.dataset.restore);
+});
+// Escape закрывает корзину, а не запись под ней; Tab ходит по кругу внутри окна
+addEventListener("keydown", e => {
+  if (!trashOpen || trashBox.hidden) return;
+  if (e.key === "Escape") { e.stopPropagation(); closeTrash(); return; }
+  if (e.key !== "Tab") return;
+  const stops = [...trashBox.querySelectorAll("button:not(:disabled)")];
+  const first = stops[0], last = stops[stops.length - 1];
+  if (!trashBox.contains(document.activeElement)) { e.preventDefault(); first.focus(); }
+  else if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+  else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+}, true);
+
+
 document.addEventListener("click", e => {
   const link = e.target.closest("[data-go]");
   if (!link) return;
@@ -4087,6 +4377,256 @@ document.getElementById("q").addEventListener("input", e => {
     runSearch();
   }, 350);
 });
+
+/* ---------- правка протокола и его версии ----------
+   Хозяин папки правит протокол текстом Markdown прямо в окне записи — без модели. Сохранение
+   передаёт отпечаток протокола, с которого начата правка (base): протокол за это время поправил
+   кто-то ещё или пересобрала модель — сервер отвечает 409, и набранный текст остаётся в поле.
+   Прежний текст сервер кладёт в версии протокола; их видно всем, кому открыта запись, а вернуть
+   версию может тот же хозяин папки. Несохранённая правка живёт, пока открыта страница: переход
+   на другую вкладку или запись её не теряет, а закрыть страницу с ней браузер не даст молча. */
+const PROTO_MAX = 200000;           // предел текста правки — как на сервере (summarize.EDIT_MAX_CHARS)
+let protoDraft = null;              // {file, text, orig, base} — правка, которая ещё не сохранена
+let proto = { file: null, mode: "", list: null, shown: null, ask: false, busy: false };
+
+const protoBody = text => text.replace(/^\s*<\!--[\s\S]*?-->\s*/, "");   // без служебной пометки сервиса
+const protoDirty = () => !!protoDraft && protoDraft.text !== protoDraft.orig;
+const protoWhen = at => `${markDay(at)} ${at.slice(11, 16)}`;
+const protoHow = v => v.how === "edit" ? `правка: ${esc(v.by)}` : v.how === "restore" ? `возврат версии: ${esc(v.by)}`
+  : "собрала модель";
+const protoLive = text => { const live = document.getElementById("vlive"); if (live) { live.className = "tsaid"; live.textContent = text; } };
+
+function protoBar() {
+  const e = viewData.edited;
+  return `<div class="protobar" role="group" aria-label="Текст протокола">
+    <span class="dim">${e ? `${icon("edit", 13)}${e.how === "restore" ? "Возвращена прежняя версия" : "Правили вручную"}: ${
+      esc(e.by)}, ${protoWhen(e.at)}` : ""}<\/span>
+    <button type="button" class="ghost copybtn" id="pversions">${icon("list", 13)}Версии<\/button>
+    ${viewData.can_edit ? `<button type="button" class="ghost copybtn" id="pedit" ${viewData.rebuilding ? "disabled" : ""}
+      title="${viewData.rebuilding ? "Протокол пересобирается — править можно после сборки" : "Поправить текст протокола без пересборки"}">${icon("edit", 13)}Править<\/button>` : ""}
+  <\/div>`;
+}
+
+function protoEditor() {
+  const n = protoDraft.text.length;
+  return `<div class="protoed">
+    <label for="ptext">Текст протокола в Markdown<\/label>
+    <div class="fhint" id="phint">Заголовки — строки с «#», поручения — строки таблицы «| поручение | срок | в записи | статус |».
+      Отметки «выполнено» и сроки останутся у поручений, если исполнитель тот же, а слова почти те же.
+      Прежний текст сохранится в версиях протокола.<\/div>
+    <div class="row">
+      <button type="button" id="psave">Сохранить<\/button>
+      <button type="button" class="ghost" id="pcancel">Отмена<\/button>
+    <\/div>
+    ${proto.ask ? `<div class="prevbar ask" role="group" aria-labelledby="paskq">
+      <p id="paskq"><b>Выбросить правку?<\/b> Набранный текст не сохранится, протокол останется прежним.<\/p>
+      <div class="row apart"><button type="button" class="ghost" id="paskno">Продолжить правку<\/button>
+        <button type="button" class="danger" id="paskyes">Выбросить правку<\/button><\/div><\/div>` : ""}
+    <div class="ferr" id="perr" role="alert"><\/div>
+    <div class="msg" id="pmsg" role="status" aria-live="polite"><\/div>
+    <textarea id="ptext" class="tpltext protoarea" spellcheck="true" autocomplete="off"
+      aria-describedby="phint pcount perr">${esc(protoDraft.text)}<\/textarea>
+    <div class="fhint" id="pcount">${protoCount(n)}<\/div>
+  <\/div>`;
+}
+
+const protoCount = n => `${n.toLocaleString("ru")} знаков из ${PROTO_MAX.toLocaleString("ru")}` +
+  (n > PROTO_MAX ? " — слишком длинно" : "") + (protoDirty() ? " · есть несохранённая правка" : "");
+
+function protoVersions() {
+  const d = proto.list;
+  if (!d) return `<div class="protover"><p class="dim" role="status">Загружаю версии протокола…<\/p><\/div>`;
+  if (d.error) return `<div class="protover"><div class="msg err" role="alert">${esc(d.error)}<\/div>
+    <div class="row"><button type="button" class="ghost" id="pback">К протоколу<\/button><\/div><\/div>`;
+  const s = proto.shown;
+  return `<div class="protover">
+    <div class="row apart"><h3 id="pvh" tabindex="-1">Версии протокола<\/h3>
+      <button type="button" class="ghost copybtn" id="pback">К протоколу<\/button><\/div>
+    <p class="fhint">Сейчас: ${d.edited ? `${d.edited.how === "restore" ? "возвращённая версия" : "правка"} — ${esc(d.edited.by)},
+      ${protoWhen(d.edited.at)}` : "протокол, собранный моделью"}. Прежний текст сохраняется при каждой правке, возврате
+      версии и пересборке протокола. Вернуть версию — поставить её текст на место нынешнего; нынешний уйдёт в версии.<\/p>
+    ${d.versions.length ? `<ul class="edvers">${d.versions.map(v => `<li><span>${protoWhen(v.at)}:${v.at.slice(17, 19)}
+        · ${protoHow(v)} <span class="dim">· ${v.chars.toLocaleString("ru")} знаков<\/span><\/span>
+        <span class="rowacts"><button type="button" class="ghost" data-pshow="${esc(v.stamp)}"
+          aria-pressed="${!!s && s.stamp === v.stamp}">Показать<\/button>
+          ${d.can_edit ? `<button type="button" class="ghost" data-pask="${esc(v.stamp)}">Вернуть…<\/button>` : ""}<\/span><\/li>`).join("")}<\/ul>`
+      : `<div class="empty">${icon("idle", 17)}прежних версий нет: протокол ещё не правили и не пересобирали<\/div>`}
+    <div class="msg" id="pvmsg" role="alert"><\/div>
+    ${s ? `<section class="pshown" aria-labelledby="psh">
+      <h3 id="psh" tabindex="-1">Версия от ${protoWhen(s.at)} — ${protoHow(s)}, только просмотр<\/h3>
+      ${d.can_edit ? `<div class="row"><button type="button" id="prestore">Вернуть эту версию<\/button>
+        <button type="button" class="ghost" id="phide">Скрыть<\/button><\/div>` : ""}
+      ${s.text === undefined ? `<p class="dim">Загружаю текст версии…<\/p>` : mdToHtml(s.text)}<\/section>` : ""}
+  <\/div>`;
+}
+
+protocolPane = {
+  body() {
+    if (proto.file !== viewFile) {           // открыли другую запись: её правка — если она была начата
+      proto = { file: viewFile, mode: protoDraft && protoDraft.file === viewFile ? "edit" : "", list: null,
+                shown: null, ask: false, busy: false };
+    }
+    if (proto.mode === "edit" && protoDraft && protoDraft.file === viewFile) return protoEditor();
+    if (proto.mode === "versions") return protoVersions();
+    return "";
+  },
+  drawn(doc, own) {
+    if (!own) { doc.insertAdjacentHTML("afterbegin", protoBar()); return; }
+    const field = document.getElementById("ptext");
+    if (field) protoFit(field);
+  },
+};
+
+// поле — в рост текста: прокручивается окно записи, а не поле внутри него
+function protoFit(field) {
+  field.style.height = "auto";
+  field.style.height = field.scrollHeight + 2 + "px";
+}
+
+function protoStart() {
+  protoLive("");
+  protoDraft = { file: viewFile, text: protoBody(viewData.text), orig: protoBody(viewData.text), base: viewData.version };
+  proto.mode = "edit"; proto.ask = false;
+  fillDoc();
+  const field = document.getElementById("ptext");
+  field.focus();
+  field.setSelectionRange(0, 0);
+  document.querySelector(".doc").scrollTop = 0;
+}
+
+function protoClose(text) {
+  protoDraft = null;
+  proto.mode = ""; proto.ask = false;
+  fillDoc();
+  if (text) protoLive(text);
+  focusIn("#pedit");
+}
+
+async function protoSave() {
+  const go = document.getElementById("psave"), err = document.getElementById("perr");
+  const field = document.getElementById("ptext");
+  err.textContent = "";
+  field.removeAttribute("aria-invalid");
+  if (!protoBody(protoDraft.text).trim()) { err.textContent = "Текст пустой — сохранять нечего"; field.focus(); return; }
+  if (protoDraft.text.length > PROTO_MAX) {
+    err.textContent = `Текст длиннее ${PROTO_MAX.toLocaleString("ru")} знаков — такой сервис не принимает`;
+    field.setAttribute("aria-invalid", "true"); field.focus(); return;
+  }
+  proto.busy = true;
+  go.disabled = true;
+  go.textContent = "Сохраняю…";
+  say("pmsg", "", "Сохраняю правку…");
+  const was = protoDraft;
+  try {
+    const d = await api("/api/v1/protocol", { file: was.file, text: was.text, base: was.base });
+    proto.busy = false;
+    if (viewFile !== was.file) { protoDraft = null; return; }       // пока сохранялось, открыли другую запись
+    await refresh();
+    protoClose(d.changed ? "Протокол сохранён. Прежний текст — в версиях протокола; карта и выгрузки уже с правкой"
+                         : "Текст тот же, что в протоколе, — сохранять было нечего");
+  } catch (e) {
+    proto.busy = false;
+    go.disabled = false;
+    go.textContent = "Сохранить";
+    say("pmsg", "", "");
+    // набранное не трогаем: поле остаётся как было, человек решает сам, что с ним делать
+    err.innerHTML = esc(e.message) + (e.status === 409
+      ? `. Ваш текст остался в поле — скопируйте его, нажмите «Отмена», откройте «Править» заново и перенесите правку
+        в новый текст. <button type="button" class="ghost copybtn" id="pcopy">${icon("clip", 13)}Скопировать мой текст<\/button>`
+      : "");
+    field.focus();
+  }
+}
+
+async function protoVersionsOpen(focus) {
+  proto.mode = "versions"; proto.list = null; proto.shown = null;
+  protoLive("");
+  fillDoc();
+  const file = viewFile;
+  try { proto.list = await api(`/api/v1/versions?file=${encodeURIComponent(file)}`); }
+  catch (e) { proto.list = { error: e.message }; }
+  if (viewFile !== file || proto.mode !== "versions") return;
+  fillDoc();
+  focusIn(focus || (proto.list.error ? "#pback" : "#pvh"));
+}
+
+async function protoShow(stamp, ask) {
+  const v = proto.list.versions.find(x => x.stamp === stamp);
+  proto.shown = { ...v, text: undefined };
+  fillDoc();
+  const file = viewFile;
+  try {
+    const d = await api(`/api/v1/version?file=${encodeURIComponent(file)}&stamp=${encodeURIComponent(stamp)}`);
+    if (viewFile !== file || !proto.shown || proto.shown.stamp !== stamp) return;
+    proto.shown.text = d.text;
+    fillDoc();
+    focusIn(ask ? "#prestore" : "#psh");
+  } catch (e) {
+    proto.shown = null;
+    fillDoc();
+    say("pvmsg", "err", e.message);
+  }
+}
+
+async function protoRestore() {
+  const go = document.getElementById("prestore"), s = proto.shown;
+  go.disabled = true;
+  go.textContent = "Возвращаю…";
+  try {
+    const d = await api("/api/v1/protocol/restore", { file: viewFile, stamp: s.stamp, base: proto.list.version });
+    await refresh();
+    proto.mode = ""; proto.shown = null;
+    fillDoc();
+    protoLive(d.changed ? `Возвращена версия от ${protoWhen(s.at)}. Прежний текст — в версиях протокола: возврат можно отменить`
+                        : "Эта версия и так совпадает с нынешним протоколом — ничего не изменилось");
+    focusIn("#pversions");
+  } catch (e) {
+    if (e.status !== 409) {
+      go.disabled = false;
+      go.textContent = "Вернуть эту версию";
+      say("pvmsg", "err", e.message);
+      go.focus();
+      return;
+    }
+    // протокол за это время изменился: список версий — заново, с новым отпечатком
+    await protoVersionsOpen("#pvh");
+    say("pvmsg", "err", e.message + ". Список версий обновлён — посмотрите его ещё раз");
+  }
+}
+
+document.getElementById("viewer").addEventListener("click", e => {
+  const t = e.target;
+  if (!viewFile || viewKind !== "summary") return;
+  if (t.closest("#pedit")) protoStart();
+  else if (t.closest("#pversions")) protoVersionsOpen();
+  else if (t.closest("#psave") && !proto.busy) protoSave();
+  else if (t.closest("#pcancel")) {
+    if (!protoDirty()) { protoClose(""); return; }
+    proto.ask = true; fillDoc(); focusIn("#paskno");
+  }
+  else if (t.closest("#paskno")) { proto.ask = false; fillDoc(); focusIn("#ptext"); }
+  else if (t.closest("#paskyes")) protoClose("Правка выброшена, протокол прежний");
+  else if (t.closest("#pcopy")) copyText(protoDraft ? protoDraft.text : "").then(ok =>
+    say("pmsg", ok ? "ok" : "err", ok ? "Ваш текст скопирован" : "Скопировать не вышло — выделите текст в поле сами"));
+  else if (t.closest("#pback")) { proto.mode = ""; proto.shown = null; fillDoc(); focusIn("#pversions"); }
+  else if (t.closest("[data-pshow]")) protoShow(t.closest("[data-pshow]").dataset.pshow, false);
+  else if (t.closest("[data-pask]")) protoShow(t.closest("[data-pask]").dataset.pask, true);
+  else if (t.closest("#phide")) { proto.shown = null; fillDoc(); focusIn("#pvh"); }
+  else if (t.closest("#prestore")) protoRestore();
+});
+document.getElementById("viewer").addEventListener("input", e => {
+  if (e.target.id !== "ptext" || !protoDraft) return;
+  protoDraft.text = e.target.value;
+  protoFit(e.target);
+  document.getElementById("pcount").textContent = protoCount(protoDraft.text.length);
+});
+// Escape в поле правки — «Отмена»: окно записи с набранным текстом не закрывается
+document.getElementById("viewer").addEventListener("keydown", e => {
+  if (e.target.id === "ptext" && e.key === "Escape") { e.preventDefault(); document.getElementById("pcancel").click(); }
+  if (e.target.id === "ptext" && e.key === "s" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); if (!proto.busy) protoSave(); }
+});
+// несохранённая правка протокола — браузер переспросит, прежде чем закрыть страницу
+addEventListener("beforeunload", e => { if (protoDirty()) e.preventDefault(); });
 
 const start = new URLSearchParams(location.search);
 folder = start.get("path") || "";
@@ -4278,6 +4818,20 @@ function newPassword() {
   return out;
 }
 
+/* Флажок «Отозвать мои ключи доступа» — при смене пароля (login.js) и на странице «задать пароль»
+   (set-password.js), только тому, у кого ключи есть. По умолчанию выключен: на ключах работают
+   интеграции человека (1С, ИИ-клиенты), и обрывать их без его слова нельзя; а если пароль мог узнать
+   кто-то ещё, пояснение подсказывает отозвать и ключи — ключом входят без пароля. */
+function revokeBox(count) {
+  if (!count) return "";
+  const word = count % 10 === 1 && count % 100 !== 11 ? "ключ"
+    : [2, 3, 4].includes(count % 10) && ![12, 13, 14].includes(count % 100) ? "ключа" : "ключей";
+  return `<label class="check"><input type="checkbox" id="revoke" aria-describedby="revoke-hint">
+      <span><b>Отозвать мои ключи доступа<\/b> — у вас ${count} ${word}<\/span><\/label>
+    <div class="fhint" id="revoke-hint">Программы и ИИ-клиенты, которые входят этими ключами, перестанут работать, пока
+      вы не выпустите новые. Отзовите, если пароль или ключ мог узнать кто-то ещё: ключом входят без пароля.<\/div>`;
+}
+
 // ---------- кто вошёл ----------
 let me = null;      // ответ /api/me: кто сейчас вошёл
 
@@ -4302,44 +4856,96 @@ async function initUser() {
   acts.innerHTML = `<button class="nav sm" id="keysbtn">${icon("key", 15)}<span>Ключи доступа<\/span><\/button>` +
     (me.login === "admin" ? "" :
       // у учётной записи домена пароля в сервисе нет: он меняется в домене
-      `${me.mail ? `<button class="nav sm" id="notifybtn" role="switch"><\/button>` : ""}
+      `${me.mail ? `<button class="nav sm" id="notifybtn" role="switch"><\/button>
+         <button class="nav sm" id="duebtn" role="switch"><\/button>` : ""}
        ${me.domain_account ? "" : `<a class="nav sm" href="/login?change">${icon("gear", 15)}<span>Сменить пароль<\/span><\/a>`}`) +
-    `<button class="nav sm" id="logout">${icon("back", 15)}<span>Выйти<\/span><\/button>`;
+    `<button class="nav sm" id="logout">${icon("back", 15)}<span>Выйти<\/span><\/button>
+     <button class="nav sm" id="logoutall" aria-expanded="false" aria-controls="logoutask">${icon("users", 15)}<span>Выйти везде<\/span><\/button>
+     <div id="logoutask" role="alertdialog" aria-labelledby="logoutasktext" hidden><\/div>`;
   drawNotify();
   document.getElementById("logout").onclick = async () => {
     await api("/api/logout", {});
     location.href = "/login";
   };
+  document.getElementById("logoutall").onclick = () => askLogoutAll(true);
   document.getElementById("keysbtn").onclick = openKeys;
   if (location.hash === "#keys") openKeys();      // сюда ведут справка и инструкция навыка
 }
 
-const ruDay = iso => iso ? `${iso.slice(8, 10)}.${iso.slice(5, 7)}.${iso.slice(0, 4)}` : "";
-
-/* ---------- письма о готовности записи ----------
-   Переключатель в меню учётной записи: «Уведомления на почту: когда моя запись готова».
-   Включён, пока человек сам не отключит; без почты в учётной записи письму идти некуда —
-   тогда он стоит выключенным и говорит, почему. Состояние написано словом, не только цветом. */
-function drawNotify() {
-  const btn = document.getElementById("notifybtn");
-  if (!btn) return;
-  const on = !!(me.email && me.notify_ready);
-  btn.setAttribute("aria-checked", on);
-  btn.setAttribute("aria-label", "Уведомления на почту: когда моя запись готова");
-  btn.title = me.email
-    ? `Уведомления на почту: когда моя запись готова — письмо со ссылкой и кратким итогом на ${me.email}`
-    : "Уведомления на почту: в вашей учётной записи не указана почта — попросите администратора её вписать";
-  btn.innerHTML = `${icon("mail", 15)}<span>Письма о готовности<\/span>
-    <span class="sw${on ? " on" : ""}" aria-hidden="true">${me.email ? (on ? "вкл" : "выкл") : "нет почты"}<\/span>`;
-  btn.onclick = async () => {
-    if (!me.email) { alert(btn.title); return; }
-    btn.disabled = true;
-    try { me.notify_ready = (await api("/api/notify", { ready: !me.notify_ready })).notify_ready; }
-    catch (e) { alert("Не сохранилось: " + e.message); }
-    btn.disabled = false;
-    drawNotify();
-    btn.focus();
+/* «Выйти везде»: входы на других браузерах и устройствах перестают действовать, этот остаётся.
+   Сначала — подтверждение тут же, под кнопкой: по ошибке человек выкинул бы себя с телефона и
+   ноутбука. Ключи доступа не трогаются — об этом сказано, чтобы не ждали, что программы отключатся. */
+function askLogoutAll(open) {
+  const box = document.getElementById("logoutask"), btn = document.getElementById("logoutall");
+  btn.setAttribute("aria-expanded", String(open));
+  box.hidden = !open;
+  if (!open) { box.innerHTML = ""; btn.focus(); return; }
+  box.innerHTML = `<div class="note dangerbox" id="logoutasktext">Выйти на всех остальных браузерах и устройствах?
+      Этот браузер останется во входе. Ключи доступа продолжат работать — их отзывают в окне «Ключи доступа».<\/div>
+    <div class="row"><button type="button" class="danger" id="logoutallgo">Выйти на остальных<\/button>
+      <button type="button" class="ghost" id="logoutallno">Отмена<\/button><\/div>
+    <div class="msg" id="logoutallmsg" aria-live="polite"><\/div>`;
+  document.getElementById("logoutallno").onclick = () => askLogoutAll(false);
+  box.onkeydown = e => { if (e.key === "Escape") { e.stopPropagation(); askLogoutAll(false); } };
+  const go = document.getElementById("logoutallgo");
+  go.onclick = async () => {
+    go.disabled = true;
+    go.textContent = "Выхожу…";
+    try {
+      await api("/api/logout/all", {});
+      box.innerHTML = `<div class="msg ok" role="status" tabindex="-1" id="logoutalldone">Готово: на остальных браузерах и
+        устройствах вход больше не действует. Здесь вы остались во входе.<\/div>`;
+      document.getElementById("logoutalldone").focus();
+      btn.setAttribute("aria-expanded", "false");
+    } catch (err) {
+      go.disabled = false;
+      go.textContent = "Выйти на остальных";
+      const msg = document.getElementById("logoutallmsg");
+      msg.setAttribute("role", "alert");
+      say("logoutallmsg", "err", "Не получилось: " + err.message);
+    }
   };
+  document.getElementById("logoutallno").focus();     // случайный Enter никого не выкинет
+}
+
+const ruDay = iso =>iso ? `${iso.slice(8, 10)}.${iso.slice(5, 7)}.${iso.slice(0, 4)}` : "";
+
+/* ---------- письма о готовности записи и напоминания о сроках ----------
+   Два переключателя в меню учётной записи: «Письма о готовности» (когда моя запись готова) и
+   «Напоминания о сроках» (раз в день — мои поручения со сроком сегодня, завтра и просроченные).
+   Включены, пока человек сам не отключит; без почты в учётной записи письму идти некуда —
+   тогда они стоят выключенными и говорят, почему. Состояние написано словом, не только цветом. */
+const NOTIFY_SWITCHES = [
+  { id: "notifybtn", field: "notify_ready", send: "ready", icon: "mail", label: "Письма о готовности",
+    what: "Уведомления на почту: когда моя запись готова",
+    hint: "письмо со ссылкой и кратким итогом" },
+  { id: "duebtn", field: "notify_due", send: "due", icon: "clock", label: "Напоминания о сроках",
+    what: "Напоминания на почту о сроках моих поручений",
+    hint: "раз в день, утром, — поручения на вас со сроком сегодня, завтра и просроченные; только когда есть о чём напомнить" },
+];
+
+function drawNotify() {
+  for (const sw of NOTIFY_SWITCHES) {
+    const btn = document.getElementById(sw.id);
+    if (!btn) continue;
+    const on = !!(me.email && me[sw.field]);
+    btn.setAttribute("aria-checked", on);
+    btn.setAttribute("aria-label", sw.what);
+    btn.title = me.email
+      ? `${sw.what} — ${sw.hint}, на ${me.email}`
+      : `${sw.what}: в вашей учётной записи не указана почта — попросите администратора её вписать`;
+    btn.innerHTML = `${icon(sw.icon, 15)}<span>${sw.label}<\/span>
+      <span class="sw${on ? " on" : ""}" aria-hidden="true">${me.email ? (on ? "вкл" : "выкл") : "нет почты"}<\/span>`;
+    btn.onclick = async () => {
+      if (!me.email) { alert(btn.title); return; }
+      btn.disabled = true;
+      try { me[sw.field] = (await api("/api/notify", { [sw.send]: !me[sw.field] }))[sw.field]; }
+      catch (e) { alert("Не сохранилось: " + e.message); }
+      btn.disabled = false;
+      drawNotify();
+      btn.focus();
+    };
+  }
 }
 
 /* ---------- протокол на почту ----------
@@ -4875,10 +5481,18 @@ function mdToHtml(src) {
   const flushList = () => { if (list) { html += "<\/" + list + ">"; list = null; } };
   const flushTable = () => { if (table) { html += "<\/table>"; table = false; } };
   const flushAll = () => { flushPara(); flushList(); flushTable(); };
+  // блок кода ``` … ``` — как есть, с отступами; прокручивается сам, а не страница (с клавиатуры тоже)
+  let code = null;
 
   // n — номер строки текста: по нему строка таблицы задач находит свою отметку «выполнено» (markTasks)
   for (const [n, raw] of src.replace(/\r/g, "").split("\n").entries()) {
     const line = raw.trimEnd();
+    if (line.trim().startsWith("```")) {
+      if (code === null) { flushAll(); code = []; }
+      else { html += `<pre tabindex="0" aria-label="Пример кода"><code>${esc(code.join("\n"))}<\/code><\/pre>`; code = null; }
+      continue;
+    }
+    if (code !== null) { code.push(line); continue; }
     if (!line.trim()) { flushAll(); continue; }
     if (line.trim().startsWith("<\!--")) continue;           // служебный заголовок файла
     if (line.trim().startsWith("|")) {
@@ -4919,6 +5533,7 @@ function mdToHtml(src) {
     }
   }
   flushAll();
+  if (code !== null) html += `<pre tabindex="0" aria-label="Пример кода"><code>${esc(code.join("\n"))}<\/code><\/pre>`;
   return html;
 }
 
@@ -5047,6 +5662,9 @@ let onViewerChange = null;
 /* Переименовать, перенести, удалить запись: кнопки появляются у хозяина записи на той
    странице, которая умеет эти действия показать, — она и задаёт обработчик. */
 let onRecordAction = null;
+/* Правка текста протокола и его версии — тоже у страницы записей: {body() — разметка вместо протокола
+   или "" (показать протокол как есть), drawn(doc, своё ли на месте) — после того, как окно нарисовано}. */
+let protocolPane = null;
 
 async function openViewer(file, kind, silent) {
   const wasOpen = !!viewFile;
@@ -5104,6 +5722,16 @@ function say(id, kind, text) {
   if (el) { el.className = "msg " + kind; el.textContent = text; }
 }
 
+/* Протокол правили вручную (d.edited — кто и когда): пересборка соберёт его моделью заново, а правленый
+   текст уйдёт в версии протокола. Об этом — у каждой кнопки, которая пересобирает, до нажатия. */
+function handEdited(d) {
+  const e = d && d.edited;
+  if (!e) return "";
+  return `<div class="fhint warnhint">${icon("alert", 13)}<span>Протокол правили вручную (${esc(e.by)}, ${markDay(e.at)}
+    ${esc(e.at.slice(11, 16))}): пересборка соберёт его заново, а ручные правки уйдут в версии протокола — вернуть их
+    можно кнопкой «Версии» на вкладке «Протокол».<\/span><\/div>`;
+}
+
 /* Протокол строится по подписям на момент сборки. Поправили подписи после —
    протокол с ними расходится, и об этом надо сказать на любой вкладке. */
 function staleBar() {
@@ -5115,7 +5743,7 @@ function staleBar() {
     : viewData.dict_newer ? "Словарь записи правили" : "ФИО правили";
   return `<div class="nhint warn">${icon("alert", 14)}
     <span>${what} после того, как собран протокол, — в нём этих правок ещё нет<\/span>
-    ${canRebuild() ? `<button class="copybtn" id="rebuild">Пересобрать протокол<\/button>
+    ${canRebuild() ? `<button class="copybtn" id="rebuild">Пересобрать протокол<\/button>${handEdited(viewData)}
     <div class="msg" id="rbmsg" role="status"><\/div>` : canSign() ? `<span class="dim">${REBUILD_BY}<\/span>` : ""}<\/div>`;
 }
 
@@ -5196,7 +5824,7 @@ function namesPanel() {
       <button id="nsave">${canRebuild() ? "Сохранить и пересобрать протокол" : "Сохранить подписи"}<\/button>
       <button class="ghost" id="nclose">Закрыть<\/button>
     <\/div>
-    ${canRebuild() ? "" : `<div class="fhint">${REBUILD_BY} — подписи сохранятся, протокол останется прежним.<\/div>`}
+    ${canRebuild() ? handEdited(viewData) : `<div class="fhint">${REBUILD_BY} — подписи сохранятся, протокол останется прежним.<\/div>`}
     <div class="msg" id="nmsg" role="status"><\/div>
   <\/section>`;
 }
@@ -5240,11 +5868,15 @@ function fillDoc() {
   const top = doc.scrollTop;
   viewText = viewData.text;
   let body;
-  if (viewKind === "summary") body = mdToHtml(viewData.text);
+  // правка протокола и его версии (страница записей, protocolPane) заменяют собой показ протокола
+  const pane = viewKind === "summary" && protocolPane && protocolPane.body();
+  if (pane) body = pane;
+  else if (viewKind === "summary") body = mdToHtml(viewData.text);
   else if (viewKind === "transcript" && (viewData.lines || []).length) body = transcriptHtml();
   else body = `<pre class="plain">${esc(viewData.text)}<\/pre>`;
   doc.innerHTML = staleBar() + namesHint() + namesPanel() + body;
-  if (viewKind === "summary") { markTasks(doc); markPrevious(doc); }
+  if (viewKind === "summary" && !pane) { markTasks(doc); markPrevious(doc); }
+  if (viewKind === "summary" && protocolPane) protocolPane.drawn(doc, !!pane);
   doc.scrollTop = top;
 }
 
@@ -5442,12 +6074,16 @@ async function sendNames(body, msg, draft) {
     // текст с подписями собирает сервер — после правки просто берём его заново
     if (viewKind === "summary") Object.assign(viewData, { names_newer: d.names_newer, rebuilding: d.rebuilding });
     else await refresh();
-    return true;
+    return d;
   } catch (e) {
     say(msg, "err", e.message);
-    return false;
+    return null;
   }
 }
+
+// подписанные ФИО, которых не было в словаре папки, сервер добавляет туда сам — сказать об этом
+const dictAdded = d => d.dictionary_added && d.dictionary_added.length
+  ? ` В словарь папки добавлено: ${d.dictionary_added.join(", ")} — должность допишите кнопкой «Словарь».` : "";
 
 async function refresh() {
   const d = await api(`/api/result?file=${encodeURIComponent(viewFile)}&kind=${viewKind}`);
@@ -5459,12 +6095,12 @@ async function saveNames() {
   document.getElementById("nsave").disabled = true;
   say("nmsg", "", "Сохраняю…");
   const again = canRebuild();
-  const ok = await sendNames({ parts, rebuild: again }, "nmsg", () => { namesDraft = parts; });
-  if (!ok) { const b = document.getElementById("nsave"); if (b) b.disabled = false; return; }
+  const d = await sendNames({ parts, rebuild: again }, "nmsg", () => { namesDraft = parts; });
+  if (!d) { const b = document.getElementById("nsave"); if (b) b.disabled = false; return; }
   namesDraft = {};
   fillDoc();
-  say("nmsg", "ok", again ? "Сохранено. Протокол пересобирается — обновится через несколько минут."
-    : "Подписи сохранены. Протокол не пересобирался.");
+  say("nmsg", "ok", (again ? "Сохранено. Протокол пересобирается — обновится через несколько минут."
+    : "Подписи сохранены. Протокол не пересобирался.") + dictAdded(d));
 }
 
 async function saveLine(reset) {
@@ -5639,6 +6275,7 @@ function drawDict(note) {
           title="Платный вызов модели; запись заново не распознаётся">Сохранить и пересобрать протокол<\/button>` : ""}
         <button type="button" class="ghost" id="dccancel">Закрыть<\/button>
       <\/div>
+      ${rec && d.can_rebuild ? handEdited(d) : ""}
       <div class="msg${note ? " " + note.kind : ""}" id="dcmsg" role="status">${note ? esc(note.text) : ""}<\/div>
       ${rec && d.processed && !d.can_rebuild ? `<div class="fhint">${REBUILD_BY}.<\/div>` : ""}
       ${dictChanged(d)}`;
@@ -5717,7 +6354,7 @@ function initViewer() {
     // Escape при вопросе «убрать раздел?» — это «Отмена», а не закрытие записи
     if (e.key === "Escape" && prevAsk) { prevAsk = false; fillDoc(); focusIn("#prevdrop"); return; }
     // в поле ввода Escape гасит подсказку браузера, а не закрывает окно с правками
-    if (e.key === "Escape" && viewFile && !(e.target.matches && e.target.matches("input"))) closeViewer();
+    if (e.key === "Escape" && viewFile && !(e.target.matches && e.target.matches("input, textarea"))) closeViewer();
     if ((e.key === "Enter" || e.key === " ") && e.target.closest && e.target.closest("a.open")) open(e);
     const mark = e.target.closest && e.target.closest("a.ts");
     if ((e.key === "Enter" || e.key === " ") && mark) { e.preventDefault(); playFrom(+mark.dataset.sec); }
@@ -5766,6 +6403,7 @@ let last = null, undoTimer = null;
 initSidebar("tasks");
 initTheme();
 document.getElementById("csv").innerHTML = icon("copy", 15) + "Скачать CSV";
+document.getElementById("ics").innerHTML = icon("clock", 15) + "В календарь (ICS)";
 
 // отбор для запроса к сервису
 function state() {
@@ -5864,6 +6502,7 @@ async function load() {
   const p = state(), mine = ++seq, shownAs = address().toString();
   history.replaceState(null, "", shownAs ? "/tasks?" + shownAs : "/tasks");
   document.getElementById("csv").href = "/api/v1/tasks.csv" + (p.toString() ? "?" + p : "");
+  document.getElementById("ics").href = "/api/v1/tasks.ics" + (p.toString() ? "?" + p : "");
   try {
     const d = await api("/api/v1/tasks?" + p);
     if (mine !== seq) return;                 // пока шёл ответ, отбор уже поменяли
