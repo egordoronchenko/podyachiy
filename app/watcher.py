@@ -135,7 +135,6 @@ class Pending:
     """Файл, за которым сканер следит до признания дописанным."""
     size: int
     mtime: float
-    stable: int = 1              # сколько замеров подряд совпали
     since: float = 0.0           # monotonic: когда этот замер увидели впервые
     first_seen: str = ""
     cut: str | None = None       # чем файл в этом замере похож на недокопированный (cut_short); None — не проверен
@@ -407,14 +406,11 @@ class Service:
                 self.log(f"новый файл: {rel} ({human_size(st.st_size)}) — "
                          f"жду, пока допишется")
                 continue
-            if prev.size == st.st_size and prev.mtime == st.st_mtime:
-                prev.stable += 1
-            else:
+            if (prev.size, prev.mtime) != (st.st_size, st.st_mtime):
                 prev.size, prev.mtime = st.st_size, st.st_mtime
-                prev.stable, prev.since, prev.cut, prev.held = 1, time.monotonic(), None, None
+                prev.since, prev.cut, prev.held = time.monotonic(), None, None
 
-            # решение по фактически прошедшему времени, а не по числу замеров:
-            # требование — размер и mtime не менялись STABLE_SEC
+            # решение по прошедшему времени: размер и mtime не менялись STABLE_SEC
             if prev.quiet_sec() >= self.cfg.stable_sec:
                 if prev.cut is None:
                     prev.cut = cut_short(p) or ""
@@ -432,8 +428,7 @@ class Service:
                     continue                    # рядом ещё копируется другой файл той же папки — следующим обходом
                 self.pending.pop(rel, None)
                 self.queue.append(QueueItem(path=taken))
-                self.log(f"файл дописан (не менялся {prev.quiet_sec():.0f} с, "
-                         f"совпавших замеров подряд: {prev.stable}, {human_size(st.st_size)}): "
+                self.log(f"файл дописан (не менялся {prev.quiet_sec():.0f} с, {human_size(st.st_size)}): "
                          f"{taken} → в очередь (в очереди {len(self.queue)})")
 
         # файл исчез или переехал — забываем накопленную стабильность
@@ -617,8 +612,7 @@ class Service:
     async def scan_loop(self) -> None:
         self.log(f"сканер запущен: {self.cfg.inbox} → {self.cfg.outbox}, "
                  f"опрос раз в {self.cfg.scan_interval_sec} с, файл считается дописанным, "
-                 f"когда размер и время изменения не менялись {self.cfg.stable_sec} с "
-                 f"(совпавших замеров подряд нужно {self.cfg.stable_samples})")
+                 f"когда размер и время изменения не менялись {self.cfg.stable_sec} с")
         while True:
             try:
                 await asyncio.to_thread(self.scan_once)
@@ -953,9 +947,7 @@ class Service:
             "queue": [{"path": i.path, "template": i.template, "force": i.force,
                        "manual": i.manual, "model": i.model} for i in self.queue],
             "watching": [
-                {"path": rel, "size": p.size, "stable": p.stable,
-                 "needed": self.cfg.stable_samples,
-                 "quiet_sec": round(p.quiet_sec()), "stable_sec": self.cfg.stable_sec,
+                {"path": rel, "size": p.size, "quiet_sec": round(p.quiet_sec()), "stable_sec": self.cfg.stable_sec,
                  "first_seen": p.first_seen,
                  # почему в обработку не идёт сам: похож на недокопированный, копия готовой записи…
                  "held": f"похоже, докопирован не до конца: {p.cut}" if p.cut else p.held or ""}

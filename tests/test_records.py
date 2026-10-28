@@ -400,10 +400,9 @@ def test_tampered_trash_note_does_not_move_files_outside_the_inbox(tmp_path):
         assert e.value.status == 404
 
 
-def test_runs_of_a_returned_record_follow_it_again_in_the_base_and_in_the_replay(tmp_path):
-    """Прогоны удалённой записи застывают под её путём; возврат из корзины их размораживает — и в базе,
-    и при проигрывании событий (journal.runs). Прогоны другой записи, удалённой с того же пути раньше,
-    остаются застывшими."""
+def test_runs_of_a_returned_record_follow_it_again(tmp_path):
+    """Прогоны удалённой записи застывают под её путём; возврат из корзины их размораживает. Прогоны другой
+    записи, удалённой с того же пути раньше, остаются застывшими."""
     from app import journal
     trail = journal.Journal(db.Database(tmp_path / "state"))
     run = lambda: trail.write("run", "", file="П/а.mp4", cost=1.0, status="ok")
@@ -416,5 +415,4 @@ def test_runs_of_a_returned_record_follow_it_again_in_the_base_and_in_the_replay
                 uploads={"П/а.mp4": "petrov"})
     trail.write("record_rename", "ivanov", file="П/а.mp4", to="П/б.mp4")
     assert [r["file"] for r in trail.within()] == ["П/а.mp4", "П/б.mp4"]
-    assert [r["file"] for r in journal.runs(trail.read())] == ["П/а.mp4", "П/б.mp4"]
     assert trail.uploaded == {"П/б.mp4": "petrov"}

@@ -10,7 +10,7 @@ name: podyachiy
 
 services:
   podyachiy:
-    # :latest — последняя сборка; чтобы закрепить версию, впиши её в .env: IMAGE_TAG=1.2.0
+    # :latest — последняя сборка; чтобы закрепить версию, впишите её в .env: IMAGE_TAG=1.2.0
     image: egordoronchenko/podyachiy:${IMAGE_TAG:-latest}
     env_file: .env
     environment:
@@ -43,6 +43,8 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
+    # без проверки Docker считает контейнер живым, пока жив процесс:
+    # приложение внутри могло встать, а «Up» продолжал бы висеть
     healthcheck:
       test: ["CMD", "python", "-c",
              "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/status', timeout=5)"]
@@ -50,6 +52,7 @@ services:
       timeout: 10s
       start_period: 20s
       retries: 3
+    # логи контейнера тоже растут без предела, если их не ограничить
     logging:
       driver: json-file
       options:

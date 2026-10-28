@@ -139,8 +139,7 @@ function render() {
       state.watching.map(w => `<tr>
         <td class="path">${esc(w.path)}${w.held ? `<div class="err-text">${icon("alert", 13)} отложен: ${esc(w.held)}</div>` : ""}</td>
         <td class="num">${mb(w.size)}</td>
-        <td class="num">${w.quiet_sec} с из ${w.stable_sec}
-          <span class="dim">(замеров ${w.stable} из ${w.needed})</span></td></tr>`).join("") +
+        <td class="num">${w.quiet_sec} с из ${w.stable_sec}</td></tr>`).join("") +
       `</tbody></table></div>`;
   }
   paint(document.getElementById("queue"), q ||
@@ -2661,6 +2660,8 @@ const ACTIONS = {
   dictionary: e => `изменил словарь ${e.file ? `записи «${e.file}»` : `папки «${e.folder}»`}: участников ${e.people}, сокращений ${e.terms}`,
   series: e => `${e.on ? "включил" : "выключил"} у папки «${e.folder}» серию совещаний`,
   previous_tasks: e => `${e.on ? "вернул" : "убрал"} раздел «Поручения прошлого совещания» в протоколе записи «${e.file}»`,
+  protocol_edit: e => `поправил протокол записи «${e.file}» вручную (знаков: ${e.chars})`,
+  protocol_restore: e => `вернул в протоколе записи «${e.file}» версию от ${String(e.stamp).replace(/^(\d{4})(\d\d)(\d\d)-(\d\d)(\d\d).*$/, "$3.$2.$1 $4:$5")}`,
   key_issue: e => `выпустил ключ доступа «${e.key}»${e.key_kind === "manage" ? " — с управлением сервисом" : ""}`,
   key_revoke: e => `отозвал ключ доступа «${e.key}»${e.owner ? ` пользователя ${e.owner}` : ""}`,
   speech_model: e => e.source === "env"

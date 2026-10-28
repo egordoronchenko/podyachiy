@@ -130,6 +130,25 @@ class Store:
         with self.db.write() as con:
             self._write(con, file, saved)
 
+    def follow(self, file: str, tasks: list[dict]) -> int:
+        """Протокол записи поправил человек: отметки и сроки переходят к поручениям нового текста — под их
+        ключ и с их формулировкой. Поручение сопоставляется так же, как при пересборке (resolve): тот же
+        исполнитель и почти те же слова. Без этого после нескольких правок подряд формулировка в базе
+        отошла бы от текста настолько, что отметка потеряла бы своё поручение. Отметка без пары остаётся
+        как есть. Возвращает, сколько отметок перешло."""
+        by_key = {key(t["who"], t["task"]): t for t in tasks}
+        with self.db.write() as con:
+            saved = self.load(file)
+            moved = {new: old for new, old in resolve(tasks, saved).items()
+                     if new != old or (saved[old].get("who"), saved[old]["task"]) != (by_key[new]["who"], by_key[new]["task"])}
+            if not moved:
+                return 0
+            fresh = {k: v for k, v in saved.items() if k not in moved.values()}
+            for new, old in moved.items():
+                fresh[new] = {**saved[old], "who": by_key[new]["who"], "task": by_key[new]["task"]}
+            self._write(con, file, fresh)
+        return len(moved)
+
     def _write(self, con, file: str, saved: dict[str, dict]) -> None:
         con.execute("DELETE FROM marks WHERE file = ?", (file,))
         con.executemany(

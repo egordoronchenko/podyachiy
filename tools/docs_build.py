@@ -33,6 +33,11 @@ Content-Security-Policy, app/web.py), поэтому сценарий у нег�
 ссылками на раздел с таким номером. Якоря заголовков — как на GitHub, поэтому ссылки вида
 (#3-настройки-env) работают и в Markdown, и в собранном файле.
 
+Так же собирается compose.yml в корне репозитория (сборка образа из исходников) — из install/compose.yml
+(установка из готового образа): общий текст у них один и разойтись не может. Отличия корневого — шапка,
+блок build вместо строки про закрепление версии и нет закомментированного прокси HTTPS (compose_build).
+Правят install/compose.yml, корневой — только пересобирают.
+
 Снимки экрана руководства лежат в docs/guide/shots/*.webp и вшиваются в файл как data: URI.
 Пересъёмка — на одноразовом стенде с выдуманными данными, шаги записаны в tools/guide_shots.mjs
 (стенд из tools/demo_seed.py, корпоративный режим, светлая тема, окно 1280 точек, WebP).
@@ -60,6 +65,8 @@ INSTALL_APP_JS = STATIC / "install-guide.js"
 GUIDE_SITE = SITE / "podyachiy-guide.html"
 PERSONAL_SRC = ROOT / "install" / "personal.md"
 PERSONAL_SITE = SITE / "podyachiy-personal.html"
+COMPOSE_SRC = ROOT / "install" / "compose.yml"
+COMPOSE_BUILD = ROOT / "compose.yml"
 # Ссылки на соседние документы написаны так, чтобы работать в репозитории (путь от файла-источника);
 # в собранном файле документы лежат рядом. Ключ — путь от корня репозитория.
 SIBLINGS = {"install/README.md": "podyachiy-install.html",
@@ -676,6 +683,48 @@ def unlink_siblings(body: str) -> str:
     return re.sub(r'<a href="podyachiy[\w-]*\.html(?:#[^"]*)?">(.*?)</a>', r"\1", body)
 
 
+# ---------- compose.yml для сборки из исходников ----------
+
+COMPOSE_HEAD = """\
+# Сборка из исходников. Рядом с этим файлом должен лежать .env (образец — install/.env.example).
+# Файл собран из install/compose.yml (установка из готового образа): правьте тот и пересоберите этот —
+# python tools/docs_build.py.
+"""
+COMPOSE_IMAGE = """\
+    # :latest — последняя сборка; чтобы закрепить версию, впишите её в .env: IMAGE_TAG=1.2.0
+    image: egordoronchenko/podyachiy:${IMAGE_TAG:-latest}
+"""
+COMPOSE_BUILD_BLOCK = """\
+    # сборка из исходников кладёт образ под тем же именем, под каким он лежит на Docker Hub:
+    # установка из готового образа (install/compose.yml) подхватит его без скачивания
+    image: egordoronchenko/podyachiy:${IMAGE_TAG:-latest}
+    build:
+      context: .
+      # дата сборки и коммит — в раздел «О сервисе»; не заданы в окружении — поля пусты
+      args:
+        BUILD_DATE: ${BUILD_DATE:-}
+        GIT_COMMIT: ${GIT_COMMIT:-}
+"""
+# с этой строки шапки install/compose.yml общая; прокси HTTPS начинается с черты и заголовка
+COMPOSE_SHARED_HEAD = "# Имя проекта задано явно"
+COMPOSE_PROXY = re.compile(r"\n\n  # -{20,}\n  # HTTPS")
+
+
+def compose_build(text: str) -> str:
+    """compose.yml для сборки из исходников — из install/compose.yml: своя шапка, build у образа,
+    без прокси HTTPS. Не нашлось, что заменить, — остановка: сборку надо поправить вслед за источником."""
+    def one(found: int, what: str) -> None:
+        if found != 1:
+            sys.exit(f"{COMPOSE_SRC.relative_to(ROOT).as_posix()}: {what} — поправьте compose_build в tools/docs_build.py")
+
+    one(text.count(COMPOSE_SHARED_HEAD), f"строка «{COMPOSE_SHARED_HEAD}» в шапке должна быть одна")
+    one(text.count(COMPOSE_IMAGE), "строки образа (image) с комментарием над ней должны быть одни")
+    proxy = list(COMPOSE_PROXY.finditer(text))
+    one(len(proxy), "закомментированный прокси HTTPS должен начинаться чертой и заголовком «HTTPS»")
+    text = text[:proxy[0].start()] + "\n"
+    return COMPOSE_HEAD + text[text.index(COMPOSE_SHARED_HEAD):].replace(COMPOSE_IMAGE, COMPOSE_BUILD_BLOCK)
+
+
 def build() -> dict[Path, str]:
     """Все собранные файлы: путь → содержимое."""
     install = Doc(INSTALL_SRC)
@@ -699,6 +748,7 @@ def build() -> dict[Path, str]:
             guide, name="руководство пользователя", note="Люди, совещания и суммы на снимках вымышлены.",
             description="Руководство пользователя сервиса «Подьячий»: от загрузки записи до протокола, поручений и доступа коллегам.",
             nav=site_nav("podyachiy-guide.html"))
+    out[COMPOSE_BUILD] = compose_build(COMPOSE_SRC.read_text(encoding="utf-8"))
     return out
 
 

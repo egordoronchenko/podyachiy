@@ -73,7 +73,6 @@ class Cfg:
     outbox_inside_inbox: None = None
     stable_sec: int = 0
     scan_interval_sec: int = 10
-    stable_samples: int = 1
 
 
 class Trail:

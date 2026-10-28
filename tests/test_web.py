@@ -5258,3 +5258,19 @@ def test_tasks_calendar_has_the_same_filters_as_the_table(site):
     assert petrov.get("/api/v1/tasks.ics").text.count("BEGIN:VEVENT") == 0          # папка закрыта — пусто
     assert ivanov.get("/api/v1/tasks.ics", params={"who": "Петров"}).text.count("BEGIN:VEVENT") == 0
     assert ivanov.get("/api/v1/tasks.ics", params={"sort": "нет"}).status_code == 400
+
+
+def test_code_block_has_one_style_for_protocols_and_the_api_page():
+    """Блок кода из Markdown (mdToHtml) бывает и в протоколе на главной, и в описании API: стиль у него один,
+    в app.css, — фон и рамка из переменных (обе темы), прокрутка внутри блока, перенос строк в протоколе,
+    видимая рамка фокуса. На странице API — только свои отступы, без второго описания того же блока."""
+    css = (ROOT / "app" / "static" / "app.css").read_text(encoding="utf-8")
+    rule = re.search(r"\.doc pre:not\(\.plain\), \.apibody pre \{(.*?)\}", css, flags=re.S)
+    assert rule, "нет общего стиля блока кода в app.css"
+    for part in ("background: var(--surface-2)", "border: 1px solid var(--line)", "color: var(--ink)", "overflow: auto",
+                 "max-width: 100%"):
+        assert part in rule.group(1), part
+    assert re.search(r"\.doc pre:not\(\.plain\), \.apibody pre\.wrap \{ white-space: pre-wrap; overflow-wrap: anywhere; \}", css)
+    assert ".doc pre:focus-visible, .apibody pre:focus-visible { outline: 2px solid var(--primary)" in css
+    api = (ROOT / "app" / "static" / "api.html").read_text(encoding="utf-8")
+    assert not re.search(r"\.apibody pre[^{]*\{[^}]*(background|border|overflow|font-family):", api)

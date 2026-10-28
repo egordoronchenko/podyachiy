@@ -13,7 +13,7 @@ dictionaries.json, settings.json, requests.json, journal.jsonl, brand/brand.json
   2. база собирается во временной папке рядом, одной транзакцией;
   3. сверка: из новой базы теми же классами, которыми сервис будет работать, читается всё
      обратно и сравнивается с прочитанным из файлов — пользователи, права, ключи, словари,
-     настройки, заявки, журнал обработки, отметки, каждое событие журнала и отчёт о расходах;
+     настройки, заявки, журнал обработки, отметки, каждое событие журнала и итог расходов;
   4. готовый файл базы одним переименованием встаёт на место;
   5. прежние файлы переезжают в STATE/до-базы-<дата>/ — копия на случай отката; сервис их
      больше не читает.
@@ -500,12 +500,9 @@ def _verify(base: db.Database, old: dict) -> dict:
     same("заявки", old["requests"], signup.Requests(base).all())
     same("журнал обработки", old["records"], ledger.Ledger(base).records)
     same("отметки и сроки поручений", old["marks"], marks.Store(base).everything())
+    # события легли по порядку тем же Journal._insert, что пишет их в работе: пути прогонов и авторы
+    # загрузок база вывела из них так же, как вывела бы, случись они уже при ней
     same("события журнала", old["events"], trail.read())
-    # отчёт о расходах: пути прогонов, которые база вела при записи событий, против тех же
-    # событий, проигранных по порядку
-    for bucket in ("month", "day"):
-        same(f"отчёт о расходах ({bucket})", journal.report(old["events"], bucket=bucket), trail.report(bucket=bucket))
-    same("авторы загрузок", _uploaded(old["events"]), trail.uploaded)
     before, after = counts(old), counted(base)
     same(f"итоги ({before} и {after})", before, after)
     # и независимо от порядка сложения: сумма по валюте одним запросом — та же до копейки
@@ -513,24 +510,6 @@ def _verify(base: db.Database, old: dict) -> dict:
         if abs(row["total"] - before["расходы"].get(row["currency"], 0.0)) >= 0.005:
             same(f"расходы в {row['currency']}: {before['расходы'].get(row['currency'])} и {row['total']}", 0, 1)
     return after
-
-
-def _uploaded(events: list[dict]) -> dict[str, str]:
-    """Кто загрузил запись, лежащую сейчас по этому пути, — проигрыванием событий по порядку."""
-    found: dict[str, str] = {}
-    for event in events:
-        kind = event["kind"]
-        if kind == "upload":
-            found[event["file"]] = event.get("by", "")
-        elif kind == "folder_rename":
-            found = {journal._moved(f, event["folder"], event["to"]): by for f, by in found.items()}
-        elif kind in journal.RECORD_MOVES and event["file"] in found:
-            found[event["to"]] = found.pop(event["file"])
-        elif kind == "record_delete":
-            found.pop(event["file"], None)
-        elif kind == "folder_delete":
-            found = {f: by for f, by in found.items() if not f.startswith(event["folder"] + "/")}
-    return found
 
 
 def bring(cfg, log) -> None:

@@ -62,7 +62,7 @@ def parsed(path: Path) -> Page:
 def test_all_four_documents_are_built():
     assert {path.relative_to(ROOT).as_posix() for path in BUILT} == {
         "site/podyachiy-install.html", "app/static/install-guide.html", "app/static/install-guide.js",
-        "site/podyachiy-guide.html", "site/podyachiy-personal.html"}
+        "site/podyachiy-guide.html", "site/podyachiy-personal.html", "compose.yml"}
 
 
 @pytest.mark.parametrize("path", sorted(BUILT, key=str), ids=lambda p: p.name)

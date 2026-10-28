@@ -177,6 +177,8 @@ curl.exe -fsS "$u/CHANGELOG.md?since=$n"
 | Переименовать запись | `stg /api/v1/rename "file=<file>" "name=<новое имя>" -- -X POST` | `Stg /api/v1/rename @{file="<file>"; name="<новое имя>"} -X POST` |
 | Перенести запись | `stg /api/v1/move "file=<file>" "dir=<папка>" -- -X POST` | `Stg /api/v1/move @{file="<file>"; dir="<папка>"} -X POST` |
 | Убрать раздел «Поручения прошлого совещания» | `stg /api/v1/previous_tasks "file=<file>" on=false -- -X POST` | `Stg /api/v1/previous_tasks @{file="<file>"; on="false"} -X POST` |
+| Версии протокола | `stg /api/v1/versions "file=<file>"` | `Stg /api/v1/versions @{file="<file>"}` |
+| Текст прежней версии | `stg /api/v1/version "file=<file>" "stamp=<stamp>"` | `Stg /api/v1/version @{file="<file>"; stamp="<stamp>"}` |
 | Папка — не серия совещаний | `stg /api/v1/series "dir=<папка>" on=false -- -X POST` | `Stg /api/v1/series @{dir="<папка>"; on="false"} -X POST` |
 | Полное описание API (текст) | `stg /api/v1` | `Stg /api/v1` |
 
@@ -364,6 +366,37 @@ Stg /api/v1/dictionary @{dir="<папка>"; add="true"} -X PUT -H "Content-Type
    `can_rebuild: false` не предлагай). Ответ `rebuild: already` — пересборка уже стоит или идёт,
    второй не будет. Запись при этом не распознаётся заново. Словарь для новой записи можно
    отправить сразу после `upload`, с её `file`.
+
+**Поправить протокол.** Просят «исправь в протоколе…», «допиши решение», «поправь ФИО в
+поручении» — протокол правится текстом, без модели и бесплатно:
+
+1. Возьми `record` с её `file`: `protocol` — текст в Markdown, `version` — его отпечаток,
+   `can_mark: false` — править нельзя (нужен владелец папки или её администратор, иначе 403).
+2. Поправь только то, о чём просили, остальной текст оставь буква в букву. Покажи человеку, что
+   меняется (было → стало), и дождись согласия.
+3. Отправь весь текст целиком, `base` — тот `version`, с которого начал. JSON — из файла:
+
+```bash
+t=$(mktemp); python3 -c 'import json, sys; print(json.dumps({"file": sys.argv[1], "base": sys.argv[2], "text": open(sys.argv[3], encoding="utf-8").read()}, ensure_ascii=False))' "<file>" "<version>" протокол.md > "$t"
+stg /api/v1/protocol -- -X POST -H "Content-Type: application/json" --data-binary "@$t"; rm -f "$t"
+```
+
+```powershell
+$t = [IO.Path]::GetTempFileName(); [IO.File]::WriteAllText($t, (@{file="<file>"; base="<version>"; text=[IO.File]::ReadAllText("протокол.md")} | ConvertTo-Json -Compress))
+Stg /api/v1/protocol @{} -X POST -H "Content-Type: application/json" --data-binary "@$t"; Remove-Item $t
+```
+
+4. Ответ 409 «протокол изменился» — его поправил кто-то ещё или пересобрала модель: возьми
+   `record` заново, внеси ту же правку в новый текст, покажи и отправь с новым `version`. Поверх
+   не пиши. Прежний текст сервис сам кладёт в версии; отметки и сроки поручений остаются.
+5. Правленый протокол помечен (`edited` в `record`). Пересборка (`rebuild=true` у подписей и
+   словаря) соберёт его моделью заново, и ручные правки уйдут в версии — прежде чем пересобирать
+   такую запись, скажи об этом человеку.
+
+«Верни как было» — `stg /api/v1/versions "file=<file>"`: прежние версии, свежие первыми (`by` —
+кто сделал, `null` — модель; `at` — когда). Покажи список, текст версии — `version` с её `stamp`;
+после согласия — `/api/v1/protocol/restore` с `file`, `stamp` и `base` (тот же JSON из файла).
+Возврат тоже уходит в версии, его можно отменить.
 
 {{#corporate}}
 **Управление сервисом** — только если в `whoami` стоит `"manage": true`: человек —

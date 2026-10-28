@@ -33,13 +33,10 @@
   .apibody li { margin: 3px 0; }
   .apibody code { font-family: var(--mono); font-size: 12.5px; background: var(--surface-2); border: 1px solid var(--line);
     border-radius: 5px; padding: 0 4px; overflow-wrap: anywhere; }
-  .apibody pre { font-family: var(--mono); font-size: 12.5px; line-height: 1.6; background: var(--surface-2);
-    border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin: 0; overflow: auto; max-height: 340px;
-    white-space: pre; tab-size: 2; }
-  .apibody pre.wrap { white-space: pre-wrap; overflow-wrap: anywhere; }
-  .apibody pre code { border: 0; padding: 0; background: none; font-size: inherit; overflow-wrap: normal; }
+  /* блок кода — общий стиль из app.css; здесь только отступы */
+  .apibody pre { margin: 0; }
+  .apibody pre code { overflow-wrap: normal; }
   .apibody .intro pre { margin: 0 0 10px; }
-  .apibody pre:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
   .apibody table { margin: 0 0 4px; }
   .apibody td, .apibody th { font-size: 13.5px; line-height: 1.5; }
   .apibody td.n { white-space: nowrap; font-family: var(--mono); font-size: 12.5px; }

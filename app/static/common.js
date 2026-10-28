@@ -1010,6 +1010,9 @@ let onViewerChange = null;
 /* Переименовать, перенести, удалить запись: кнопки появляются у хозяина записи на той
    странице, которая умеет эти действия показать, — она и задаёт обработчик. */
 let onRecordAction = null;
+/* Правка текста протокола и его версии — тоже у страницы записей: {body() — разметка вместо протокола
+   или "" (показать протокол как есть), drawn(doc, своё ли на месте) — после того, как окно нарисовано}. */
+let protocolPane = null;
 
 async function openViewer(file, kind, silent) {
   const wasOpen = !!viewFile;
@@ -1067,6 +1070,16 @@ function say(id, kind, text) {
   if (el) { el.className = "msg " + kind; el.textContent = text; }
 }
 
+/* Протокол правили вручную (d.edited — кто и когда): пересборка соберёт его моделью заново, а правленый
+   текст уйдёт в версии протокола. Об этом — у каждой кнопки, которая пересобирает, до нажатия. */
+function handEdited(d) {
+  const e = d && d.edited;
+  if (!e) return "";
+  return `<div class="fhint warnhint">${icon("alert", 13)}<span>Протокол правили вручную (${esc(e.by)}, ${markDay(e.at)}
+    ${esc(e.at.slice(11, 16))}): пересборка соберёт его заново, а ручные правки уйдут в версии протокола — вернуть их
+    можно кнопкой «Версии» на вкладке «Протокол».</span></div>`;
+}
+
 /* Протокол строится по подписям на момент сборки. Поправили подписи после —
    протокол с ними расходится, и об этом надо сказать на любой вкладке. */
 function staleBar() {
@@ -1078,7 +1091,7 @@ function staleBar() {
     : viewData.dict_newer ? "Словарь записи правили" : "ФИО правили";
   return `<div class="nhint warn">${icon("alert", 14)}
     <span>${what} после того, как собран протокол, — в нём этих правок ещё нет</span>
-    ${canRebuild() ? `<button class="copybtn" id="rebuild">Пересобрать протокол</button>
+    ${canRebuild() ? `<button class="copybtn" id="rebuild">Пересобрать протокол</button>${handEdited(viewData)}
     <div class="msg" id="rbmsg" role="status"></div>` : canSign() ? `<span class="dim">${REBUILD_BY}</span>` : ""}</div>`;
 }
 
@@ -1159,7 +1172,7 @@ function namesPanel() {
       <button id="nsave">${canRebuild() ? "Сохранить и пересобрать протокол" : "Сохранить подписи"}</button>
       <button class="ghost" id="nclose">Закрыть</button>
     </div>
-    ${canRebuild() ? "" : `<div class="fhint">${REBUILD_BY} — подписи сохранятся, протокол останется прежним.</div>`}
+    ${canRebuild() ? handEdited(viewData) : `<div class="fhint">${REBUILD_BY} — подписи сохранятся, протокол останется прежним.</div>`}
     <div class="msg" id="nmsg" role="status"></div>
   </section>`;
 }
@@ -1203,11 +1216,15 @@ function fillDoc() {
   const top = doc.scrollTop;
   viewText = viewData.text;
   let body;
-  if (viewKind === "summary") body = mdToHtml(viewData.text);
+  // правка протокола и его версии (страница записей, protocolPane) заменяют собой показ протокола
+  const pane = viewKind === "summary" && protocolPane && protocolPane.body();
+  if (pane) body = pane;
+  else if (viewKind === "summary") body = mdToHtml(viewData.text);
   else if (viewKind === "transcript" && (viewData.lines || []).length) body = transcriptHtml();
   else body = `<pre class="plain">${esc(viewData.text)}</pre>`;
   doc.innerHTML = staleBar() + namesHint() + namesPanel() + body;
-  if (viewKind === "summary") { markTasks(doc); markPrevious(doc); }
+  if (viewKind === "summary" && !pane) { markTasks(doc); markPrevious(doc); }
+  if (viewKind === "summary" && protocolPane) protocolPane.drawn(doc, !!pane);
   doc.scrollTop = top;
 }
 
@@ -1606,6 +1623,7 @@ function drawDict(note) {
           title="Платный вызов модели; запись заново не распознаётся">Сохранить и пересобрать протокол</button>` : ""}
         <button type="button" class="ghost" id="dccancel">Закрыть</button>
       </div>
+      ${rec && d.can_rebuild ? handEdited(d) : ""}
       <div class="msg${note ? " " + note.kind : ""}" id="dcmsg" role="status">${note ? esc(note.text) : ""}</div>
       ${rec && d.processed && !d.can_rebuild ? `<div class="fhint">${REBUILD_BY}.</div>` : ""}
       ${dictChanged(d)}`;
@@ -1684,7 +1702,7 @@ function initViewer() {
     // Escape при вопросе «убрать раздел?» — это «Отмена», а не закрытие записи
     if (e.key === "Escape" && prevAsk) { prevAsk = false; fillDoc(); focusIn("#prevdrop"); return; }
     // в поле ввода Escape гасит подсказку браузера, а не закрывает окно с правками
-    if (e.key === "Escape" && viewFile && !(e.target.matches && e.target.matches("input"))) closeViewer();
+    if (e.key === "Escape" && viewFile && !(e.target.matches && e.target.matches("input, textarea"))) closeViewer();
     if ((e.key === "Enter" || e.key === " ") && e.target.closest && e.target.closest("a.open")) open(e);
     const mark = e.target.closest && e.target.closest("a.ts");
     if ((e.key === "Enter" || e.key === " ") && mark) { e.preventDefault(); playFrom(+mark.dataset.sec); }

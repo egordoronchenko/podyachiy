@@ -50,10 +50,6 @@ def now_iso() -> str:
     return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
 
 
-def _moved(path: str, old: str, new: str) -> str:
-    return new + path[len(old):] if path == old or path.startswith(old + "/") else path
-
-
 def _text(value) -> str | None:
     return value if isinstance(value, str) else None
 
@@ -288,40 +284,6 @@ def _with_money(run: dict) -> dict:
     return {**run, "cost": cost, "stages": stages, "providers": spent}
 
 
-def runs(events: list[dict]) -> list[dict]:
-    """Прогоны с путями, какими они стали после всех переименований и переносов папок
-    и записей: иначе расходы одной папки или записи распались бы на два названия.
-    То же самое, что база делает при записи событий (Journal._follow), но над готовым
-    списком событий.
-
-    Прогоны удалённой записи и записей удалённой папки остаются под последним путём и дальше
-    не переезжают: по тому же пути позже может лечь другая запись, и её переименование не
-    должно утащить за собой чужие расходы."""
-    out: list[dict] = []
-    settled: set[int] = set()       # номера прогонов удалённых записей и папок
-    binned: dict[str, set[int]] = {}    # папка корзины → какие прогоны застыли при этом удалении
-    for event in events:
-        kind = event["kind"]
-        if kind == "run":
-            out.append(_with_money(event))
-        elif kind == "folder_rename":
-            for run in (run for n, run in enumerate(out) if n not in settled):
-                run["file"] = _moved(run["file"], event["folder"], event["to"])
-        elif kind in RECORD_MOVES:
-            for n, run in enumerate(out):
-                if n not in settled and run["file"] == event["file"]:
-                    run["file"] = event["to"]
-        elif kind in ("record_delete", "folder_delete"):
-            hit = ((lambda f: f == event["file"]) if kind == "record_delete"
-                   else (lambda f: f.startswith(event["folder"] + "/")))
-            now = {n for n, run in enumerate(out) if n not in settled and hit(run["file"])}
-            settled |= now
-            binned[event.get("trash") or ""] = now
-        elif kind in RESTORES:
-            settled -= binned.pop(event.get("trash") or "", set())
-    return out
-
-
 def spender(run: dict) -> str:
     """Кому отнести расход: кто запустил прогон, а если сервис взял запись сам —
     кто её загрузил. Пусто — неизвестно."""
@@ -353,18 +315,6 @@ class _Sum:
     def out(self) -> dict:
         return {"cost": self.cost, "runs": self.runs, "records": len(self.audio),
                 "audio_sec": round(sum(self.audio.values()), 1)}
-
-
-def within(events: list[dict], start: str = "", end: str = "") -> list[dict]:
-    """Прогоны за период. start и end — даты ГГГГ-ММ-ДД включительно, пусто — без границы.
-    Период считается по времени прогона: деньги тратятся при обработке, а не при загрузке."""
-    return [r for r in runs(events)
-            if (not start or r["at"][:10] >= start) and (not end or r["at"][:10] <= end)]
-
-
-def report(events: list[dict], start: str = "", end: str = "", bucket: str = "day") -> dict:
-    """Расходы за период по списку событий (границы — как у within)."""
-    return summary(within(events, start, end), start, end, bucket)
 
 
 def summary(picked: list[dict], start: str = "", end: str = "", bucket: str = "day") -> dict:

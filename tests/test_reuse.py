@@ -164,3 +164,30 @@ def test_worker_takes_the_model_for_new_records_from_the_settings_and_for_a_run_
     asyncio.run(drain())
     assert seen.speech == [SCRIBE, NOVA, MAI] and svc.ledger.get(REL)["speech_model"] == MAI
     assert events[-2:] == [("rebuild", NOVA), ("manual", MAI)]
+
+
+def test_files_of_a_run_are_read_and_written_off_the_event_loop(done, monkeypatch):
+    """Файлы прогона — шаблоны, готовая расшифровка и разбор, подписи говорящих, протокол прошлого
+    совещания, маркер исхода — читаются и пишутся в потоке, а не в цикле событий: пока один обработчик
+    ждёт медленный (сетевой) диск, страница и другие обработчики не стоят."""
+    import threading
+    from app import templates
+    cfg, base, seen = done
+    watched = [(pipeline, "_size_of"), (pipeline, "_mtime_of"), (pipeline, "_load_stage"), (pipeline, "source_note"),
+               (pipeline, "previous_tasks"), (pipeline, "_write_outcome"), (templates, "load_glossary"),
+               (templates, "types"), (templates, "load_template"), (templates, "load_actions"),
+               (names, "for_protocol"), (triage, "load_saved")]
+    where: dict[str, set[bool]] = {}
+
+    def spy(owner, name):
+        real = getattr(owner, name)
+
+        def call(*args, **kwargs):
+            where.setdefault(name, set()).add(threading.current_thread() is threading.main_thread())
+            return real(*args, **kwargs)
+        monkeypatch.setattr(owner, name, call)
+
+    for owner, name in watched:
+        spy(owner, name)
+    run(dataclasses.replace(cfg, prev_tasks=True), seen)
+    assert where == {name: {False} for _, name in watched}

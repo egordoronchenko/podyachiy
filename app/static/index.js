@@ -887,6 +887,256 @@ document.getElementById("q").addEventListener("input", e => {
   }, 350);
 });
 
+/* ---------- правка протокола и его версии ----------
+   Хозяин папки правит протокол текстом Markdown прямо в окне записи — без модели. Сохранение
+   передаёт отпечаток протокола, с которого начата правка (base): протокол за это время поправил
+   кто-то ещё или пересобрала модель — сервер отвечает 409, и набранный текст остаётся в поле.
+   Прежний текст сервер кладёт в версии протокола; их видно всем, кому открыта запись, а вернуть
+   версию может тот же хозяин папки. Несохранённая правка живёт, пока открыта страница: переход
+   на другую вкладку или запись её не теряет, а закрыть страницу с ней браузер не даст молча. */
+const PROTO_MAX = 200000;           // предел текста правки — как на сервере (summarize.EDIT_MAX_CHARS)
+let protoDraft = null;              // {file, text, orig, base} — правка, которая ещё не сохранена
+let proto = { file: null, mode: "", list: null, shown: null, ask: false, busy: false };
+
+const protoBody = text => text.replace(/^\s*<!--[\s\S]*?-->\s*/, "");   // без служебной пометки сервиса
+const protoDirty = () => !!protoDraft && protoDraft.text !== protoDraft.orig;
+const protoWhen = at => `${markDay(at)} ${at.slice(11, 16)}`;
+const protoHow = v => v.how === "edit" ? `правка: ${esc(v.by)}` : v.how === "restore" ? `возврат версии: ${esc(v.by)}`
+  : "собрала модель";
+const protoLive = text => { const live = document.getElementById("vlive"); if (live) { live.className = "tsaid"; live.textContent = text; } };
+
+function protoBar() {
+  const e = viewData.edited;
+  return `<div class="protobar" role="group" aria-label="Текст протокола">
+    <span class="dim">${e ? `${icon("edit", 13)}${e.how === "restore" ? "Возвращена прежняя версия" : "Правили вручную"}: ${
+      esc(e.by)}, ${protoWhen(e.at)}` : ""}</span>
+    <button type="button" class="ghost copybtn" id="pversions">${icon("list", 13)}Версии</button>
+    ${viewData.can_edit ? `<button type="button" class="ghost copybtn" id="pedit" ${viewData.rebuilding ? "disabled" : ""}
+      title="${viewData.rebuilding ? "Протокол пересобирается — править можно после сборки" : "Поправить текст протокола без пересборки"}">${icon("edit", 13)}Править</button>` : ""}
+  </div>`;
+}
+
+function protoEditor() {
+  const n = protoDraft.text.length;
+  return `<div class="protoed">
+    <label for="ptext">Текст протокола в Markdown</label>
+    <div class="fhint" id="phint">Заголовки — строки с «#», поручения — строки таблицы «| поручение | срок | в записи | статус |».
+      Отметки «выполнено» и сроки останутся у поручений, если исполнитель тот же, а слова почти те же.
+      Прежний текст сохранится в версиях протокола.</div>
+    <div class="row">
+      <button type="button" id="psave">Сохранить</button>
+      <button type="button" class="ghost" id="pcancel">Отмена</button>
+    </div>
+    ${proto.ask ? `<div class="prevbar ask" role="group" aria-labelledby="paskq">
+      <p id="paskq"><b>Выбросить правку?</b> Набранный текст не сохранится, протокол останется прежним.</p>
+      <div class="row apart"><button type="button" class="ghost" id="paskno">Продолжить правку</button>
+        <button type="button" class="danger" id="paskyes">Выбросить правку</button></div></div>` : ""}
+    <div class="ferr" id="perr" role="alert"></div>
+    <div class="msg" id="pmsg" role="status" aria-live="polite"></div>
+    <textarea id="ptext" class="tpltext protoarea" spellcheck="true" autocomplete="off"
+      aria-describedby="phint pcount perr">${esc(protoDraft.text)}</textarea>
+    <div class="fhint" id="pcount">${protoCount(n)}</div>
+  </div>`;
+}
+
+const protoCount = n => `${n.toLocaleString("ru")} знаков из ${PROTO_MAX.toLocaleString("ru")}` +
+  (n > PROTO_MAX ? " — слишком длинно" : "") + (protoDirty() ? " · есть несохранённая правка" : "");
+
+function protoVersions() {
+  const d = proto.list;
+  if (!d) return `<div class="protover"><p class="dim" role="status">Загружаю версии протокола…</p></div>`;
+  if (d.error) return `<div class="protover"><div class="msg err" role="alert">${esc(d.error)}</div>
+    <div class="row"><button type="button" class="ghost" id="pback">К протоколу</button></div></div>`;
+  const s = proto.shown;
+  return `<div class="protover">
+    <div class="row apart"><h3 id="pvh" tabindex="-1">Версии протокола</h3>
+      <button type="button" class="ghost copybtn" id="pback">К протоколу</button></div>
+    <p class="fhint">Сейчас: ${d.edited ? `${d.edited.how === "restore" ? "возвращённая версия" : "правка"} — ${esc(d.edited.by)},
+      ${protoWhen(d.edited.at)}` : "протокол, собранный моделью"}. Прежний текст сохраняется при каждой правке, возврате
+      версии и пересборке протокола. Вернуть версию — поставить её текст на место нынешнего; нынешний уйдёт в версии.</p>
+    ${d.versions.length ? `<ul class="edvers">${d.versions.map(v => `<li><span>${protoWhen(v.at)}:${v.at.slice(17, 19)}
+        · ${protoHow(v)} <span class="dim">· ${v.chars.toLocaleString("ru")} знаков</span></span>
+        <span class="rowacts"><button type="button" class="ghost" data-pshow="${esc(v.stamp)}"
+          aria-pressed="${!!s && s.stamp === v.stamp}">Показать</button>
+          ${d.can_edit ? `<button type="button" class="ghost" data-pask="${esc(v.stamp)}">Вернуть…</button>` : ""}</span></li>`).join("")}</ul>`
+      : `<div class="empty">${icon("idle", 17)}прежних версий нет: протокол ещё не правили и не пересобирали</div>`}
+    <div class="msg" id="pvmsg" role="alert"></div>
+    ${s ? `<section class="pshown" aria-labelledby="psh">
+      <h3 id="psh" tabindex="-1">Версия от ${protoWhen(s.at)} — ${protoHow(s)}, только просмотр</h3>
+      ${d.can_edit ? `<div class="row"><button type="button" id="prestore">Вернуть эту версию</button>
+        <button type="button" class="ghost" id="phide">Скрыть</button></div>` : ""}
+      ${s.text === undefined ? `<p class="dim">Загружаю текст версии…</p>` : mdToHtml(s.text)}</section>` : ""}
+  </div>`;
+}
+
+protocolPane = {
+  body() {
+    if (proto.file !== viewFile) {           // открыли другую запись: её правка — если она была начата
+      proto = { file: viewFile, mode: protoDraft && protoDraft.file === viewFile ? "edit" : "", list: null,
+                shown: null, ask: false, busy: false };
+    }
+    if (proto.mode === "edit" && protoDraft && protoDraft.file === viewFile) return protoEditor();
+    if (proto.mode === "versions") return protoVersions();
+    return "";
+  },
+  drawn(doc, own) {
+    if (!own) { doc.insertAdjacentHTML("afterbegin", protoBar()); return; }
+    const field = document.getElementById("ptext");
+    if (field) protoFit(field);
+  },
+};
+
+// поле — в рост текста: прокручивается окно записи, а не поле внутри него
+function protoFit(field) {
+  field.style.height = "auto";
+  field.style.height = field.scrollHeight + 2 + "px";
+}
+
+function protoStart() {
+  protoLive("");
+  protoDraft = { file: viewFile, text: protoBody(viewData.text), orig: protoBody(viewData.text), base: viewData.version };
+  proto.mode = "edit"; proto.ask = false;
+  fillDoc();
+  const field = document.getElementById("ptext");
+  field.focus();
+  field.setSelectionRange(0, 0);
+  document.querySelector(".doc").scrollTop = 0;
+}
+
+function protoClose(text) {
+  protoDraft = null;
+  proto.mode = ""; proto.ask = false;
+  fillDoc();
+  if (text) protoLive(text);
+  focusIn("#pedit");
+}
+
+async function protoSave() {
+  const go = document.getElementById("psave"), err = document.getElementById("perr");
+  const field = document.getElementById("ptext");
+  err.textContent = "";
+  field.removeAttribute("aria-invalid");
+  if (!protoBody(protoDraft.text).trim()) { err.textContent = "Текст пустой — сохранять нечего"; field.focus(); return; }
+  if (protoDraft.text.length > PROTO_MAX) {
+    err.textContent = `Текст длиннее ${PROTO_MAX.toLocaleString("ru")} знаков — такой сервис не принимает`;
+    field.setAttribute("aria-invalid", "true"); field.focus(); return;
+  }
+  proto.busy = true;
+  go.disabled = true;
+  go.textContent = "Сохраняю…";
+  say("pmsg", "", "Сохраняю правку…");
+  const was = protoDraft;
+  try {
+    const d = await api("/api/v1/protocol", { file: was.file, text: was.text, base: was.base });
+    proto.busy = false;
+    if (viewFile !== was.file) { protoDraft = null; return; }       // пока сохранялось, открыли другую запись
+    await refresh();
+    protoClose(d.changed ? "Протокол сохранён. Прежний текст — в версиях протокола; карта и выгрузки уже с правкой"
+                         : "Текст тот же, что в протоколе, — сохранять было нечего");
+  } catch (e) {
+    proto.busy = false;
+    go.disabled = false;
+    go.textContent = "Сохранить";
+    say("pmsg", "", "");
+    // набранное не трогаем: поле остаётся как было, человек решает сам, что с ним делать
+    err.innerHTML = esc(e.message) + (e.status === 409
+      ? `. Ваш текст остался в поле — скопируйте его, нажмите «Отмена», откройте «Править» заново и перенесите правку
+        в новый текст. <button type="button" class="ghost copybtn" id="pcopy">${icon("clip", 13)}Скопировать мой текст</button>`
+      : "");
+    field.focus();
+  }
+}
+
+async function protoVersionsOpen(focus) {
+  proto.mode = "versions"; proto.list = null; proto.shown = null;
+  protoLive("");
+  fillDoc();
+  const file = viewFile;
+  try { proto.list = await api(`/api/v1/versions?file=${encodeURIComponent(file)}`); }
+  catch (e) { proto.list = { error: e.message }; }
+  if (viewFile !== file || proto.mode !== "versions") return;
+  fillDoc();
+  focusIn(focus || (proto.list.error ? "#pback" : "#pvh"));
+}
+
+async function protoShow(stamp, ask) {
+  const v = proto.list.versions.find(x => x.stamp === stamp);
+  proto.shown = { ...v, text: undefined };
+  fillDoc();
+  const file = viewFile;
+  try {
+    const d = await api(`/api/v1/version?file=${encodeURIComponent(file)}&stamp=${encodeURIComponent(stamp)}`);
+    if (viewFile !== file || !proto.shown || proto.shown.stamp !== stamp) return;
+    proto.shown.text = d.text;
+    fillDoc();
+    focusIn(ask ? "#prestore" : "#psh");
+  } catch (e) {
+    proto.shown = null;
+    fillDoc();
+    say("pvmsg", "err", e.message);
+  }
+}
+
+async function protoRestore() {
+  const go = document.getElementById("prestore"), s = proto.shown;
+  go.disabled = true;
+  go.textContent = "Возвращаю…";
+  try {
+    const d = await api("/api/v1/protocol/restore", { file: viewFile, stamp: s.stamp, base: proto.list.version });
+    await refresh();
+    proto.mode = ""; proto.shown = null;
+    fillDoc();
+    protoLive(d.changed ? `Возвращена версия от ${protoWhen(s.at)}. Прежний текст — в версиях протокола: возврат можно отменить`
+                        : "Эта версия и так совпадает с нынешним протоколом — ничего не изменилось");
+    focusIn("#pversions");
+  } catch (e) {
+    if (e.status !== 409) {
+      go.disabled = false;
+      go.textContent = "Вернуть эту версию";
+      say("pvmsg", "err", e.message);
+      go.focus();
+      return;
+    }
+    // протокол за это время изменился: список версий — заново, с новым отпечатком
+    await protoVersionsOpen("#pvh");
+    say("pvmsg", "err", e.message + ". Список версий обновлён — посмотрите его ещё раз");
+  }
+}
+
+document.getElementById("viewer").addEventListener("click", e => {
+  const t = e.target;
+  if (!viewFile || viewKind !== "summary") return;
+  if (t.closest("#pedit")) protoStart();
+  else if (t.closest("#pversions")) protoVersionsOpen();
+  else if (t.closest("#psave") && !proto.busy) protoSave();
+  else if (t.closest("#pcancel")) {
+    if (!protoDirty()) { protoClose(""); return; }
+    proto.ask = true; fillDoc(); focusIn("#paskno");
+  }
+  else if (t.closest("#paskno")) { proto.ask = false; fillDoc(); focusIn("#ptext"); }
+  else if (t.closest("#paskyes")) protoClose("Правка выброшена, протокол прежний");
+  else if (t.closest("#pcopy")) copyText(protoDraft ? protoDraft.text : "").then(ok =>
+    say("pmsg", ok ? "ok" : "err", ok ? "Ваш текст скопирован" : "Скопировать не вышло — выделите текст в поле сами"));
+  else if (t.closest("#pback")) { proto.mode = ""; proto.shown = null; fillDoc(); focusIn("#pversions"); }
+  else if (t.closest("[data-pshow]")) protoShow(t.closest("[data-pshow]").dataset.pshow, false);
+  else if (t.closest("[data-pask]")) protoShow(t.closest("[data-pask]").dataset.pask, true);
+  else if (t.closest("#phide")) { proto.shown = null; fillDoc(); focusIn("#pvh"); }
+  else if (t.closest("#prestore")) protoRestore();
+});
+document.getElementById("viewer").addEventListener("input", e => {
+  if (e.target.id !== "ptext" || !protoDraft) return;
+  protoDraft.text = e.target.value;
+  protoFit(e.target);
+  document.getElementById("pcount").textContent = protoCount(protoDraft.text.length);
+});
+// Escape в поле правки — «Отмена»: окно записи с набранным текстом не закрывается
+document.getElementById("viewer").addEventListener("keydown", e => {
+  if (e.target.id === "ptext" && e.key === "Escape") { e.preventDefault(); document.getElementById("pcancel").click(); }
+  if (e.target.id === "ptext" && e.key === "s" && (e.ctrlKey || e.metaKey)) { e.preventDefault(); if (!proto.busy) protoSave(); }
+});
+// несохранённая правка протокола — браузер переспросит, прежде чем закрыть страницу
+addEventListener("beforeunload", e => { if (protoDirty()) e.preventDefault(); });
+
 const start = new URLSearchParams(location.search);
 folder = start.get("path") || "";
 query = start.get("q") || "";

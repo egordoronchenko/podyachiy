@@ -6,7 +6,6 @@
 """
 from __future__ import annotations
 
-import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -282,15 +281,6 @@ class Settings:
             ldap_domain=(os.environ.get("LDAP_DOMAIN") or "").strip(),
             ldap_recheck_min=_int_env("LDAP_RECHECK_MIN", 15),
         )
-
-    @property
-    def stable_samples(self) -> int:
-        """Сколько одинаковых замеров подряд нужно, чтобы наблюдение покрыло
-        STABLE_SEC. Первый замер — только точка отсчёта, поэтому при интервале
-        10 с и STABLE_SEC=30 это четыре замера: между первым и четвёртым
-        проходит ровно 30 секунд без изменений. Величина справочная, решение
-        принимается по фактически прошедшему времени."""
-        return math.floor(self.stable_sec / self.scan_interval_sec) + 1
 
     @property
     def outbox_inside_inbox(self) -> Path | None:

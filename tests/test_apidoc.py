@@ -149,7 +149,7 @@ def test_openapi_lists_the_external_api_and_nothing_internal(stand):
     spec = guest.get("/api/v1/openapi.json").json()
     described = {(m, p) for m, p, _ in operations(spec)}
     v1 = {(m, p) for m, p in T.api_routes(web) if p.startswith("/api/v1")}
-    assert len(v1) == 26 and described == v1 | T.MANAGE_KEY | ALSO_OUTSIDE
+    assert len(v1) == 30 and described == v1 | T.MANAGE_KEY | ALSO_OUTSIDE
     assert described.isdisjoint(T.PAGE_ONLY) and described <= set(T.api_routes(web))
     for method, path, item in operations(spec):
         assert (item["x-key"] == "manage") == ((method, path) in T.MANAGE_KEY), f"{method} {path}"
@@ -201,9 +201,9 @@ def request_of(item):
 
 def test_every_example_request_is_accepted_and_the_answer_has_the_described_fields(stand):
     """Каждый пример запроса из описания уходит в сервис как есть и получает 200; ответ — того
-    типа и с теми полями, что в примере ответа. Единственная подстановка — номер заявки на
-    доступ: он случайный. Изменяющие примеры идут в порядке описания, переименование и перенос —
-    после загрузки. Платные доходят до очереди и там остаются."""
+    типа и с теми полями, что в примере ответа. Подстановки — номер заявки на доступ (он случайный)
+    и у правки протокола его отпечаток и метка версии (они от текста и времени). Изменяющие примеры
+    идут в порядке описания, переименование и перенос — после загрузки. Платные доходят до очереди и там остаются."""
     web, guest, plain, manage = stand
     spec = guest.get("/api/v1/openapi.json").json()
     todo = sorted(operations(spec), key=lambda o: o[2]["operationId"] in AFTER_UPLOAD)
@@ -214,6 +214,12 @@ def test_every_example_request_is_accepted_and_the_answer_has_the_described_fiel
         client = {"none": guest, "any": plain, "manage": manage}[item["x-key"]]
         if "id" in kw.get("json", {}):
             kw["json"]["id"] = manage.get("/api/admin/requests").json()["requests"][0]["id"]
+        if name in ("post-protocol", "post-protocol-restore", "get-version"):
+            # отпечаток протокола и метка его версии — с диска стенда: протокол правят примеры перед этим
+            versions = plain.get("/api/v1/versions", params={"file": MEETING}).json()
+            (kw["params"] if name == "get-version" else kw["json"]).update(
+                {"base": versions["version"]} if name == "post-protocol" else
+                {"stamp": versions["versions"][-1]["stamp"], **({} if name == "get-version" else {"base": versions["version"]})})
         if name == "post-admin-mail-test":
             continue                # без почты отвечает 503: пример проверяет отдельный тест, с почтой
         if name == "post-admin-queue-remove":

@@ -640,6 +640,19 @@ a.open:hover { border-bottom-color: var(--primary); }
   font-family: var(--mono); font-size: 12.5px; line-height: 1.65;
   white-space: pre-wrap; word-break: break-word; margin: 8px 0; color: var(--ink-2);
 }
+/* блок кода из Markdown (common.js mdToHtml) — в протоколе и в описании API: фон и рамка из переменных
+   (обе темы), длинный блок прокручивается внутри себя, страница вширь не едет. Блок можно выбрать с
+   клавиатуры (tabindex) и прокрутить стрелками — рамка фокуса видна. В протоколе строки переносятся: там
+   это текст, не код с отступами; в описании API отступы JSON сохраняются, переносятся только .wrap */
+.doc pre:not(.plain), .apibody pre {
+  font-family: var(--mono); font-size: 12.5px; line-height: 1.6; color: var(--ink);
+  background: var(--surface-2); border: 1px solid var(--line); border-radius: 8px;
+  padding: 10px 12px; margin: 8px 0; max-width: 100%; max-height: 340px; overflow: auto;
+  white-space: pre; tab-size: 2;
+}
+.doc pre:not(.plain), .apibody pre.wrap { white-space: pre-wrap; overflow-wrap: anywhere; }
+.doc pre code, .apibody pre code { border: 0; padding: 0; background: none; font: inherit; color: inherit; }
+.doc pre:focus-visible, .apibody pre:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
 /* подписи говорящих над расшифровкой */
 .nhint {
   display: flex; align-items: center; gap: 9px; flex-wrap: wrap; margin: 10px 0 4px;
@@ -1355,4 +1368,28 @@ pre.aboutcopy {
 @media (max-width: 600px), (pointer: coarse) {
   #backup input:not([type=checkbox]), #backup select, #backup button, #backup .check { min-height: 44px; }
   #queue .rowacts button, #running button { min-height: 44px; }
+}
+
+/* правка протокола и его версии в окне записи: поле в рост текста, во всю ширину и на телефоне */
+.protobar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 2px 0 10px; }
+.protobar .dim { flex: 1 1 220px; display: flex; align-items: center; gap: 6px; font-size: 13px; }
+.protobar .dim:empty { display: none; }
+.protobar .dim svg { flex: none; }
+.protoed label { margin-top: 4px; }
+.protoed .row { margin: 8px 0 6px; }
+.protoed .prevbar.ask { margin: 6px 0 8px; }
+.protoed .ferr { display: block; line-height: 1.5; }
+.protoed .ferr button { margin: 6px 0 0; color: var(--ink); }
+textarea.protoarea { min-height: 240px; overflow: hidden; resize: none; margin-top: 6px; }
+.protover .row.apart { justify-content: space-between; margin-top: 0; }
+.protover h3, .pshown h3 { margin: 0; font-size: 15px; }
+.protover h3:focus, .pshown h3:focus { outline: none; }
+.doc .protover .edvers { max-width: none; margin: 8px 0 0; padding: 0; }
+.protover .msg:empty { display: none; }
+.pshown { margin-top: 14px; padding: 10px 12px; border: 1px dashed var(--line-2); border-radius: 8px; background: var(--surface-2); }
+.pshown .row { margin: 8px 0 10px; }
+.nhint .fhint { flex-basis: 100%; margin: 0; }
+@media (max-width: 600px), (pointer: coarse) {
+  .protobar button, .protoed .row button, .protover button, .pshown button { min-height: 44px; }
+  textarea.protoarea { font-size: 16px; }
 }
