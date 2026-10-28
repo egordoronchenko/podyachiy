@@ -657,12 +657,12 @@ def test_shipped_prompts_tell_to_treat_the_list_as_a_hint():
 
 # Отпечатки собранных заданий модели из поставки. Сняты до выноса общих правил в common.md — модель
 # получала ровно тот же текст, что и раньше, — и переснимаются только с намеренной правкой текста
-# (1.3.0: голоса в «Участниках», факт один раз, фамилии, метки времени).
+# (1.3.0: голоса в «Участниках», фамилии, метки времени).
 ASSEMBLED = {
-    "meeting": "b605db9dbd227feb4703d333eec20554cf32dd45e2b11e4897241bdd74b531b6",
-    "lecture": "efb9460316ee18fa36c43d533ec0e8749fea82a9457d4bb4b3c2dc92b6a11acd",
-    "call": "44d399e3198ce2d4e37808438a5ba153ff43bd71e6e509c2c78011fb2f8ba6d9",
-    "spec": "ce47234be537b6c7816fc1781b71553230b562819fb214259e3540f5a255f612",
+    "meeting": "b9dcc08db14427f5710d544b565f4c7f347e5bfaf047f633cd7e5c7c85871c5a",
+    "lecture": "a4fbbdf2568950290c30bfcad9734083ab93e8e2a8f1d0b9ab9163a80752f042",
+    "call": "d7f7b17d40edc96dad6f17dbfd695bac172b7620148d941c2b855fc76752e64f",
+    "spec": "ed951a0814dd2cfd6eabb861ee9df17ce2d1c940e2af4499a1ca3e1d58ca6ed1",
     "triage": "684ca88474f65129dc264e38266eb41a0cfc4c5f15bc8e32ae6e40c27df1547f",
     "actions": "4a4187c34e394b2c1ab14312f5bc88cafa76d6bb7a648a9632cc2b009168a6a5",
 }
