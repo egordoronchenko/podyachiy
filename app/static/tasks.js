@@ -13,6 +13,7 @@ let last = null, undoTimer = null;
 initSidebar("tasks");
 initTheme();
 document.getElementById("csv").innerHTML = icon("copy", 15) + "Скачать CSV";
+document.getElementById("ics").innerHTML = icon("clock", 15) + "В календарь (ICS)";
 
 // отбор для запроса к сервису
 function state() {
@@ -111,6 +112,7 @@ async function load() {
   const p = state(), mine = ++seq, shownAs = address().toString();
   history.replaceState(null, "", shownAs ? "/tasks?" + shownAs : "/tasks");
   document.getElementById("csv").href = "/api/v1/tasks.csv" + (p.toString() ? "?" + p : "");
+  document.getElementById("ics").href = "/api/v1/tasks.ics" + (p.toString() ? "?" + p : "");
   try {
     const d = await api("/api/v1/tasks?" + p);
     if (mine !== seq) return;                 // пока шёл ответ, отбор уже поменяли

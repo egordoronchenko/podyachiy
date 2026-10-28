@@ -47,7 +47,7 @@ from starlette.requests import ClientDisconnect
 
 from . import (about, apidoc, backup, brand, costbook, db, dictionary, directory, export, external, folders, journal, keys, mail,
                marks, media, migrate, mindmap, names, notify, pipeline, providers, records, registry, search, series,
-               settings, signup, speech, templates, upload, users)
+               settings, signup, speech, templates, upload, users, webhook)
 from .config import Settings
 from .ledger import REMOVED, SOURCE_CHANGED, SOURCE_MISSING, SOURCE_STATE, Ledger
 from .logbook import Logbook
@@ -94,6 +94,9 @@ serial = series.Store(base)                      # признак папки «�
 noted = marks.Store(base)                        # отметки «выполнено» и сроки поручений
 task_cache = registry.Cache()        # разобранные поручения протоколов — чтобы не читать сотни файлов на запрос
 domain = directory.Directory(cfg, log)           # вход под учётной записью домена (корпоративный режим)
+# webhook «запись готова» (webhook.py): адреса и секрет из .env; не годятся — выключен, причина в журнале при запуске
+webhook_off, webhook_warnings = webhook.check(cfg.webhook_urls, cfg.webhook_secret, cfg.public_url)
+hooks = webhook.Hooks(base, () if webhook_off else cfg.webhook_urls, cfg.webhook_secret, log, about.version() or "")
 
 # Неудачные входы через домен ограничены по логину и по адресу клиента. Без этого страница входа
 # сервиса стала бы инструментом подбора доменных паролей и — хуже — блокировки чужих учётных
@@ -299,6 +302,12 @@ def _startup_checks() -> None:
                 f"доменов: {', '.join(cfg.mail_domains)}")
     elif mail.why_off(cfg):
         log(f"ВНИМАНИЕ: почта выключена — {mail.why_off(cfg)}")
+    if webhook_off:
+        log(f"ВНИМАНИЕ: webhook выключен — {webhook_off}")
+    elif hooks.on:
+        log(f"webhook «запись готова» включён: {', '.join(map(webhook.where, hooks.urls))}")
+    for warning in webhook_warnings:
+        log(f"ВНИМАНИЕ: {warning}")
     for warning in storage_warnings:
         log(f"ВНИМАНИЕ: {warning}")
     _check_volumes()
@@ -485,6 +494,64 @@ async def _backup_loop() -> None:
             log(f"сбой расписания резервной копии (продолжаю): {e!r}")
 
 
+# Напоминания о сроках поручений (кому и что — notify.py): раз в REMIND_CHECK_SEC сервис смотрит, пора ли.
+# Пора — после notify.REMIND_HOUR по часам сервера, если сегодня рассылки ещё не было. День рассылки
+# отмечается в базе (meta, ключ REMINDED) до отправки: сбой посреди рассылки не пришлёт второе письмо тем,
+# кому первое уже ушло, а перезапуск сервиса в тот же день — тем более. Только в корпоративном режиме с почтой.
+REMIND_CHECK_SEC = 60
+REMINDED = "reminded"
+
+
+def _remind_due(now: datetime.datetime) -> bool:
+    return (cfg.mail_on and now.hour >= notify.REMIND_HOUR
+            and base.noted(REMINDED) != now.date().isoformat())
+
+
+def _remind_all(today: str) -> int:
+    """Письмо-сводка каждому, кому есть что напомнить: поручения на него из открытых ему папок.
+    Возвращает, скольким ушло. Сбой почты у одного не мешает остальным."""
+    sent = 0
+    for box in people.reminded():
+        who = people.access(box["login"])
+        if who is None:
+            continue
+        found, _ = _task_rows(who, cfg.public_url, "", "", "")
+        due = notify.reminders([row for row in found if notify.assigned(row["who"], box["name"])], today)
+        count = sum(len(rows) for rows in due.values())
+        if not count:
+            continue
+        url = f"{cfg.public_url}/tasks?" + urlencode({"who": notify.surname(box["name"]), "sort": "due"},
+                                                      quote_via=quote)
+        try:
+            mail.send(cfg, [box["email"]], mail.due_reminder(cfg, box["name"], due, url, notify.REMIND_MAX))
+        except Exception as e:      # поток не должен умирать на одном письме
+            log(f"ВНИМАНИЕ: напоминание о сроках поручений для {box['login']} не ушло: {e}")
+            trail.write("mail_failed", "", what="due", to=box["login"], error=str(e)[:300])
+            continue
+        trail.write("due_mail", "", to=box["login"], tasks=count)
+        sent += 1
+    log(f"напоминания о сроках поручений: писем {sent}")
+    return sent
+
+
+async def _remind_tick(now: datetime.datetime) -> bool:
+    """Пора — отметить день и разослать (в потоке: протоколы читаются с диска). Разослано ли."""
+    if not _remind_due(now):
+        return False
+    base.note(REMINDED, now.date().isoformat())
+    await asyncio.to_thread(_remind_all, now.date().isoformat())
+    return True
+
+
+async def _remind_loop() -> None:
+    while True:
+        await asyncio.sleep(REMIND_CHECK_SEC)
+        try:
+            await _remind_tick(datetime.datetime.now().astimezone())
+        except Exception as e:  # база занята, диск недоступен — сверимся через минуту
+            log(f"сбой напоминаний о сроках поручений (продолжаю): {e!r}")
+
+
 def _key_targets() -> list[tuple[str, providers.Provider, tuple[str, ...]]]:
     """Чьи ключи проверять: основной поставщик, запасной и свой адрес текстовых этапов, если
     заданы. При каждом — текстовые модели, которые он должен знать: у текста со своим адресом
@@ -532,7 +599,8 @@ async def lifespan(app: FastAPI):
     service = Service(cfg=cfg, log=log, ledger=Ledger(base, log), journal=trail,
                       speech_model=speech_model, tell=_tell, words=words.effective, marked=noted,
                       series=lambda rel: serial.on(_parent_of(rel)), people=people, dictionaries=words,
-                      dropped=options.dropped(), keep_dropped=options.set_dropped)
+                      dropped=options.dropped(), keep_dropped=options.set_dropped,
+                      hook=_hook if hooks.on else None)
     try:
         service.known_to_nfc()          # записи и папки под разложенными именами — разово, до обхода
     except Exception as e:
@@ -545,6 +613,9 @@ async def lifespan(app: FastAPI):
     tasks.append(asyncio.create_task(_clean_loop()))
     tasks.append(asyncio.create_task(_beat_loop()))
     tasks.append(asyncio.create_task(_backup_loop()))
+    tasks.append(asyncio.create_task(_remind_loop()))
+    if hooks.on:
+        tasks.append(asyncio.create_task(hooks.run()))     # доставка webhook — своей задачей, обработку не держит
     try:
         yield
     finally:
@@ -915,7 +986,8 @@ def _upload_denied(who: users.Access, folder: str) -> str:
 
 
 PAGE_ONLY = ("это делается только на странице сервиса, даже ключом с управлением: ключи доступа, пароли "
-             "и ссылки на пароль, «Выйти везде», роль администратора сервиса и почта пользователя, удаление записей и папок, "
+             "и ссылки на пароль, «Выйти везде», роль администратора сервиса и почта пользователя, удаление записей и папок "
+             "и возврат их из корзины, "
              "отправка протокола на почту, правка шаблонов и оформления, проверка подключения к домену и "
              "привязка к нему")
 
@@ -1019,13 +1091,16 @@ def _base(request: Request) -> str:
     return cfg.public_url or str(request.base_url).rstrip("/")
 
 
+NO_RECORD = "файла нет в журнале обработки"
+
+
 def _record(file: str, who: users.Access) -> dict:
     """Запись из журнала — если она есть и лежит в открытой человеку папке.
     Чужая запись неотличима от несуществующей."""
     assert service is not None
     record = service.ledger.get(file)
     if record is None or not who.sees(_parent_of(file)):
-        raise HTTPException(404, "файла нет в журнале обработки")
+        raise HTTPException(404, NO_RECORD)
     return record
 
 
@@ -1198,6 +1273,9 @@ def admin_status(log_from: int = 0, history_version: int = -1):
         "volumes": {"warnings": volume_warnings},
         # копия из самого сервиса: расписание, следующее время, идущая копия, последняя неудача
         "backups": _backups(),
+        # webhook «запись готова»: включён ли, куда (без пути и токенов), сколько доставок ждёт, последняя
+        # доставка и последний сбой
+        "webhook": hooks.state(),
         # последняя отметка «сервис жив» в базе
         "heartbeat": _heartbeat(),
         "templates": {k: v["title"] for k, v in templates.types(cfg.prompts_dir).items()},
@@ -1268,11 +1346,16 @@ def _sees_costs(who: users.Access) -> bool:
     return who.admin and (not who.key or who.key_kind == keys.MANAGE)
 
 
-def _failure(rec: dict, who: users.Access) -> str | None:
+def _public_error(rec: dict) -> str | None:
+    """Текст сбоя, каким его видит тот, кому расходы не открыты: без ответа поставщика."""
     error = rec.get("error")
-    if not error or _sees_costs(who) or rec.get("status") == "no_audio":
+    if not error or rec.get("status") == "no_audio":
         return error
     return NO_SUMMARY_HIDDEN if rec.get("status") == "no_summary" else FAILED_HIDDEN
+
+
+def _failure(rec: dict, who: users.Access) -> str | None:
+    return rec.get("error") if _sees_costs(who) else _public_error(rec)
 
 
 def _shown(rec: dict, who: users.Access) -> dict:
@@ -1446,7 +1529,8 @@ def browse(path: str = "", flat: bool = False, who: users.Access = Depends(viewe
         # хозяин папки правит её словарь и словари её записей (в том числе при загрузке) и включает
         # и выключает у неё признак «серия совещаний» (series — включён ли; у корня его нет)
         "owns": who.owns(rel),
-        "series": serial.on(rel),
+        # у закрытой папки признака не видно: выключенный выдал бы, что такая папка есть
+        "series": who.sees(rel) and serial.on(rel),
         # из общего списка запись уходит в личную папку — если человеку разрешено в неё загружать
         "home_upload": upload_ready and bool(who.home) and who.uploads(who.home),
         # раздавать доступ можно к папке, не к корню: корень открывает только администратор
@@ -1465,7 +1549,7 @@ def _upload_rel(folder: str, name: str, who: users.Access) -> str:
     except upload.UploadError as e:
         raise HTTPException(e.status, e.detail)
     if not who.sees(_parent_of(rel)):
-        raise HTTPException(403, "эта папка вам не открыта")
+        raise HTTPException(404, folders.NO_FOLDER)         # закрытая папка неотличима от несуществующей
     if not who.uploads(_parent_of(rel)):
         raise HTTPException(403, _no_upload(who, _parent_of(rel)))
     return rel
@@ -1917,6 +2001,18 @@ async def v1_tasks_csv(request: Request, dir: str = "", since: str = "", until: 
                     headers={"Content-Disposition": 'attachment; filename="tasks.csv"'})
 
 
+@app.get("/api/v1/tasks.ics")
+async def v1_tasks_ics(request: Request, dir: str = "", since: str = "", until: str = "",
+                       name: str = Query("", alias="who"), due: bool = False,
+                       only_open: bool = Query(False, alias="open"), q: str = "", sort: str = "date",
+                       overdue: bool = False, who: users.Access = Depends(viewer)):
+    """Тот же реестр с теми же отборами — календарём ICS: событие на день срока у каждого поручения
+    с датой срока (marks.ics). Поручения без даты срока в файл не попадают."""
+    tasks = (await _tasks(request, who, dir, since, until, name, due, only_open, q, sort, overdue))["tasks"]
+    return Response(marks.ics(tasks), media_type="text/calendar; charset=utf-8",
+                    headers={"Content-Disposition": 'attachment; filename="tasks.ics"'})
+
+
 @app.get("/api/v1/status")
 def v1_status(file: str, who: users.Access = Depends(viewer)):
     """Что сейчас с записью — чтобы дождаться результата после загрузки."""
@@ -1971,7 +2067,7 @@ async def v1_upload(request: Request, dir: str = "", name: str = "", who: users.
     if cfg.personal and not name:
         raise HTTPException(400, "нужно имя файла: PUT /api/v1/upload?name=<имя файла>&dir=<папка>. "
                                  "Без dir запись ляжет в корень записей")
-    if not name or not (users.norm_folder(dir) or cfg.personal):
+    if not name or not (_dir(dir) or cfg.personal):
         folders = await asyncio.to_thread(_upload_folders, who)
         raise HTTPException(400, "нужны папка и имя файла: PUT /api/v1/upload?dir=<папка>&name=<имя файла>. "
                             + ("Папки, куда вы можете загружать: " + "; ".join(folders) if folders
@@ -2381,7 +2477,10 @@ async def _move(file: str, dir: str, who: users.Access) -> dict:
         jot("record_move", who, file=file, to=new)
 
     _record(file, who)
-    if not who.owns(_dir(dir)):
+    target = _dir(dir)
+    if not who.sees(target):
+        raise HTTPException(404, folders.NO_FOLDER)         # закрытая папка неотличима от несуществующей
+    if not who.owns(target):
         raise HTTPException(403, "переносить можно в папку, где вы владелец или администратор")
     new = await _record_action(records.move, file, who, dir, also=also)
     if new != file:
@@ -2423,13 +2522,70 @@ class RecordDelete(BaseModel):
 @app.post("/api/record/delete")
 async def record_delete(req: RecordDelete, who: users.Access = Depends(person)):
     """Запись с результатами уходит в корзину на сервере; через месяц стирается."""
-    def also(done: dict) -> None:
+    def also(done: dict) -> dict:
+        # словарь записи и автор загрузки уходят из базы — в опись корзины, чтобы вернуться вместе с ней
+        kept = {"dictionary": words.taken(file=req.file), "uploads": trail.kept(file=req.file)}
         words.drop_record(req.file)
         jot("record_delete", who, file=req.file, trash=done["trash"])
+        return kept
 
     done = await _record_action(records.remove, req.file, who, who.login, also=also)
     log(f"запись удалена в корзину: {req.file}, лежит в {done['trash']} ({who.login})")
     return {"ok": True, **done}
+
+
+# ---------- корзина: что удалено и возврат ----------
+# Удалённое лежит в корзине TRASH_DAYS дней (folders.py). Вернуть запись может тот, кто мог её удалить, —
+# хозяин её папки; папку — администратор сервиса. Как и удаление, это делает сам человек на странице.
+# Подтверждения нет: возврат обратим — вернувшееся снова удаляют. Обработки при возврате нет: результаты
+# возвращаются с диска, строки журнала обработки — из описи.
+
+def _restorable(who: users.Access, item: dict) -> bool:
+    return who.admin if item["kind"] == "folder" else who.owns(_parent_of(item["path"]))
+
+
+@app.get("/api/trash")
+async def trash_list(who: users.Access = Depends(person)):
+    """Что человек может вернуть из корзины: записи его папок, а администратору сервиса — всё."""
+    found = await asyncio.to_thread(folders.binned, cfg)
+    return {"items": [item for item in found if _restorable(who, item)], "keep_days": folders.TRASH_DAYS}
+
+
+class TrashRestore(BaseModel):
+    id: str
+
+
+@app.post("/api/trash/restore")
+async def trash_restore(req: TrashRestore, who: users.Access = Depends(person)):
+    """Запись или папка из корзины — на прежнее место, со всем, что удаление убрало из базы."""
+    assert service is not None
+    if not upload_ready:
+        raise HTTPException(503, "входная папка доступна только для чтения")
+    trash = f"{folders.TRASH}/{req.id}"
+    async with scan_paused():
+        try:
+            note = folders.read_note(cfg, req.id)
+            item = folders.entry(req.id, note)
+            if not _restorable(who, item):
+                raise HTTPException(404, folders.NOT_IN_TRASH)      # чужое в корзине неотличимо от отсутствующего
+            kept = note.get("kept") or {}
+
+            def also(note: dict) -> None:
+                words.put_back(kept.get("dictionary") or [])
+                where = {"folder": item["path"], "records": item["records"]} if item["kind"] == "folder" \
+                    else {"file": item["path"]}
+                jot(f"{item['kind']}_restore", who, **where, trash=trash, uploads=kept.get("uploads") or {})
+
+            if item["kind"] == "folder":
+                folders.restore(cfg, service, people, req.id, also=also)
+            else:
+                records.restore(cfg, service, req.id, also=also)
+        except (folders.FolderError, records.RecordError) as e:
+            raise HTTPException(e.status, e.detail)
+        except OSError as e:
+            raise _os_fault("не удалось вернуть из корзины", e)
+    log(f"{'папка' if item['kind'] == 'folder' else 'запись'} возвращена из корзины: {item['path']} ({who.login})")
+    return {"ok": True, "kind": item["kind"], "path": item["path"], "records": item["records"]}
 
 
 class TaskMark(BaseModel):
@@ -2601,7 +2757,7 @@ async def v1_previous_tasks(file: str, on: bool, who: users.Access = Depends(vie
 async def _series_set(path: str, on: bool, who: users.Access) -> dict:
     """Включить или выключить у папки признак «серия совещаний». Действует со следующей обработки
     и пересборки: готовые протоколы не меняются — раздел в них убирают кнопкой у раздела."""
-    if not users.norm_folder(path):
+    if not _dir(path):
         raise HTTPException(400, ROOT_NO_SERIES)
     folder = _dict_folder(path, who)            # та же проверка, что у словаря: закрытая папка неотличима от несуществующей
     if not who.owns(folder):
@@ -2668,6 +2824,12 @@ def _tell(record: dict, kind: str, login: str, by_hand: bool = False) -> threadi
     thread = threading.Thread(target=_ready_letter, args=(dict(record), kind, login, box, by_hand), daemon=True)
     thread.start()
     return thread
+
+
+def _hook(record: dict, kind: str) -> None:
+    """Событие webhook об исходе обработки (когда — webhook.due) — в очередь доставки. Запись в теле — без
+    сумм и без ответа поставщика в тексте сбоя: получатель — внешняя система, а не администратор сервиса."""
+    hooks.add(kind, {**record, "error": _public_error(record)}, cfg.public_url)
 
 
 def _sender(file: str, who: users.Access) -> dict:
@@ -2888,13 +3050,14 @@ async def me(request: Request):
         return {"login": OWNER.login, "name": "", "admin": True, "home": None, "personal": True,
                 "home_root": users.HOME_ROOT, "mail": False, "signup": False, "requests": 0, "url": _base(request),
                 "url_set": bool(cfg.public_url),
-                "email": "", "notify_ready": False, "domain": {"on": False}, "domain_account": False, "notice": ""}
+                "email": "", "notify_ready": False, "notify_due": False, "domain": {"on": False}, "domain_account": False,
+                "notice": ""}
     who, notice = people.by_token(request.cookies.get(users.COOKIE, "")), ""
     try:
         who = who and await _confirmed(who)
     except HTTPException as e:
         who, notice = None, e.detail        # домен человеку отказал — страница входа скажет почему
-    box = (who and people.mailbox(who.login)) or {"email": "", "notify_ready": False}
+    box = (who and people.mailbox(who.login)) or {"email": "", "notify_ready": False, "notify_due": False}
     configured = not domain_off()
     return {"login": who and who.login, "name": who and who.name,
             # вход под учётной записью домена — странице входа: предлагать ли его по этому соединению.
@@ -2914,8 +3077,8 @@ async def me(request: Request):
             "mail": cfg.mail_on,
             # принимаются ли заявки на доступ: всегда, пока учётные записи есть где хранить
             "signup": state_kept,
-            # своя почта и письма о готовности записи — переключателю в меню учётной записи
-            "email": box["email"], "notify_ready": box["notify_ready"],
+            # своя почта, письма о готовности записи и напоминания о сроках — переключателям в меню учётной записи
+            "email": box["email"], "notify_ready": box["notify_ready"], "notify_due": box["notify_due"],
             # сколько заявок ждёт решения — счётчик в меню, только администратору сервиса
             "requests": len(claims.pending()) if who and who.admin else 0}
 
@@ -2951,18 +3114,22 @@ async def change_password(req: PasswordRequest, who: users.Access = Depends(pers
 
 
 class NotifyRequest(BaseModel):
-    ready: bool
+    ready: bool | None = None       # письма «запись готова»; не указано — не трогать
+    due: bool | None = None         # напоминания о сроках поручений; не указано — не трогать
 
 
 @app.post("/api/notify")
 async def notify_set(req: NotifyRequest, who: users.Access = Depends(person)):
-    """Письма «запись готова» — человек включает и отключает их себе сам."""
+    """Письма «запись готова» и напоминания о сроках поручений — человек включает и отключает их себе сам."""
+    if req.ready is None and req.due is None:
+        raise HTTPException(400, "укажите ready или due: какие письма включить или отключить")
     try:
-        await asyncio.to_thread(people.set_notify, who.login, req.ready)
+        await asyncio.to_thread(people.set_notify, who.login, req.ready, req.due)
     except users.UserError as e:
         raise HTTPException(400, str(e))
-    jot("notify", who, ready=req.ready)
-    return {"ok": True, "notify_ready": req.ready}
+    jot("notify", who, **{k: v for k, v in (("ready", req.ready), ("due", req.due)) if v is not None})
+    box = people.mailbox(who.login)
+    return {"ok": True, "notify_ready": box["notify_ready"], "notify_due": box["notify_due"]}
 
 
 # ---------- заявка на доступ и пароль по ссылке ----------
@@ -3268,9 +3435,12 @@ async def admin_folder_delete(req: FolderDelete, who: users.Access = Depends(vie
         raise HTTPException(503, "входная папка доступна только для чтения")
     folder = _dir(req.dir)
 
-    def also(done: dict) -> None:
+    def also(done: dict) -> dict:
+        # словари и авторы загрузок уходят из базы — в опись корзины, чтобы вернуться вместе с папкой
+        kept = {"dictionary": words.taken(folder=folder), "uploads": trail.kept(folder=folder)}
         words.drop_folder(folder)
         jot("folder_delete", who, folder=folder, records=done["records"], trash=done["trash"])
+        return kept
 
     async with scan_paused():
         try:
@@ -3764,11 +3934,9 @@ NO_DICT_EDIT = "словарь правит владелец папки или �
 
 
 def _dict_folder(path: str, who: users.Access) -> str:
-    """Папка, у которой может быть словарь. Закрытая человеку неотличима от несуществующей."""
-    try:
-        folder = upload.folder_arg(path, cfg.outbox_inside_inbox)
-    except upload.UploadError:
-        raise HTTPException(404, folders.NO_FOLDER)         # путь с «..» и служебная папка — тоже «нет такой»
+    """Папка, у которой может быть словарь. Закрытая человеку неотличима от несуществующей; путь с «..»,
+    скрытой или служебной папкой — 400, как везде (_dir)."""
+    folder = _dir(path)
     if not folder:
         raise HTTPException(400, "у корня записей своего словаря нет: общий словарь сервиса — в настройках, "
                                  "его правит администратор")
@@ -3785,7 +3953,7 @@ def _dict_record(file: str, who: users.Access) -> dict | None:
     if service.ledger.get(file) is not None:
         return _record(file, who)
     if not (_uploaded(file) and who.sees(_parent_of(file))):
-        raise HTTPException(404, "такой записи нет")
+        raise HTTPException(404, NO_RECORD)                 # тот же отказ, что у чужой записи из журнала
     return None
 
 

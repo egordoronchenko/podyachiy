@@ -118,6 +118,8 @@ PAGE_ONLY = {
     # «Выйти везде» — свои входы на странице; ключом их не завершить (ключи — отдельные пропуска)
     ("POST", "/api/logout/all"),
     ("POST", "/api/record/delete"), ("POST", "/api/admin/folders/delete"),
+    # корзина: что удалено и возврат — как и удаление, только сам человек
+    ("GET", "/api/trash"), ("POST", "/api/trash/restore"),
     # протокол на почту — содержимое совещания на произвольные адреса
     ("GET", "/api/record/recipients"), ("POST", "/api/record/send"),
     ("POST", "/api/notify"),
@@ -167,7 +169,7 @@ def running(tmp_path, mode="corporate", extra=None, kept=True):
             patch.setenv(key, value)
         patch.delenv("OPENROUTER_API_KEY", raising=False)
         for key in ("SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASSWORD", "SMTP_FROM", "SMTP_SECURITY",
-                    "PUBLIC_URL", "ADMIN_EMAIL", "MAIL_DOMAINS", "BACKUP_BASE_URL", "BACKUP_API_KEY", "SUMMARY_BASE_URL",
+                    "PUBLIC_URL", "ADMIN_EMAIL", "MAIL_DOMAINS", "WEBHOOK_URL", "WEBHOOK_SECRET", "BACKUP_BASE_URL", "BACKUP_API_KEY", "SUMMARY_BASE_URL",
                     "SUMMARY_API_KEY", "COST_CURRENCY", "LDAP_URL", "LDAP_BASE_DN", "LDAP_BIND_DN",
                     "LDAP_BIND_PASSWORD", "LDAP_USER_FILTER", "LDAP_ACCESS_GROUP", "LDAP_ADMIN_GROUP", "LDAP_CA_FILE",
                     "LDAP_TLS_VERIFY", "LDAP_STARTTLS", "LDAP_ALLOW_HTTP", "LDAP_DOMAIN", "LDAP_RECHECK_MIN"):
@@ -573,11 +575,12 @@ def test_upload_lands_in_own_folder_and_is_written_to_the_journal(site):
 def test_upload_into_a_closed_folder_is_refused(site):
     web, admin, ivanov, _ = staffed(site)
     admin.post("/api/folder", json={"dir": "Проекты"})
+    # закрытая папка — как несуществующая: 404
     for folder in (f"{HOME}/petrov", "Проекты", ""):
         file = {"name": "запись.mp3", "size": 5, "stamp": "1", "dir": folder}
-        assert ivanov.get("/api/upload", params=file).status_code == 403, folder
-        assert ivanov.put("/api/upload", params={**file, "offset": 0}, content=b"12345").status_code == 403, folder
-        assert ivanov.delete("/api/upload", params=file).status_code == 403, folder
+        assert ivanov.get("/api/upload", params=file).status_code == 404, folder
+        assert ivanov.put("/api/upload", params={**file, "offset": 0}, content=b"12345").status_code == 404, folder
+        assert ivanov.delete("/api/upload", params=file).status_code == 404, folder
     refused = ivanov.put("/api/upload", params={"name": "вирус.exe", "size": 5, "stamp": "1", "offset": 0,
                                                 "dir": f"{HOME}/ivanov"}, content=b"12345")
     assert refused.status_code == 400
@@ -994,9 +997,9 @@ def test_record_actions_follow_the_rights(site):
     admin.post("/api/access", json={"dir": "Проекты", "login": "ivanov", "manage": "only"})
     assert ivanov.get("/api/result", params={"file": file}).json()["can_act"]
     assert ivanov.get("/api/record/folders").json()["folders"] == [f"{HOME}/ivanov", "Проекты"]
-    # переносить — только туда, где он тоже хозяин
+    # переносить — только туда, где он тоже хозяин; закрытая папка — как несуществующая
     for folder in ("Снабжение", f"{HOME}/petrov", "", "Нет такой"):
-        assert ivanov.post("/api/record/move", json={"file": file, "dir": folder}).status_code == 403, folder
+        assert ivanov.post("/api/record/move", json={"file": file, "dir": folder}).status_code == 404, folder
     assert admin.post("/api/record/move", json={"file": file, "dir": "Нет такой"}).status_code == 404
     assert "" in admin.get("/api/record/folders").json()["folders"]
     for name in ("", "..", "а/б", ".скрытая"):
@@ -2383,9 +2386,9 @@ def test_streamed_upload_needs_a_folder_and_follows_the_rights(site):
         assert refused.status_code == 400, params
         assert "Проекты/Сметы" in refused.json()["detail"] and f"{HOME}/ivanov" in refused.json()["detail"]
         assert "Снабжение" not in refused.json()["detail"]
-    # в чужую — 403; не запись, плохое имя, повтор, пустой файл — свои отказы
+    # в чужую — 404, как в несуществующую; не запись, плохое имя, повтор, пустой файл — свои отказы
     for folder in ("Снабжение", f"{HOME}/petrov", HOME):
-        assert robot.put("/api/v1/upload", params={"dir": folder, "name": "запись.mp3"}, content=b"123").status_code == 403, folder
+        assert robot.put("/api/v1/upload", params={"dir": folder, "name": "запись.mp3"}, content=b"123").status_code == 404, folder
     for name, code in (("вирус.exe", 400), ("../x.mp3", 400), (".скрытая.mp3", 400), ("новая запись.mp3", 409)):
         answer = robot.put("/api/v1/upload", params={"dir": "Проекты/Сметы", "name": name}, content=b"123")
         assert answer.status_code == code, name
@@ -3177,7 +3180,8 @@ def test_person_switches_ready_letters_off_and_on(office):
     shown = petrov.get("/api/me").json()
     assert (shown["mail"], shown["email"], shown["notify_ready"]) == (True, "petrov@example.test", True)
     assert admin.get("/api/me").json()["email"] == "" and office[1].get("/api/me").json()["notify_ready"] is False
-    assert petrov.post("/api/notify", json={"ready": False}).json() == {"ok": True, "notify_ready": False}
+    assert petrov.post("/api/notify", json={"ready": False}).json() == {"ok": True, "notify_ready": False,
+                                                                        "notify_due": True}
     assert petrov.get("/api/me").json()["notify_ready"] is False
     assert web.trail.read()[-1]["kind"] == "notify" and web.trail.read()[-1]["ready"] is False
     record = web.service.ledger.get(MEETING)
@@ -3204,7 +3208,8 @@ def test_users_file_from_before_the_letters_gets_them_switched_on(tmp_path):
         "read": {}, "manage": {}, "keys": []}}}), encoding="utf-8")
     cfg = types.SimpleNamespace(state_dir=state, inbox=tmp_path / "inbox", outbox=tmp_path / "outbox")
     people = users.Users(legacy.start(cfg))
-    assert people.mailbox("ivanov") == {"name": "Иванов", "email": "i@example.test", "notify_ready": True}
+    assert people.mailbox("ivanov") == {"name": "Иванов", "email": "i@example.test", "notify_ready": True,
+                                      "notify_due": True}
     assert people.mailbox("nobody") is None
 
 
@@ -3496,7 +3501,7 @@ def test_reader_with_upload_and_the_folder_admin_upload_on_the_page(site):
         ("sidorov", "Проекты/Сметы/от сидорова.mp3"), ("admin", "Снабжение/админ.mp3")]
     # право загрузки — на свою папку: в закрытую по-прежнему нельзя
     there = petrov.get("/api/upload", params={"name": "чужое.mp3", "size": 5, "stamp": "1", "dir": "Снабжение"})
-    assert there.status_code == 403 and "не открыта" in there.json()["detail"]
+    assert there.status_code == 404 and "не открыта" in there.json()["detail"]
     # читатель с загрузкой остаётся читателем: записью не распоряжается, доступ не раздаёт
     seen = petrov.get("/api/result", params={"file": "Проекты/планёрка.mp4", "kind": "summary"}).json()
     assert (seen["can_edit"], seen["can_act"], seen["can_rebuild"]) == (False, False, False)
@@ -3635,7 +3640,7 @@ def test_key_uploads_and_rebuilds_only_within_its_owners_upload_right(site):
     assert not list(web.cfg.inbox.rglob("запись.mp3"))
     assert loader.put("/api/v1/upload", params={"dir": "Проекты/Сметы", "name": "запись.mp3"}, content=b"123").status_code == 200
     assert lead.put("/api/v1/upload", params={"dir": "Проекты", "name": "запись.mp3"}, content=b"123").status_code == 200
-    assert loader.put("/api/v1/upload", params={"dir": "Снабжение", "name": "запись.mp3"}, content=b"123").status_code == 403
+    assert loader.put("/api/v1/upload", params={"dir": "Снабжение", "name": "запись.mp3"}, content=b"123").status_code == 404
     assert [(e["by"], e["key"]) for e in web.trail.read() if e["kind"] == "upload"] == [
         ("petrov", "с загрузкой"), ("sidorov", "администратор папки")]
 
@@ -3897,12 +3902,12 @@ def test_folder_admin_edits_the_dictionary_and_a_reader_only_reads_it(site):
     sidorov.post("/api/dictionary", json={"path": "Проекты/Сметы", "people": []})                # сокращения не тронуты
     assert len(web.words.get("folders", "Проекты/Сметы")["terms"]) == 2
 
-    # чужая, несуществующая и служебная папки неотличимы; у корня словаря нет
+    # чужая и несуществующая папки неотличимы; путь с «..» и служебная папка — 400, как везде; у корня словаря нет
     stranger = enter(web, "ivanov")
     assert stranger.get("/api/dictionary", params={"path": "Снабжение"}).status_code == 404
-    for path in ("Нет такой", "../state", ".trash"):
-        assert admin.get("/api/dictionary", params={"path": path}).status_code == 404, path
-        assert admin.post("/api/dictionary", json={"path": path, "people": "Кто-то"}).status_code == 404, path
+    for path, code in (("Нет такой", 404), ("../state", 400), (".trash", 400)):
+        assert admin.get("/api/dictionary", params={"path": path}).status_code == code, path
+        assert admin.post("/api/dictionary", json={"path": path, "people": "Кто-то"}).status_code == code, path
     assert admin.get("/api/dictionary").status_code == 400
     assert admin.get("/api/dictionary", params={"path": "Проекты", "file": PLAN}).status_code == 400
     assert admin.post("/api/dictionary", json={"path": "Проекты"}).status_code == 400            # менять нечего
@@ -5070,3 +5075,186 @@ def test_file_held_for_a_decision_can_be_run_by_hand(site):
         assert admin.post("/api/admin/run", json={"file": f"Проекты/{name}"}).status_code == 200, name
     still = admin.post("/api/admin/run", json={"file": "Проекты/копируется.mp4"})
     assert still.status_code == 409 and still.json()["detail"] == web.STILL_WRITTEN
+
+
+# ---------- одна проверка пути и один отказ на закрытое ----------
+
+def test_closed_folder_answers_like_a_missing_one_in_every_method_with_dir(site):
+    """Папка, которой человек не видит, неотличима от несуществующей: 404 «такой папки нет или она вам не
+    открыта» во всех методах с dir — в дереве, загрузке, переносе записи, — и ни одно поле просмотра папки
+    не выдаёт, что она есть. 403 остаётся там, где папку человек видит, а права на действие нет."""
+    web, admin, ivanov, petrov = filled(site)
+    admin.post("/api/v1/series", params={"dir": "Снабжение", "on": False})
+    admin.post("/api/access", json={"dir": "Проекты", "login": "petrov", "read": "tree"})
+    file = {"name": "запись.mp3", "size": 5, "stamp": "1"}
+    for folder in ("Снабжение", "Нет такой"):
+        for refused in (ivanov.get("/api/v1/tree", params={"dir": folder}),
+                        ivanov.put("/api/v1/upload", params={"dir": folder, "name": "запись.mp3"}, content=b"123"),
+                        ivanov.get("/api/upload", params={**file, "dir": folder}),
+                        ivanov.put("/api/upload", params={**file, "dir": folder, "offset": 0}, content=b"12345"),
+                        petrov.post("/api/v1/move", params={"file": f"{HOME}/petrov/личное.mp4", "dir": folder})):
+            assert (refused.status_code, refused.json()["detail"]) == (404, folders.NO_FOLDER), (folder, refused.request.url)
+    seen = [{k: v for k, v in ivanov.get("/api/browse", params={"path": folder}).json().items() if k != "path"}
+            for folder in ("Снабжение", "Нет такой")]
+    assert seen[0] == seen[1]
+    assert admin.get("/api/browse", params={"path": "Снабжение"}).json()["series"] is False
+    # папка видна, а права нет — 403 со словами, что не так
+    reader = petrov.put("/api/v1/upload", params={"dir": "Проекты", "name": "запись.mp3"}, content=b"123")
+    assert reader.status_code == 403 and "право загрузки" in reader.json()["detail"]
+    moved = petrov.post("/api/v1/move", params={"file": f"{HOME}/petrov/личное.mp4", "dir": "Проекты"})
+    assert moved.status_code == 403
+    assert [p for p in web.cfg.inbox.rglob("запись.mp3")] == []
+
+
+def test_closed_record_answers_like_a_missing_one_in_the_dictionary(site):
+    """Словарь записи: чужая запись и несуществующая — один и тот же отказ, и кодом, и текстом. Раньше
+    у чужой был текст «файла нет в журнале обработки», у несуществующей — «такой записи нет»."""
+    web, admin, ivanov, _ = filled(site)
+    for ask in (lambda file: ivanov.get("/api/v1/dictionary", params={"file": file}),
+                lambda file: ivanov.put("/api/v1/dictionary", params={"file": file}, json={"people": []}),
+                lambda file: ivanov.get("/api/dictionary", params={"file": file})):
+        closed, missing = ask("Снабжение/итоги.mp4"), ask("Снабжение/нет такой.mp4")
+        assert closed.status_code == missing.status_code == 404 and closed.json() == missing.json()
+        assert closed.json()["detail"] == web.NO_RECORD
+
+
+def test_dots_in_dir_are_refused_with_400_in_dictionaries_and_series_too(site):
+    """«..», скрытые и служебные имена в dir — 400 везде одной проверкой (_dir), как в дереве и просмотре
+    папки; раньше словарь и серия совещаний отвечали на них 404."""
+    web, admin, ivanov, _ = filled(site)
+    for bad in ("Проекты/..", "Проекты/../Снабжение", "..", ".trash", "Проекты/./Сметы"):
+        for refused in (ivanov.get("/api/v1/dictionary", params={"dir": bad}),
+                        ivanov.put("/api/v1/dictionary", params={"dir": bad}, json={"people": []}),
+                        admin.post("/api/v1/series", params={"dir": bad, "on": False}),
+                        admin.get("/api/v1/tree", params={"dir": bad})):
+            assert refused.status_code == 400, (bad, refused.request.url)
+    assert admin.get("/api/v1/dictionary", params={"dir": "Проекты"}).status_code == 200
+
+
+# ---------- корзина: возврат удалённого ----------
+
+def test_owner_returns_a_deleted_record_from_the_trash_as_it_was(site):
+    web, admin, ivanov, petrov = staffed(site)
+    home = f"{HOME}/ivanov"
+    file = f"{home}/вкс.mp4"
+    recorded(web, file, by="ivanov")
+    web.words.put("records", file, [{"name": "Иванов Иван Иванович", "role": "", "aka": []}], [], "ivanov")
+    deleted = ivanov.post("/api/record/delete", json={"file": file}).json()
+    stamp = deleted["trash"].rpartition("/")[2]
+    assert web.trail.uploaded == {} and web.words.get("records", file)["people"] == []
+    listed = ivanov.get("/api/trash").json()
+    assert listed["keep_days"] == 30
+    assert [(i["id"], i["kind"], i["path"], i["by"]) for i in listed["items"]] == [(stamp, "record", file, "ivanov")]
+    assert petrov.get("/api/trash").json()["items"] == []                    # чужое не видно
+    assert petrov.post("/api/trash/restore", json={"id": stamp}).status_code == 404
+    robot, _ = keyed(web, ivanov)
+    assert robot.get("/api/trash").status_code == 403 and robot.post("/api/trash/restore", json={"id": stamp}).status_code == 403
+
+    back = ivanov.post("/api/trash/restore", json={"id": stamp})
+    assert back.json() == {"ok": True, "kind": "record", "path": file, "records": 1}
+    assert (web.cfg.inbox / file).is_file() and "Решили." in ivanov.get("/api/result", params={"file": file}).json()["text"]
+    assert web.service.ledger.get(file)["runs"] == 1
+    assert web.trail.uploaded == {file: "ivanov"}                              # автор загрузки вернулся
+    assert web.words.get("records", file)["people"][0]["name"] == "Иванов Иван Иванович"
+    assert idle(web)                                                         # платной обработки нет
+    assert ivanov.get("/api/trash").json()["items"] == []
+    assert ivanov.post("/api/trash/restore", json={"id": stamp}).status_code == 404
+    assert web.trail.read()[-1]["kind"] == "record_restore" and web.trail.read()[-1]["by"] == "ivanov"
+    # прогоны снова идут за записью: после переименования расходы — под одним новым названием
+    ivanov.post("/api/record/rename", json={"file": file, "name": "Итоги"})
+    report = admin.get("/api/admin/report").json()
+    assert [r["file"] for r in report["records"]] == [f"{home}/Итоги.mp4"] and report["total"]["cost"] == {"USD": 0.25}
+
+
+def test_record_is_not_returned_over_a_new_one_and_the_page_hears_why(site):
+    web, admin, ivanov, _ = staffed(site)
+    file = f"{HOME}/ivanov/вкс.mp4"
+    recorded(web, file)
+    stamp = ivanov.post("/api/record/delete", json={"file": file}).json()["trash"].rpartition("/")[2]
+    (web.cfg.inbox / file).write_bytes(b"new")
+    refused = ivanov.post("/api/trash/restore", json={"id": stamp})
+    assert refused.status_code == 409 and "на прежнем месте уже есть запись" in refused.json()["detail"]
+    assert ivanov.get("/api/trash").json()["items"][0]["id"] == stamp            # осталась в корзине
+
+
+def test_service_admin_returns_a_deleted_folder_with_its_rights(site):
+    web, admin, ivanov, petrov = staffed(site)
+    admin.post("/api/folder", json={"dir": "Проекты"})
+    admin.post("/api/access", json={"dir": "Проекты", "login": "ivanov", "manage": "tree"})
+    recorded(web, "Проекты/вкс.mp4", by="admin")
+    web.words.put("folders", "Проекты", [], [{"term": "ВКС", "meaning": "видеосвязь"}], "admin")
+    stamp = admin.post("/api/admin/folders/delete", json={"dir": "Проекты"}).json()["trash"].rpartition("/")[2]
+    assert ivanov.get("/api/trash").json()["items"] == []                      # папку возвращает администратор сервиса
+    assert ivanov.post("/api/trash/restore", json={"id": stamp}).status_code == 404
+    [item] = admin.get("/api/trash").json()["items"]
+    assert (item["kind"], item["path"], item["records"]) == ("folder", "Проекты", 1)
+    back = admin.post("/api/trash/restore", json={"id": stamp}).json()
+    assert back == {"ok": True, "kind": "folder", "path": "Проекты", "records": 1}
+    assert ivanov.get("/api/result", params={"file": "Проекты/вкс.mp4"}).json()["can_act"]
+    assert web.words.get("folders", "Проекты")["terms"][0]["term"] == "ВКС"
+    assert web.trail.uploaded == {"Проекты/вкс.mp4": "admin"} and idle(web)
+    event = web.trail.read()[-1]
+    assert (event["kind"], event["folder"], event["records"]) == ("folder_restore", "Проекты", 1)
+
+
+# ---------- напоминания о сроках поручений и календарь ----------
+
+def _task_key(client, text):
+    return next(t["key"] for t in client.get("/api/v1/tasks").json()["tasks"] if t["task"] == text)
+
+
+def test_due_reminder_goes_once_a_day_to_the_assignee_who_sees_the_folder(office):
+    web, admin, ivanov, petrov, post = desk(office)
+    set_protocol(web, MEETING, TASKS_MD + "| **Орлова** | | | |\n| Прислать акт | завтра | — | — |\n")
+    today = datetime.date.today()
+    morning = datetime.datetime.combine(today, datetime.time(web.notify.REMIND_HOUR, 5)).astimezone()
+    for text in ("Согласовать смету", "Прислать акт"):
+        assert ivanov.post("/api/record/task", json={"file": MEETING, "key": _task_key(ivanov, text),
+                                                     "due": today.isoformat()}).status_code == 200
+    run = lambda at: web.asyncio.run(web._remind_tick(at))
+    assert run(morning.replace(hour=web.notify.REMIND_HOUR - 1)) is False and post.sent == []     # рано
+    assert run(morning) is True
+    # Иванов Иван — исполнитель; Орлова — тоже, но папка «Проекты» ей не открыта: письма ей нет
+    assert [m.to for m in post.sent] == [["ivanov@example.test"]]
+    letter = post.sent[0]
+    assert letter.subject.endswith("сроки поручений — срок сегодня: 1")
+    assert "Согласовать смету — совещание «Планёрка: итоги/план»" in letter.text and "Прислать акт" not in letter.text
+    assert "http://podyachiy.test/tasks?who=" in letter.text and "«Напоминания о сроках»" in letter.text
+    assert "USD" not in letter.text and "$" not in letter.text
+    assert run(morning.replace(hour=20)) is False and len(post.sent) == 1                       # второй раз за день — нет
+    assert web.trail.read()[-1]["kind"] == "due_mail" and web.trail.read()[-1]["to"] == "ivanov"
+
+    # человек отключил напоминания — назавтра письма нет; настройка «запись готова» не тронута
+    assert ivanov.post("/api/notify", json={"due": False}).json() == {"ok": True, "notify_ready": True, "notify_due": False}
+    assert ivanov.get("/api/me").json()["notify_due"] is False
+    web.base.note(web.REMINDED, "2000-01-01")
+    assert run(morning) is True and len(post.sent) == 1
+    assert ivanov.post("/api/notify", json={}).status_code == 400
+
+
+def test_reminders_need_mail(site, monkeypatch):
+    web, _ = site
+    monkeypatch.setattr(web.mail, "send", lambda *a, **kw: pytest.fail("без почты писем быть не должно"))
+    assert web.asyncio.run(web._remind_tick(datetime.datetime.now().astimezone().replace(hour=23))) is False
+
+
+def test_tasks_calendar_has_the_same_filters_as_the_table(site):
+    web, admin, ivanov, petrov = staffed(site)
+    admin.post("/api/folder", json={"dir": "Проекты"})
+    admin.post("/api/access", json={"dir": "Проекты", "login": "ivanov", "manage": "tree"})
+    recorded(web, MEETING)
+    set_protocol(web, MEETING, TASKS_MD)
+    key = _task_key(ivanov, "Согласовать смету")
+    ivanov.post("/api/record/task", json={"file": MEETING, "key": key, "due": "2026-11-03"})
+    assert site[1].get("/api/v1/tasks.ics").status_code == 401
+    got = ivanov.get("/api/v1/tasks.ics", params={"dir": "Проекты"})
+    assert got.status_code == 200 and got.headers["content-type"].startswith("text/calendar")
+    assert 'filename="tasks.ics"' in got.headers["content-disposition"]
+    assert got.headers["cache-control"] == "no-store"
+    text = got.text.replace("\r\n ", "")
+    assert text.count("BEGIN:VEVENT") == 1                                   # «Проверить остатки» без срока — нет
+    assert "DTSTART;VALUE=DATE:20261103" in text and "SUMMARY:Согласовать смету — Иванов Иван" in text
+    assert f"UID:{key}-" in text
+    assert petrov.get("/api/v1/tasks.ics").text.count("BEGIN:VEVENT") == 0          # папка закрыта — пусто
+    assert ivanov.get("/api/v1/tasks.ics", params={"who": "Петров"}).text.count("BEGIN:VEVENT") == 0
+    assert ivanov.get("/api/v1/tasks.ics", params={"sort": "нет"}).status_code == 400

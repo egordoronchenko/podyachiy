@@ -624,3 +624,19 @@ def test_letter_about_a_known_address_names_the_login_and_the_way_back():
     assert subject == "учётная запись уже есть"
     assert "ivanov" in text and "http://192.0.2.10:8082/login?forgot" in text and "set-password" not in text
     assert "Иван &lt;b&gt;" in body and "<b>ivanov</b>" in body and "Иван <b>" not in body
+
+
+
+def test_due_reminder_lists_the_tasks_with_links_and_how_to_switch_it_off():
+    row = {"task": "Согласовать <смету>", "title": "Планёрка", "file": "Проекты/вкс.mp4", "date": "2026-10-09",
+           "due": None, "due_date": "2026-10-28", "due_text": "до вторника", "link": "http://podyachiy.test/?open=a&b=1"}
+    late = {**row, "task": "Сдать отчёт", "due": "2026-10-20", "due_date": "2026-10-20"}
+    subject, text, body = mail.due_reminder(cfg(), "Иванов Иван", {"overdue": [late] * 3, "today": [row], "tomorrow": []},
+                                            "http://podyachiy.test/tasks?who=Иванов", most=2)
+    assert subject == "сроки поручений — просрочено: 3, срок сегодня: 1"
+    assert "Здравствуйте, Иванов Иван!" in text and "Просрочено (3):" in text and "Срок завтра" not in text
+    assert "- Сдать отчёт — совещание «Планёрка» от 09.10.2026, срок 20.10.2026" in text
+    assert "срок 28.10.2026, по словам протокола «до вторника»" in text
+    assert "- и ещё 1 — на странице «Поручения»" in text and "http://podyachiy.test/?open=a&b=1" in text
+    assert "«Напоминания о сроках»" in text and "http://podyachiy.test/tasks?who=Иванов" in text
+    assert "Согласовать &lt;смету&gt;" in body and "<смету>" not in body and 'href="http://podyachiy.test/?open=a&amp;b=1"' in body

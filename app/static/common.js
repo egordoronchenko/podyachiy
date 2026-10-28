@@ -204,7 +204,8 @@ async function initUser() {
   acts.innerHTML = `<button class="nav sm" id="keysbtn">${icon("key", 15)}<span>Ключи доступа</span></button>` +
     (me.login === "admin" ? "" :
       // у учётной записи домена пароля в сервисе нет: он меняется в домене
-      `${me.mail ? `<button class="nav sm" id="notifybtn" role="switch"></button>` : ""}
+      `${me.mail ? `<button class="nav sm" id="notifybtn" role="switch"></button>
+         <button class="nav sm" id="duebtn" role="switch"></button>` : ""}
        ${me.domain_account ? "" : `<a class="nav sm" href="/login?change">${icon("gear", 15)}<span>Сменить пароль</span></a>`}`) +
     `<button class="nav sm" id="logout">${icon("back", 15)}<span>Выйти</span></button>
      <button class="nav sm" id="logoutall" aria-expanded="false" aria-controls="logoutask">${icon("users", 15)}<span>Выйти везде</span></button>
@@ -257,30 +258,42 @@ function askLogoutAll(open) {
 
 const ruDay = iso =>iso ? `${iso.slice(8, 10)}.${iso.slice(5, 7)}.${iso.slice(0, 4)}` : "";
 
-/* ---------- письма о готовности записи ----------
-   Переключатель в меню учётной записи: «Уведомления на почту: когда моя запись готова».
-   Включён, пока человек сам не отключит; без почты в учётной записи письму идти некуда —
-   тогда он стоит выключенным и говорит, почему. Состояние написано словом, не только цветом. */
+/* ---------- письма о готовности записи и напоминания о сроках ----------
+   Два переключателя в меню учётной записи: «Письма о готовности» (когда моя запись готова) и
+   «Напоминания о сроках» (раз в день — мои поручения со сроком сегодня, завтра и просроченные).
+   Включены, пока человек сам не отключит; без почты в учётной записи письму идти некуда —
+   тогда они стоят выключенными и говорят, почему. Состояние написано словом, не только цветом. */
+const NOTIFY_SWITCHES = [
+  { id: "notifybtn", field: "notify_ready", send: "ready", icon: "mail", label: "Письма о готовности",
+    what: "Уведомления на почту: когда моя запись готова",
+    hint: "письмо со ссылкой и кратким итогом" },
+  { id: "duebtn", field: "notify_due", send: "due", icon: "clock", label: "Напоминания о сроках",
+    what: "Напоминания на почту о сроках моих поручений",
+    hint: "раз в день, утром, — поручения на вас со сроком сегодня, завтра и просроченные; только когда есть о чём напомнить" },
+];
+
 function drawNotify() {
-  const btn = document.getElementById("notifybtn");
-  if (!btn) return;
-  const on = !!(me.email && me.notify_ready);
-  btn.setAttribute("aria-checked", on);
-  btn.setAttribute("aria-label", "Уведомления на почту: когда моя запись готова");
-  btn.title = me.email
-    ? `Уведомления на почту: когда моя запись готова — письмо со ссылкой и кратким итогом на ${me.email}`
-    : "Уведомления на почту: в вашей учётной записи не указана почта — попросите администратора её вписать";
-  btn.innerHTML = `${icon("mail", 15)}<span>Письма о готовности</span>
-    <span class="sw${on ? " on" : ""}" aria-hidden="true">${me.email ? (on ? "вкл" : "выкл") : "нет почты"}</span>`;
-  btn.onclick = async () => {
-    if (!me.email) { alert(btn.title); return; }
-    btn.disabled = true;
-    try { me.notify_ready = (await api("/api/notify", { ready: !me.notify_ready })).notify_ready; }
-    catch (e) { alert("Не сохранилось: " + e.message); }
-    btn.disabled = false;
-    drawNotify();
-    btn.focus();
-  };
+  for (const sw of NOTIFY_SWITCHES) {
+    const btn = document.getElementById(sw.id);
+    if (!btn) continue;
+    const on = !!(me.email && me[sw.field]);
+    btn.setAttribute("aria-checked", on);
+    btn.setAttribute("aria-label", sw.what);
+    btn.title = me.email
+      ? `${sw.what} — ${sw.hint}, на ${me.email}`
+      : `${sw.what}: в вашей учётной записи не указана почта — попросите администратора её вписать`;
+    btn.innerHTML = `${icon(sw.icon, 15)}<span>${sw.label}</span>
+      <span class="sw${on ? " on" : ""}" aria-hidden="true">${me.email ? (on ? "вкл" : "выкл") : "нет почты"}</span>`;
+    btn.onclick = async () => {
+      if (!me.email) { alert(btn.title); return; }
+      btn.disabled = true;
+      try { me[sw.field] = (await api("/api/notify", { [sw.send]: !me[sw.field] }))[sw.field]; }
+      catch (e) { alert("Не сохранилось: " + e.message); }
+      btn.disabled = false;
+      drawNotify();
+      btn.focus();
+    };
+  }
 }
 
 /* ---------- протокол на почту ----------
@@ -816,10 +829,18 @@ function mdToHtml(src) {
   const flushList = () => { if (list) { html += "</" + list + ">"; list = null; } };
   const flushTable = () => { if (table) { html += "</table>"; table = false; } };
   const flushAll = () => { flushPara(); flushList(); flushTable(); };
+  // блок кода ``` … ``` — как есть, с отступами; прокручивается сам, а не страница (с клавиатуры тоже)
+  let code = null;
 
   // n — номер строки текста: по нему строка таблицы задач находит свою отметку «выполнено» (markTasks)
   for (const [n, raw] of src.replace(/\r/g, "").split("\n").entries()) {
     const line = raw.trimEnd();
+    if (line.trim().startsWith("```")) {
+      if (code === null) { flushAll(); code = []; }
+      else { html += `<pre tabindex="0" aria-label="Пример кода"><code>${esc(code.join("\n"))}</code></pre>`; code = null; }
+      continue;
+    }
+    if (code !== null) { code.push(line); continue; }
     if (!line.trim()) { flushAll(); continue; }
     if (line.trim().startsWith("<!--")) continue;           // служебный заголовок файла
     if (line.trim().startsWith("|")) {
@@ -860,6 +881,7 @@ function mdToHtml(src) {
     }
   }
   flushAll();
+  if (code !== null) html += `<pre tabindex="0" aria-label="Пример кода"><code>${esc(code.join("\n"))}</code></pre>`;
   return html;
 }
 

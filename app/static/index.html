@@ -24,6 +24,8 @@
           title="Переносить ли в новый протокол незакрытые поручения предыдущей записи этой папки">Серия<span class="sw" id="srstate"></span></button>
         <button class="ghost" id="acbtn" hidden title="Кому открыта эта папка">Доступ</button>
         <button class="ghost" id="mkbtn" hidden title="Создать подпапку здесь">Новая папка</button>
+        <button class="ghost" id="trbtn" aria-haspopup="dialog"
+          title="Удалённые записи и папки: их можно вернуть на прежнее место, пока срок хранения не вышел">Корзина</button>
       </div>
       <input type="search" id="q" placeholder="Поиск по всем записям" aria-label="Поиск по протоколам и расшифровкам всех записей">
     </div>
@@ -50,6 +52,7 @@
 <div id="access" hidden></div>
 <div id="series" hidden></div>
 <div id="recact" hidden></div>
+<div id="trash" hidden></div>
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
 <script src="/static/common.js"></script>

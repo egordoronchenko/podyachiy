@@ -291,3 +291,39 @@ def test_domains_limit_where_the_protocol_may_go():
     assert "a@example.test" not in text.split("не подходят")[1]
     # поддомен и похожее имя — не тот домен
     assert not notify.allowed("a@notexample.test", domains) and notify.allowed("a@anything.test", ())
+
+
+
+# ---------- напоминания о сроках поручений ----------
+
+@pytest.mark.parametrize("who, name, mine", [
+    ("Иванов Иван", "Иванов Иван Иванович", True),
+    ("Иванов И.И.", "Иванов Иван Иванович", True),
+    ("Иванов", "Иванов Иван Иванович", True),
+    ("Иван Иванович Иванов", "Иванов Иван Иванович", True),
+    ("Иванов Пётр", "Иванов Иван Иванович", False),           # однофамилец
+    ("Иванов П.", "Иванов Иван Иванович", False),
+    ("Иванова Анна", "Иванов Иван Иванович", False),           # фамилия — словом целиком
+    ("Иванов Иван", "Иван Иванович Иванов", True),             # ФИО учётной записи в другом порядке
+    ("Петров П.", "Пётр Петров", True),                        # два слова: годится и «Имя Фамилия»
+    ("Петров", "Петров", True),
+    ("S2", "Петров", False),
+    (None, "Петров", False),
+    ("Петров", "", False),
+])
+def test_task_belongs_to_a_person_by_the_surname_and_not_contradicting_name(who, name, mine):
+    assert notify.assigned(who, name) is mine
+
+
+def test_reminders_pick_open_tasks_due_today_tomorrow_and_overdue_once():
+    def task(task, due_date, due=None, overdue=False, open=True, file="П/а.mp4", key=None):
+        return {"task": task, "due_date": due_date, "due": due, "overdue": overdue, "open": open, "file": file,
+                "key": key or task, "date": "2026-10-01"}
+    rows = [task("сегодня", "2026-10-28"), task("завтра", "2026-10-29"), task("послезавтра", "2026-10-30"),
+            task("просрочено", "2026-10-20", due="2026-10-20", overdue=True),
+            task("давно", "2026-10-02", due="2026-10-02", overdue=True),
+            task("по словам и прошло", "2026-10-02"),                      # дата из слов протокола — не просрочка
+            task("закрыто", "2026-10-28", open=False), task("сегодня", "2026-10-28")]       # повтор строки
+    found = notify.reminders(rows, "2026-10-28")
+    assert {k: [r["task"] for r in v] for k, v in found.items()} == {
+        "overdue": ["давно", "просрочено"], "today": ["сегодня"], "tomorrow": ["завтра"]}

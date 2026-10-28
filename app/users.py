@@ -384,16 +384,26 @@ class Users:
         """Логин пользователя с такой почтой. Почта у пользователей не повторяется."""
         return self.db.value("SELECT login FROM users WHERE email = ? ORDER BY login", email) if email else None
 
-    def set_notify(self, login: str, ready: bool) -> None:
-        """Человек включил или отключил себе письма о готовности записи."""
+    def set_notify(self, login: str, ready: bool | None = None, due: bool | None = None) -> None:
+        """Человек включил или отключил себе письма о готовности записи (ready) и напоминания о сроках
+        поручений (due). None — эту настройку не трогать."""
         with self.db.write() as con:
-            if not con.execute("UPDATE users SET notify_ready = ? WHERE login = ?", (int(bool(ready)), login)).rowcount:
+            if con.execute("SELECT 1 FROM users WHERE login = ?", (login,)).fetchone() is None:
                 raise UserError("у администратора из .env учётной записи в сервисе нет — и почты тоже")
+            for column, value in (("notify_ready", ready), ("notify_due", due)):
+                if value is not None:
+                    con.execute(f"UPDATE users SET {column} = ? WHERE login = ?", (int(bool(value)), login))
 
     def mailbox(self, login: str) -> dict | None:
-        """Имя и почта человека и хочет ли он письма о своих записях. Нет такого — None."""
-        row = self.db.row("SELECT name, email, notify_ready FROM users WHERE login = ?", login)
-        return row and {"name": row["name"], "email": row["email"], "notify_ready": bool(row["notify_ready"])}
+        """Имя и почта человека, хочет ли он письма о своих записях и напоминания о сроках. Нет такого — None."""
+        row = self.db.row("SELECT name, email, notify_ready, notify_due FROM users WHERE login = ?", login)
+        return row and {"name": row["name"], "email": row["email"], "notify_ready": bool(row["notify_ready"]),
+                        "notify_due": bool(row["notify_due"])}
+
+    def reminded(self) -> list[dict]:
+        """Кому напоминать о сроках поручений: у кого есть почта и кто напоминания не отключил."""
+        return [dict(row) for row in self.db.rows(
+            "SELECT login, name, email FROM users WHERE email <> '' AND notify_due = 1 ORDER BY login")]
 
     def set_access(self, login: str, folder: str, read: str | None = None, manage: str | None = None,
                    upload: str | None = None) -> None:
@@ -455,6 +465,22 @@ class Users:
         """Папку удалили — права на неё и на её подпапки больше ни к чему."""
         with self.db.write() as con:
             con.execute(f"DELETE FROM grants WHERE {db.below('folder')}", db.span(folder))
+
+    def grants_below(self, folder: str) -> list[dict]:
+        """Права на папку и её подпапки — в опись корзины перед удалением папки."""
+        return [dict(row) for row in self.db.rows(
+            f"SELECT login, kind, folder, scope FROM grants WHERE {db.below('folder')} ORDER BY login, kind, folder",
+            *db.span(folder))]
+
+    def put_grants(self, grants: list[dict]) -> int:
+        """Права из описи корзины — назад. Учётной записи, которую с тех пор удалили, право не
+        возвращается. Возвращает, сколько прав не вернулось."""
+        with self.db.write() as con:
+            back = sum(con.execute(
+                "INSERT OR IGNORE INTO grants (login, kind, folder, scope) SELECT ?, ?, ?, ? "
+                "WHERE EXISTS (SELECT 1 FROM users WHERE login = ?)",
+                (g["login"], g["kind"], g["folder"], g["scope"], g["login"])).rowcount for g in grants)
+        return len(grants) - back
 
     def delete(self, login: str) -> None:
         """Убирает учётную запись; её права и ключи доступа гаснут вместе с ней — одной транзакцией."""

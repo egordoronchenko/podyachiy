@@ -15,22 +15,37 @@ Service.scan_lock, а сами функции идут в событийном �
 
 Удаление — это перенос в корзину (.trash во входной и выходной папках), а не стирание:
 папку с записями удаляют одним нажатием, и ошибку должно быть можно исправить. Корзина
-чистится сама через TRASH_DAYS дней.
+чистится сама через TRASH_DAYS дней. Рядом с удалённым — опись (NOTE): что это было, кто удалил,
+строки журнала обработки, отметки поручений и то, что удаление убрало из базы (kept: права, признак
+серии, словари, авторы загрузок). По ней удалённое возвращается кнопкой (restore, records.restore):
+файлы — на прежнее место, строки — в базу, тем же порядком, что у переезда, — сначала файлы, потом база,
+опись убирается последней перед фиксацией; сбой — файлы обратно в корзину, опись на месте.
 """
 from __future__ import annotations
 
+import datetime
 import json
 import os
+import re
 import secrets
 import shutil
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from . import marks, series, upload, users
 
 TRASH = ".trash"
 TRASH_DAYS = 30
 NOTE = "удалено.json"           # опись удалённого рядом с ним в корзине
+STAMP = re.compile(r"\d{8}-\d{6}(?:-\d+)?")      # имя папки корзины (trash_stamp)
+NOT_IN_TRASH = "в корзине такого нет: его уже вернули или срок хранения вышел"
+BROKEN_NOTE = "опись удалённого в корзине не читается — вернуть его можно только вручную (раздел о корзине в инструкции)"
+# прежнее место занято: вернуть рядом под другим именем сервис не берётся — сначала освободить место
+FOLDER_TAKEN = ("на прежнем месте уже есть папка с таким именем — переименуйте или удалите её, "
+                "потом верните удалённую")
+PARENT_GONE = ("папки, в которой это лежало, больше нет: верните из корзины сначала её "
+               "или создайте её заново под тем же именем")
+EMPTY_BIN = "в корзине не осталось файлов этого удаления — вернуть нечего"
 # один текст на несуществующую и на закрытую человеку папку: существование чужой не раскрывается
 NO_FOLDER = "такой папки нет или она вам не открыта"
 # папка результатов записи «вкс.mp3» — «вкс»: подпапка «вкс» положила бы свои результаты туда же
@@ -159,7 +174,8 @@ def trash_stamp(cfg) -> str:
 
 def remove(cfg, service, people: users.Users, folder: str, by: str, also=None) -> dict:
     """Папка со всем содержимым уходит в корзину. Возвращает, сколько чего убрано.
-    also(что убрано) — что ещё записать в базу той же транзакцией: словари, событие журнала."""
+    also(что убрано) — что ещё записать в базу той же транзакцией: словари, событие журнала; что оно
+    вернёт (словарь), ложится в опись (kept) — для возврата из корзины."""
     folder = _path(cfg, folder)
     _check(folder, service, people)
     if not (cfg.inbox / folder).is_dir() and not (cfg.outbox / folder).is_dir():
@@ -177,18 +193,20 @@ def remove(cfg, service, people: users.Users, folder: str, by: str, also=None) -
                 (root / folder).rename(bin_dir / name)
                 moved.append((root / folder, bin_dir / name))
         with service.ledger.db.write():
-            # отметки поручений уходят из базы вместе со строками записей — сначала запомнить их
+            # отметки поручений, права и признак серии уходят из базы — сначала запомнить их для возврата
             noted = marks.Store(service.ledger.db).everything(folder)
+            kept = {"grants": people.grants_below(folder),
+                    "series_off": sorted(f for f in series.Store(service.ledger.db).off() if _inside(f, folder))}
             records = service.ledger.drop(folder)
             people.drop_folder(folder)
             series.Store(service.ledger.db).drop_folder(folder)
             done["records"] = len(records)
             if also:
-                also(done)
-            # что это было и откуда — рядом с результатами, чтобы папку можно было вернуть руками.
+                kept.update(also(done) or {})
+            # что это было и откуда — рядом с результатами, чтобы папку можно было вернуть кнопкой или руками.
             # До записи базы: не записалась опись — удаления нет, а не «удалено, но отказ 500»
             trash_note(note, {"folder": folder, "by": by, "at": stamp, "moved": [str(binned) for _, binned in moved],
-                              "records": records, "marks": noted})
+                              "records": records, "marks": noted, "kept": kept})
     except BaseException:
         (note / NOTE).unlink(missing_ok=True)
         for place, binned in reversed(moved):
@@ -203,6 +221,137 @@ def trash_note(where: Path, what: dict) -> None:
     """Опись удалённого в папке корзины: что это было, кто и когда удалил, где оно теперь."""
     where.mkdir(parents=True, exist_ok=True)
     (where / NOTE).write_text(json.dumps(what, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def read_note(cfg, stamp: str) -> dict:
+    """Опись удалённого по имени папки корзины — проверенная: путь удалённого и строки журнала в ней
+    те же, что проходят проверку пути у новой папки и записи (upload). Файл описи лежит на диске,
+    его могли поправить руками, а по нему файлы переезжают во входную папку."""
+    if not isinstance(stamp, str) or not STAMP.fullmatch(stamp):
+        raise FolderError(404, NOT_IN_TRASH)
+    try:
+        note = json.loads((cfg.outbox / TRASH / stamp / NOTE).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise FolderError(404, NOT_IN_TRASH)
+    except (OSError, ValueError):
+        raise FolderError(409, BROKEN_NOTE)
+    try:
+        if "folder" in note:
+            where = _path(cfg, note["folder"])
+            assert where and where == note["folder"]
+            assert all(r["file"].startswith(where + "/") for r in note["records"])
+        else:
+            file = note["file"]
+            parent, _, name = file.rpartition("/")
+            assert _path(cfg, parent) == parent
+            upload._check_part(name, "имя записи")
+            assert [r["file"] for r in note["records"]] == [file]
+            upload._check_part(note["records"][0].get("stem") or PurePosixPath(name).stem, "имя записи")
+        assert isinstance(note.get("marks", {}), dict) and isinstance(note.get("kept", {}), dict)
+        assert set(note.get("marks", {})) <= {r["file"] for r in note["records"]}
+    except (AssertionError, FolderError, upload.UploadError, KeyError, TypeError, AttributeError):
+        raise FolderError(409, BROKEN_NOTE)
+    return note
+
+
+def entry(stamp: str, note: dict) -> dict:
+    """Строка списка корзины: что удалено (kind — folder или record, path — путь), кто и когда, до какого
+    дня хранится, сколько в нём записей и вернётся ли оно целиком (partial — опись до версии 1.2.0: словари,
+    права и авторы загрузок в ней не записаны и не вернутся)."""
+    at = datetime.datetime.strptime(stamp[:15], "%Y%m%d-%H%M%S").astimezone()
+    path = note["folder"] if "folder" in note else note["file"]
+    found = {"id": stamp, "kind": "folder" if "folder" in note else "record", "path": path,
+             "dir": path.rpartition("/")[0], "name": path.rpartition("/")[2], "by": note.get("by") or "",
+             "at": at.isoformat(timespec="seconds"),
+             "until": (at + datetime.timedelta(days=TRASH_DAYS)).date().isoformat(),
+             "records": len(note["records"]), "partial": "kept" not in note}
+    if found["kind"] == "record":
+        found["title"] = (note["records"][0].get("title") or "").strip() or None
+    return found
+
+
+def binned(cfg) -> list[dict]:
+    """Что лежит в корзине — по описям, свежее первым. Папка корзины без описи или с негодной описью
+    в список не идёт: вернуть её можно только руками."""
+    try:
+        stamps = [p.name for p in (cfg.outbox / TRASH).iterdir() if STAMP.fullmatch(p.name)]
+    except OSError:
+        return []
+    found = []
+    for stamp in stamps:
+        try:
+            found.append(entry(stamp, read_note(cfg, stamp)))
+        except FolderError:
+            continue
+    return sorted(found, key=lambda x: x["id"], reverse=True)
+
+
+def unbin(cfg, base, stamp: str, places: list[tuple[Path, Path]], commit) -> None:
+    """Обратный перенос из корзины: places — (что в корзине, куда вернуть). Сначала файлы, потом база:
+    commit() пишет её одной транзакцией, а опись убирается последней перед фиксацией — после фиксации
+    сбоя на диске уже не бывает. Не вышло — файлы назад в корзину, опись на место, созданные для них
+    папки убираются."""
+    note = cfg.outbox / TRASH / stamp / NOTE
+    saved = note.read_bytes()
+    moved: list[tuple[Path, Path]] = []
+    made: list[Path] = []
+    try:
+        for binned_at, place in places:
+            for up in reversed([d for d in place.parents if not d.exists()]):
+                up.mkdir()
+                made.append(up)
+            binned_at.rename(place)
+            moved.append((binned_at, place))
+        with base.write():
+            commit()
+            note.unlink()
+    except BaseException:
+        if not note.exists():
+            note.write_bytes(saved)
+        for binned_at, place in reversed(moved):
+            place.rename(binned_at)
+        for up in reversed(made):
+            _tidy(up)
+        raise
+    for root in (cfg.inbox, cfg.outbox):
+        _tidy(root / TRASH / stamp)
+
+
+def restore(cfg, service, people: users.Users, stamp: str, also=None) -> dict:
+    """Удалённую папку — из корзины на прежнее место: её записи и результаты, строки журнала обработки,
+    отметки поручений, права и признак серии из описи. also(опись) — что ещё записать в базу той же
+    транзакцией: словари, событие журнала. Прежнее место занято или папки выше больше нет — отказ 409.
+    Обработки не будет: строки журнала возвращаются вместе с файлами. Возвращает путь папки и сколько
+    записей вернулось."""
+    note = read_note(cfg, stamp)
+    if "folder" not in note:
+        raise FolderError(404, NOT_IN_TRASH)
+    folder = note["folder"]
+    parent, _, name = folder.rpartition("/")
+    if parent and not (cfg.inbox / parent).is_dir():
+        raise FolderError(409, PARENT_GONE)
+    if (cfg.inbox / folder).exists() or any(_inside(f, folder) for f in service.ledger.records):
+        raise FolderError(409, FOLDER_TAKEN)
+    if (cfg.outbox / folder).exists():
+        raise FolderError(409, RESULTS_TAKEN)
+    places = [(root / TRASH / stamp / name, root / folder) for root in (cfg.inbox, cfg.outbox)
+              if (root / TRASH / stamp / name).exists()]
+    if not places:
+        raise FolderError(409, EMPTY_BIN)
+    kept = note.get("kept") or {}
+
+    def commit() -> None:
+        service.ledger.restore(note["records"])
+        for file, saved in (note.get("marks") or {}).items():
+            marks.Store(service.ledger.db).restore(file, saved)
+        people.put_grants(kept.get("grants") or [])
+        for off in kept.get("series_off") or []:
+            series.Store(service.ledger.db).put(off, False)
+        if also:
+            also(note)
+
+    unbin(cfg, service.ledger.db, stamp, places, commit)
+    return {"path": folder, "records": len(note["records"])}
 
 
 def _tidy(bin_dir: Path) -> None:

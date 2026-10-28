@@ -138,6 +138,11 @@ class Settings:
     # Пусто — на любые: протокол совещания уйдёт туда, куда его отправит хозяин записи.
     mail_domains: tuple[str, ...] = ()
 
+    # Webhook «запись готова» (app/webhook.py): куда сервис сам шлёт событие, когда запись дошла до исхода,
+    # и чем подписывает тело. Задаёт администратор сервиса здесь, в .env; без адреса или секрета webhook выключен.
+    webhook_urls: tuple[str, ...] = ()
+    webhook_secret: str = ""
+
     # Вход под учётной записью домена (Active Directory по LDAP) — app/directory.py. Только
     # корпоративный режим. Пароль служебной учётной записи живёт только здесь, из .env:
     # ни в settings.json, ни на странице, ни в логе его нет.
@@ -261,6 +266,8 @@ class Settings:
                                if a.strip()),
             mail_domains=tuple(d.strip().lower().lstrip("@") for d in (os.environ.get("MAIL_DOMAINS") or "").split(",")
                                if d.strip().lstrip("@")),
+            webhook_urls=tuple(u.strip() for u in (os.environ.get("WEBHOOK_URL") or "").split(",") if u.strip()),
+            webhook_secret=(os.environ.get("WEBHOOK_SECRET") or "").strip(),
             ldap_urls=tuple(u.strip() for u in (os.environ.get("LDAP_URL") or "").split(",") if u.strip()),
             ldap_base_dn=(os.environ.get("LDAP_BASE_DN") or "").strip(),
             ldap_bind_dn=(os.environ.get("LDAP_BIND_DN") or "").strip(),

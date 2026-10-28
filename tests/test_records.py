@@ -318,3 +318,103 @@ def test_adopt_moves_results_to_a_file_already_renamed_on_disk_and_refuses_other
     assert records.adopt(cfg, service, FILE, "Снабжение/план.mp4") == "Снабжение/план.mp4"
     assert (cfg.outbox / "Снабжение/план/summary/план.md").is_file() and service.ledger.get(FILE) is None
     assert (cfg.inbox / "Снабжение/план.mp4").read_bytes() == b"video"
+
+
+# ---------- возврат из корзины ----------
+
+def test_deleted_record_comes_back_from_the_trash_without_processing(tmp_path):
+    cfg, service = setup(tmp_path)
+    marks.Store(service.ledger.db).restore(FILE, {"k1": {"who": "Иванов", "task": "Смета", "status": "done",
+                                                         "by": "ivanov", "at": "2026-10-10T10:00:00+03:00"}})
+    before = dict(service.ledger.get(FILE))
+    stamp = records.remove(cfg, service, FILE, "ivanov", also=lambda done: {"uploads": {FILE: "ivanov"}})["trash"]
+    stamp = stamp.rpartition("/")[2]
+    [item] = folders.binned(cfg)
+    assert (item["id"], item["kind"], item["path"], item["by"], item["partial"]) == (stamp, "record", FILE, "ivanov", False)
+    seen = []
+    assert records.restore(cfg, service, stamp, also=seen.append) == FILE
+    assert seen[0]["kept"] == {"uploads": {FILE: "ivanov"}}
+    assert (cfg.inbox / FILE).read_bytes() == b"video"
+    assert (cfg.outbox / "Проекты отдела/план/summary/план.md").is_file()
+    assert service.ledger.get(FILE) == before                          # та же строка: прогонов и расходов не прибавилось
+    assert Ledger(db.Database(cfg.outbox.parent / "state")).get(FILE)["runs"] == 1
+    assert marks.Store(service.ledger.db).load(FILE)["k1"]["status"] == "done"
+    assert not (cfg.inbox / folders.TRASH / stamp).exists() and not (cfg.outbox / folders.TRASH / stamp).exists()
+    assert folders.binned(cfg) == []
+    scan = scanner(cfg, service)
+    scan.scan_once()
+    scan.scan_once()
+    assert scan.queue == [] and scan.pending == {}                  # вернувшаяся запись в обработку не идёт
+    with pytest.raises(records.RecordError) as e:
+        records.restore(cfg, service, stamp)                        # второй раз вернуть нечего
+    assert e.value.status == 404
+
+
+def test_record_is_not_restored_over_a_new_one_or_into_a_gone_folder(tmp_path):
+    cfg, service = setup(tmp_path)
+    stamp = records.remove(cfg, service, FILE, "ivanov")["trash"].rpartition("/")[2]
+    (cfg.inbox / "Проекты отдела/план.mkv").write_bytes(b"new")         # новая запись с тем же названием
+    with pytest.raises(records.RecordError) as e:
+        records.restore(cfg, service, stamp)
+    assert e.value.status == 409 and "на прежнем месте уже есть запись" in e.value.detail
+    (cfg.inbox / "Проекты отдела/план.mkv").unlink()
+    (cfg.inbox / "Проекты отдела").rename(cfg.inbox / "Другое")
+    with pytest.raises(records.RecordError) as e:
+        records.restore(cfg, service, stamp)
+    assert e.value.status == 409 and "папки, в которой это лежало, больше нет" in e.value.detail
+    assert (cfg.inbox / folders.TRASH / stamp / "план.mp4").is_file()       # всё осталось в корзине
+    assert (cfg.outbox / folders.TRASH / stamp / folders.NOTE).is_file() and service.ledger.records == {}
+
+
+def test_restore_that_fails_on_the_database_puts_the_files_back_into_the_trash(tmp_path):
+    cfg, service = setup(tmp_path)
+    stamp = records.remove(cfg, service, FILE, "ivanov")["trash"].rpartition("/")[2]
+    note = (cfg.outbox / folders.TRASH / stamp / folders.NOTE).read_bytes()
+
+    def broken(_):
+        raise sqlite3.OperationalError("database is locked")
+
+    with pytest.raises(sqlite3.OperationalError):
+        records.restore(cfg, service, stamp, also=broken)
+    assert not (cfg.inbox / FILE).exists() and not (cfg.outbox / "Проекты отдела/план").exists()
+    assert (cfg.inbox / folders.TRASH / stamp / "план.mp4").is_file()
+    assert (cfg.outbox / folders.TRASH / stamp / folders.NOTE).read_bytes() == note
+    assert service.ledger.records == {} and Ledger(db.Database(cfg.outbox.parent / "state")).records == {}
+    assert records.restore(cfg, service, stamp) == FILE                 # причина ушла — возвращается
+
+
+def test_tampered_trash_note_does_not_move_files_outside_the_inbox(tmp_path):
+    cfg, service = setup(tmp_path)
+    stamp = records.remove(cfg, service, FILE, "ivanov")["trash"].rpartition("/")[2]
+    path = cfg.outbox / folders.TRASH / stamp / folders.NOTE
+    note = json.loads(path.read_text(encoding="utf-8"))
+    for file in ("../чужое/план.mp4", ".trash/план.mp4", "Проекты отдела/../../план.mp4"):
+        path.write_text(json.dumps({**note, "file": file, "records": [{**note["records"][0], "file": file}]}),
+                        encoding="utf-8")
+        with pytest.raises(records.RecordError) as e:
+            records.restore(cfg, service, stamp)
+        assert e.value.status == 409, file
+    for bad in ("../x", "20261010-101010/../..", ""):
+        with pytest.raises(records.RecordError) as e:
+            records.restore(cfg, service, bad)
+        assert e.value.status == 404
+
+
+def test_runs_of_a_returned_record_follow_it_again_in_the_base_and_in_the_replay(tmp_path):
+    """Прогоны удалённой записи застывают под её путём; возврат из корзины их размораживает — и в базе,
+    и при проигрывании событий (journal.runs). Прогоны другой записи, удалённой с того же пути раньше,
+    остаются застывшими."""
+    from app import journal
+    trail = journal.Journal(db.Database(tmp_path / "state"))
+    run = lambda: trail.write("run", "", file="П/а.mp4", cost=1.0, status="ok")
+    run()
+    trail.write("record_delete", "ivanov", file="П/а.mp4", trash=".trash/20261001-100000")
+    run()
+    trail.write("upload", "petrov", file="П/а.mp4")
+    trail.write("record_delete", "ivanov", file="П/а.mp4", trash=".trash/20261002-100000")
+    trail.write("record_restore", "ivanov", file="П/а.mp4", trash=".trash/20261002-100000",
+                uploads={"П/а.mp4": "petrov"})
+    trail.write("record_rename", "ivanov", file="П/а.mp4", to="П/б.mp4")
+    assert [r["file"] for r in trail.within()] == ["П/а.mp4", "П/б.mp4"]
+    assert [r["file"] for r in journal.runs(trail.read())] == ["П/а.mp4", "П/б.mp4"]
+    assert trail.uploaded == {"П/б.mp4": "petrov"}

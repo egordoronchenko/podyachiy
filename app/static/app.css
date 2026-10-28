@@ -993,6 +993,21 @@ pre.smtperr:empty { display: none; }
   .c2 .hrow button, .c2 .hrow a.linkbtn { min-height: 44px; padding: 6px 12px; }
 }
 
+/* ---------- корзина: окно со страницы записей ---------- */
+#trash .veil { z-index: 30; }
+#trash .modal { width: min(640px, 100%); }
+#trash .modal header { display: flex; align-items: center; gap: 12px; }
+#trash .modal header h2 { margin: 0; flex: 1; font-size: 16px; text-transform: none; letter-spacing: 0; color: var(--ink); }
+#trash .modal .body { padding: 14px 18px 18px; overflow: auto; }
+#trash .keyrow .msg { grid-column: 1 / -1; margin-top: 4px; }
+#trash .keyrow .msg:empty { display: none; }
+#trash .keyrow .kact button { display: inline-flex; align-items: center; gap: 6px; }
+#trash .msg.err::before { content: "Ошибка: "; font-weight: 600; }
+@media (max-width: 560px), (pointer: coarse) {
+  #trash .veil { padding: 10px; }
+  #trash .keyrow .kact button, #trash .row button { min-height: 44px; }
+}
+
 /* ---------- серия совещаний: кнопка в шапке папки и её окно ---------- */
 .c2 .hrow #srbtn { display: inline-flex; align-items: center; gap: 6px; }
 .hrow .sw { padding: 0 7px; border-radius: 999px; font-size: 11.5px; font-weight: 600; line-height: 18px;

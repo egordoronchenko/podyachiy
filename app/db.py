@@ -248,6 +248,26 @@ MIGRATIONS: tuple[tuple[str, ...], ...] = ((
     # Счётчик сессий человека входит в штамп метки входа (users.py): «Выйти везде» увеличивает его,
     # и все прежние метки перестают подходить. У admin из .env строки в users нет — его счётчик в meta.
     "ALTER TABLE users ADD COLUMN sessions INTEGER NOT NULL DEFAULT 0",
+
+    # ---------- напоминания о сроках поручений ----------
+    # Письмо-сводка раз в день: поручения человека со сроком сегодня, завтра и просроченные (notify.py).
+    # Включено, пока человек сам не отключит, — как письмо «запись готова» (notify_ready).
+    "ALTER TABLE users ADD COLUMN notify_due INTEGER NOT NULL DEFAULT 1",
+
+    # ---------- webhook «запись готова» (webhook.py) ----------
+    # Очередь доставки: строка — одно событие одному адресу из WEBHOOK_URL. Доставленное и брошенное после
+    # последней попытки стирается; ждущее переживает перезапуск. Время — секунды Unix.
+    """CREATE TABLE webhook_queue (
+        id TEXT NOT NULL,                       -- id доставки: тот же во всех попытках и у всех адресов
+        url TEXT NOT NULL,
+        event TEXT NOT NULL,                    -- record.ready | record.failed
+        body TEXT NOT NULL,                     -- тело JSON как есть: подпись считается от него
+        created REAL NOT NULL,                  -- когда случилось событие
+        attempts INTEGER NOT NULL DEFAULT 0,    -- сколько попыток не удалось
+        next_at REAL NOT NULL,                  -- когда следующая попытка
+        error TEXT NOT NULL DEFAULT '',         -- чем кончилась последняя
+        PRIMARY KEY (id, url)
+    ) STRICT, WITHOUT ROWID""",
 ),)
 SCHEMA_VERSION = len(MIGRATIONS)
 

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from app import db, dictionary, folders, journal, marks, users, watcher
+from app import db, dictionary, folders, journal, marks, series, users, watcher
 from app.ledger import Ledger
 
 
@@ -366,3 +366,48 @@ def test_new_folder_name_from_a_mac_is_stored_in_one_form(tmp_path):
     nfd = unicodedata.normalize("NFD", "Отчёты й")
     assert folders.rename(cfg, service, people, "Снабжение", nfd) == "Отчёты й"
     assert os.listdir(cfg.inbox / "Отчёты й") == ["вкс.mp4"] and "Отчёты й/вкс.mp4" in service.ledger.records
+
+
+# ---------- возврат из корзины ----------
+
+def test_deleted_folder_comes_back_with_records_rights_series_and_marks(tmp_path):
+    cfg, service, people = setup(tmp_path)
+    series.Store(service.ledger.db).put("Проекты отдела/Сметы", False)
+    marks.Store(service.ledger.db).restore("Проекты отдела/план.mp4", {"k": {"who": None, "task": "Т", "due": "2026-11-01"}})
+    before = {f: dict(r) for f, r in service.ledger.records.items()}
+    done = folders.remove(cfg, service, people, "Проекты отдела", "admin", also=lambda d: {"dictionary": ["словарь"]})
+    stamp = done["trash"].rpartition("/")[2]
+    assert not people.access("ivanov").sees("Проекты отдела")
+    [item] = folders.binned(cfg)
+    assert (item["kind"], item["path"], item["records"]) == ("folder", "Проекты отдела", 2)
+    seen = []
+    assert folders.restore(cfg, service, people, stamp, also=seen.append) == {"path": "Проекты отдела", "records": 2}
+    assert seen[0]["kept"]["dictionary"] == ["словарь"]
+    assert {f: dict(r) for f, r in service.ledger.records.items()} == before
+    assert (cfg.inbox / "Проекты отдела/Сметы/запись.mp4").is_file()
+    assert (cfg.outbox / "Проекты отдела/план/summary/протокол.md").is_file()
+    who = people.access("ivanov")
+    assert who.sees("Проекты отдела") and who.rules("Проекты отдела/Сметы")
+    assert not series.Store(service.ledger.db).on("Проекты отдела/Сметы")
+    assert marks.Store(service.ledger.db).load("Проекты отдела/план.mp4")["k"]["due"] == "2026-11-01"
+    assert folders.binned(cfg) == [] and not (cfg.inbox / folders.TRASH / stamp).exists()
+
+
+def test_folder_is_not_restored_over_a_recreated_one(tmp_path):
+    cfg, service, people = setup(tmp_path)
+    stamp = folders.remove(cfg, service, people, "Проекты отдела", "admin")["trash"].rpartition("/")[2]
+    (cfg.inbox / "Проекты отдела").mkdir()
+    with pytest.raises(folders.FolderError) as e:
+        folders.restore(cfg, service, people, stamp)
+    assert e.value.status == 409 and "на прежнем месте уже есть папка" in e.value.detail
+    assert (cfg.inbox / folders.TRASH / stamp / "Проекты отдела/план.mp4").is_file()
+
+
+def test_rights_of_a_user_deleted_meanwhile_do_not_come_back(tmp_path):
+    cfg, service, people = setup(tmp_path)
+    people.put("petrov", "Петров", "пароль-1234")
+    people.set_access("petrov", "Снабжение", read="only")
+    stamp = folders.remove(cfg, service, people, "Снабжение", "admin")["trash"].rpartition("/")[2]
+    people.delete("petrov")
+    folders.restore(cfg, service, people, stamp)
+    assert people.access("ivanov").sees("Снабжение") and people.get("petrov") is None

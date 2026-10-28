@@ -45,6 +45,8 @@
       <div class="count" id="count" role="status" aria-live="polite">Загружаю…</div>
       <button type="button" class="ghost" id="reset" hidden>Сбросить отбор</button>
       <a class="linkbtn" id="csv" href="/api/v1/tasks.csv" title="Те же строки с тем же отбором — файлом для Excel"></a>
+      <a class="linkbtn" id="ics" href="/api/v1/tasks.ics"
+        title="Поручения с датой срока из того же отбора — событиями на день срока, файлом для Outlook, Google и других календарей. Повторный импорт обновляет события, а не дублирует их"></a>
     </div>
     <div id="list"></div>
   </div>

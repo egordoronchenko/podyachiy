@@ -2678,6 +2678,9 @@ const ACTIONS = {
   record_rename: e => `переименовал запись «${e.file}» в «${e.to.split("/").pop()}»`,
   record_move: e => `перенёс запись «${e.file}» в папку «${e.to.split("/").slice(0, -1).join("/") || "корень"}»`,
   record_delete: e => `удалил запись «${e.file}» в корзину`,
+  record_restore: e => `вернул из корзины запись «${e.file}»`,
+  folder_restore: e => `вернул из корзины папку «${e.folder}», записей: ${e.records}`,
+  due_mail: e => `напоминание о сроках поручений (${e.tasks}) — для ${e.to}`,
   protocol_sent: e => `отправил протокол записи «${e.file}» на почту: ${(e.to || []).join(", ")} — ` +
     ({ pdf: "вложение PDF", docx: "вложение DOCX", none: "без вложения, ссылкой" }[e.format] || e.format) +
     (e.note ? ", с припиской" : "") + ((e.refused || []).length ? `; не ушло: ${e.refused.join(", ")}` : ""),
@@ -2687,8 +2690,10 @@ const ACTIONS = {
     : e.what === "notice" ? `письмо администраторам о заявке на доступ (логин ${e.login}) не ушло`
     : e.what === "link" ? `письмо со ссылкой «задать пароль» для ${e.login} не ушло`
     : e.what === "known" ? `письмо «учётная запись уже есть» для ${e.login} не ушло`
+    : e.what === "due" ? `напоминание о сроках поручений для ${e.to} не ушло`
     : `письмо о записи «${e.file}» для ${e.to} не ушло`) + `: ${e.error}`,
-  notify: e => `${e.ready ? "включил" : "отключил"} себе письма о готовности записей`,
+  notify: e => [e.ready === undefined ? "" : `${e.ready ? "включил" : "отключил"} себе письма о готовности записей`,
+    e.due === undefined ? "" : `${e.due ? "включил" : "отключил"} себе напоминания о сроках поручений`].filter(Boolean).join("; "),
   task_done: e => `отметил выполненным поручение «${e.task}»${e.owner ? ` (${e.owner})` : ""} в записи «${e.file}»`,
   task_reopen: e => `снял отметку «выполнено» с поручения «${e.task}»${e.owner ? ` (${e.owner})` : ""} в записи «${e.file}»`,
   brand_logo: e => `заменил логотип организации (${e.format}, ${e.width}×${e.height})`,

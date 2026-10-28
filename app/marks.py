@@ -19,6 +19,7 @@
 """
 from __future__ import annotations
 
+import datetime
 import hashlib
 import re
 import time
@@ -221,3 +222,78 @@ def stamp(md: str, saved: dict[str, dict]) -> str:
             write(cells, col["статус"], f"выполнено, {day(task['done_at'])}", True)
         lines[n] = "| " + " | ".join(cells) + " |"
     return "\n".join(lines)
+
+
+# ---------- поручения в календарь (ICS, RFC 5545) ----------
+# Событие «на весь день» на дату срока: заданную человеком, а без неё — вычисленную из слов протокола
+# (registry.state: due_date). Поручение без даты срока в календарь не идёт. UID — от пути записи и ключа
+# поручения: повторный импорт того же файла обновляет события, а не дублирует их. Переименовали запись —
+# у её поручений новые UID.
+
+ICS_FOLD = 75                       # октетов в строке, дальше — продолжение с пробела (RFC 5545, 3.1)
+
+
+def ics_text(value: str) -> str:
+    """Значение вида TEXT: обратная косая черта, точка с запятой и запятая — с обратной косой чертой,
+    перевод строки — как \\n; прочие управляющие знаки убираются."""
+    value = value.replace("\r\n", "\n").replace("\r", "\n")
+    value = "".join(c for c in value if c == "\n" or ord(c) >= 32 and c != "\x7f")
+    return (value.replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,")
+            .replace("\n", "\\n"))
+
+
+def ics_fold(line: str) -> str:
+    """Строка длиннее ICS_FOLD октетов — кусками, каждый следующий с пробела в начале. Знак UTF-8 не
+    разрезается: кусок кончается перед ним."""
+    out, chunk, size = [], "", 0
+    for c in line:
+        n = len(c.encode("utf-8"))
+        if size + n > ICS_FOLD:
+            out.append(chunk)
+            chunk, size = " ", 1
+        chunk += c
+        size += n
+    out.append(chunk)
+    return "\r\n".join(out)
+
+
+def _ics_day(iso: str) -> str:
+    return iso.replace("-", "")
+
+
+def ics(rows: list[dict], now: datetime.datetime | None = None) -> str:
+    """Поручения реестра (registry.rows с отметками) — календарь ICS: событие на день срока у каждого
+    поручения с датой срока. В событии — поручение, исполнитель, совещание и ссылка на запись."""
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    stamp = now.astimezone(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    lines = ["BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//Подьячий//Поручения//RU", "CALSCALE:GREGORIAN",
+             "METHOD:PUBLISH", "X-WR-CALNAME:" + ics_text("Поручения")]
+    seen = set()
+    for row in rows:
+        if not row.get("due_date"):
+            continue
+        uid = f"{row['key']}-{hashlib.sha1(row['file'].encode('utf-8')).hexdigest()[:16]}@podyachiy"
+        if uid in seen:                 # одно поручение, записанное в протоколе дважды
+            continue
+        seen.add(uid)
+        start = datetime.date.fromisoformat(row["due_date"])
+        who = row.get("who") or "исполнитель не назван"
+        meeting = (row.get("title") or "").strip() or row["file"].rpartition("/")[2]
+        about = [f"Ответственный: {who}", f"Совещание: {meeting}, {day(row['date'])}" if row.get("date")
+                 else f"Совещание: {meeting}"]
+        if not row.get("due"):
+            about.append(f"Срок по словам протокола: {row.get('due_text') or ''} — дата вычислена сервисом")
+        if row.get("done"):
+            about.append(f"Отмечено выполненным: {row.get('done_by') or ''}, {day(row['done_at'])}"
+                         if row.get("done_at") else "Отмечено выполненным")
+        elif row.get("status"):
+            about.append(f"Статус на совещании: {row['status']}")
+        about.append(f"Запись: {row['link']}")
+        summary = f"{row['task']} — {who}" + (" (выполнено)" if row.get("done") else "")
+        lines += ["BEGIN:VEVENT", f"UID:{uid}", f"DTSTAMP:{stamp}",
+                  f"DTSTART;VALUE=DATE:{_ics_day(start.isoformat())}",
+                  f"DTEND;VALUE=DATE:{_ics_day((start + datetime.timedelta(days=1)).isoformat())}",
+                  "SUMMARY:" + ics_text(summary), "DESCRIPTION:" + ics_text("\n".join(about)),
+                  "URL:" + row["link"], "TRANSP:TRANSPARENT", "END:VEVENT"]
+    lines.append("END:VCALENDAR")
+    return "".join(ics_fold(line) + "\r\n" for line in lines)

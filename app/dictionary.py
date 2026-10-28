@@ -384,3 +384,21 @@ class Store:
     def drop_record(self, file: str) -> None:
         with self.db.write() as con:
             con.execute("DELETE FROM dictionaries WHERE scope = ? AND path = ?", (RECORDS, file))
+
+    def taken(self, file: str = "", folder: str = "") -> list[dict]:
+        """Строки словарей, которые уйдут вместе с удалённой записью (file) или папкой (folder: её, её
+        подпапок и записей), как они лежат в базе, — в опись корзины, чтобы вернуть их вместе с ней."""
+        if file:
+            rows = self.db.rows("SELECT * FROM dictionaries WHERE scope = ? AND path = ?", RECORDS, file)
+        else:
+            rows = self.db.rows(f"SELECT * FROM dictionaries WHERE {db.below('path')} ORDER BY scope, path",
+                                *db.span(folder))
+        return [dict(row) for row in rows]
+
+    def put_back(self, rows: list[dict]) -> None:
+        """Словари из описи корзины — назад, как были: с автором и временем правки."""
+        with self.db.write() as con:
+            con.executemany("INSERT OR REPLACE INTO dictionaries (scope, path, people, terms, author, at, changed) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                            [(r["scope"], r["path"], r["people"], r["terms"], r["author"], r["at"], r["changed"])
+                             for r in rows])

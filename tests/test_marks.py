@@ -391,3 +391,42 @@ def test_registry_sorts_by_set_dates_first_and_finds_the_overdue(tmp_path):
     file.put_due(tasks, key_of("Согласовать"), "2026-10-20", "ivanov")
     block = registry.block(record, marks.merged(tasks, file.load()))
     assert "Согласовать смету по складу; срок: 20.10.2026; статус: в работе" in block and "до пятницы" not in block
+
+
+
+# ---------- календарь ICS ----------
+
+def _row(**over):
+    return {"key": "677770baf98235ca", "file": "Проекты/вкс.mp4", "who": "Иванов Иван", "task": "Согласовать смету",
+            "title": "Планёрка", "date": "2026-10-09", "due": "2026-10-16", "due_date": "2026-10-16", "due_text": None,
+            "status": None, "done": False, "done_by": None, "done_at": None, "link": "http://podyachiy.test/?open=x", **over}
+
+
+def _unfold(text):
+    return text.replace("\r\n ", "")
+
+
+def test_ics_has_an_all_day_event_with_a_stable_uid_per_task_with_a_due_date():
+    now = __import__("datetime").datetime(2026, 10, 28, 9, 0, tzinfo=__import__("datetime").timezone.utc)
+    text = marks.ics([_row(), _row(), _row(key="другой", due=None, due_date=None),
+                      _row(key="словами", due=None, due_date="2026-10-17", due_text="до пятницы")], now)
+    assert text.startswith("BEGIN:VCALENDAR\r\nVERSION:2.0\r\n") and text.endswith("END:VCALENDAR\r\n")
+    assert "\n" not in text.replace("\r\n", "")                  # строки — только через CRLF
+    events = _unfold(text).split("BEGIN:VEVENT")[1:]
+    assert len(events) == 2                                          # повтор — одно событие, без срока — ни одного
+    assert "DTSTART;VALUE=DATE:20261016\r\nDTEND;VALUE=DATE:20261017" in events[0]
+    assert "DTSTAMP:20261028T090000Z" in events[0] and "URL:http://podyachiy.test/?open=x" in events[0]
+    uid = next(line for line in events[0].split("\r\n") if line.startswith("UID:"))
+    assert uid in _unfold(marks.ics([_row(task="Согласовать смету")]))      # тот же файл заново — тот же UID
+    assert "Срок по словам протокола: до пятницы — дата вычислена сервисом" in events[1]
+
+
+def test_ics_escapes_text_and_folds_long_lines_at_75_octets():
+    assert marks.ics_text("а,б;в\\г\nд\r\nе\x07") == "а\\,б\\;в\\\\г\\nд\\nе"
+    text = marks.ics([_row(task="Смета, акт; " + "длинное поручение " * 20)])
+    lines = text.split("\r\n")
+    assert all(len(line.encode("utf-8")) <= 75 for line in lines)
+    assert any(line.startswith(" ") for line in lines)
+    for line in lines:
+        line.encode("utf-8").decode("utf-8")                         # знак UTF-8 не разрезан
+    assert "SUMMARY:Смета\\, акт\\; длинное" in _unfold(text)

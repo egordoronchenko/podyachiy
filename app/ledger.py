@@ -215,6 +215,19 @@ class Ledger:
             self._touch()
             return self.records.pop(rel)
 
+    def restore(self, records: list[dict]) -> None:
+        """Записи вернули из корзины: их строки — назад в журнал такими, какими они были при удалении.
+        Не put: прогона не было, счётчики прогонов и потраченное остаются как есть."""
+        with self.db.write() as con, self._lock:
+            for record in records:
+                if record["file"] in self.records:
+                    raise KeyError(record["file"])
+                self._store(con, record)
+            if records:
+                self._touch()
+            for record in records:
+                self.records[record["file"]] = record
+
     def _touch(self) -> None:
         """Память сейчас изменится вслед за базой: если транзакция откатится, память
         перечитывается из базы."""

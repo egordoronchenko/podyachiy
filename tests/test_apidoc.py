@@ -149,7 +149,7 @@ def test_openapi_lists_the_external_api_and_nothing_internal(stand):
     spec = guest.get("/api/v1/openapi.json").json()
     described = {(m, p) for m, p, _ in operations(spec)}
     v1 = {(m, p) for m, p in T.api_routes(web) if p.startswith("/api/v1")}
-    assert len(v1) == 25 and described == v1 | T.MANAGE_KEY | ALSO_OUTSIDE
+    assert len(v1) == 26 and described == v1 | T.MANAGE_KEY | ALSO_OUTSIDE
     assert described.isdisjoint(T.PAGE_ONLY) and described <= set(T.api_routes(web))
     for method, path, item in operations(spec):
         assert (item["x-key"] == "manage") == ((method, path) in T.MANAGE_KEY), f"{method} {path}"
@@ -387,3 +387,47 @@ def test_api_page_is_served_without_login_and_needs_no_internet(stand):
     # ссылки на раздел: справка (оглавление и «Интеграция с ИИ») и окно «Ключи доступа»
     assert guest.get("/help").text.count('href="/api"') >= 2
     assert 'href="/api"' in guest.get("/static/common.js").text
+
+
+# ---------- платные методы ----------
+
+# К платной обработке ведут две вещи: задание в очереди обработчиков и новый файл во входной папке (его
+# сервис возьмёт сам). Метод платный, если его обработчик доходит до них — сам или через функции web.py.
+PAID_CALLS = {"service.enqueue_manual", "upload.append", "upload.stream_finish"}
+# Платные адреса страниц: в описании API их нет, у каждого есть двойник в /api/v1.
+PAID_PAGES = {("PUT", "/api/upload"), ("POST", "/api/admin/names"), ("POST", "/api/dictionary")}
+
+
+def paid_routes() -> set[tuple[str, str]]:
+    """Адреса web.py, чей обработчик может привести к платной обработке, — по самому коду."""
+    tree = ast.parse((ROOT / "app" / "web.py").read_text(encoding="utf-8"))
+    uses, routes = {}, {}
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        uses[node.name] = {f"{n.value.id}.{n.attr}" if isinstance(n, ast.Attribute) else n.id
+                           for n in ast.walk(node) if isinstance(n, ast.Name)
+                           or isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)}
+        for d in node.decorator_list:
+            if (isinstance(d, ast.Call) and isinstance(d.func, ast.Attribute) and getattr(d.func.value, "id", "") == "app"
+                    and d.func.attr in ("get", "post", "put", "delete", "patch")
+                    and d.args and isinstance(d.args[0], ast.Constant)):
+                routes[(d.func.attr.upper(), d.args[0].value)] = node.name
+
+    def paid(name: str, seen: set[str]) -> bool:
+        seen.add(name)
+        return any(use in PAID_CALLS or use in uses and use not in seen and paid(use, seen) for use in uses[name])
+
+    return {route for route, name in routes.items() if paid(name, set())}
+
+
+def test_every_method_that_can_lead_to_paid_processing_is_marked_paid(stand):
+    """x-paid стоит ровно у тех описанных методов, что могут поставить запись в обработку, — по коду web.py,
+    а не по памяти: новый платный путь (ещё одна пересборка, загрузка) без пометки тест покажет."""
+    _, guest, _, _ = stand
+    described = {(m, p): item for m, p, item in operations(guest.get("/api/v1/openapi.json").json())}
+    found = paid_routes()
+    assert {("PUT", "/api/v1/upload"), ("POST", "/api/v1/speakers"), ("PUT", "/api/v1/dictionary"),
+            ("POST", "/api/admin/run")} <= found
+    assert {route for route, item in described.items() if item["x-paid"]} == found & set(described)
+    assert found - set(described) == PAID_PAGES

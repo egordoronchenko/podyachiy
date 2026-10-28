@@ -20,7 +20,8 @@
 переводит на новый путь прогоны, которые к этой записи относятся. Прогоны удалённой записи —
 и всех записей удалённой папки — остаются под последним путём и дальше не переезжают
 (runs.settled): по тому же пути позже может лечь другая запись или папка, и её переименование
-не должно утащить за собой чужие расходы.
+не должно утащить за собой чужие расходы. В runs.settled при этом — номер события удаления: запись или
+папку вернули из корзины — её прогоны по этому номеру снова идут за ней.
 Так же ведётся таблица uploads — кто загрузил запись, лежащую сейчас по этому пути.
 """
 from __future__ import annotations
@@ -35,6 +36,9 @@ from .ledger import CANCELLED
 BUCKETS = ("day", "week", "month", "year")
 EARLIER = "earlier"          # этап для расходов, набежавших до появления журнала
 RECORD_MOVES = ("record_rename", "record_move")     # запись сменила путь: file → to
+# запись или папку вернули из корзины (trash — какую папку корзины, как в событии удаления; uploads — кто
+# загрузил её записи: путь → логин, из описи корзины)
+RESTORES = ("record_restore", "folder_restore")
 # поля прогона, у которых в базе свои столбцы и таблицы; прочие поля события лежат в events.data
 RUN_FIELDS = ("at", "kind", "by", "file", "uploaded_by", "reason", "status", "started_at", "audio_sec",
               "cost", "stages", "providers", "runs")
@@ -85,10 +89,11 @@ class Journal:
         file, folder = _text(fields.get("file")), _text(fields.get("folder"))
         if folder is None and file is not None:
             folder = file.rpartition("/")[0]
-        con.execute("INSERT INTO events (at, kind, actor, file, folder, login, data) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (event["at"], event["kind"], event.get("by") or "", file, folder, _text(fields.get("login")),
-                     json.dumps(fields, ensure_ascii=False)))
-        self._follow(con, event)
+        number = con.execute(
+            "INSERT INTO events (at, kind, actor, file, folder, login, data) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (event["at"], event["kind"], event.get("by") or "", file, folder, _text(fields.get("login")),
+             json.dumps(fields, ensure_ascii=False))).lastrowid
+        self._follow(con, event, number)
 
     def _insert_run(self, con, event: dict) -> None:
         run = _with_money(event)
@@ -114,8 +119,10 @@ class Journal:
                         [(number, n, s["provider"], s["currency"], float(s["cost"]))
                          for n, s in enumerate(run["providers"])])
 
-    def _follow(self, con, event: dict) -> None:
-        """Что событие меняет в путях: кто загрузил запись и под каким путём числятся её прогоны."""
+    def _follow(self, con, event: dict, number: int) -> None:
+        """Что событие меняет в путях: кто загрузил запись и под каким путём числятся её прогоны.
+        number — номер этого события: прогоны удалённого застывают с ним (runs.settled), и возврат из
+        корзины по нему находит именно их."""
         kind, file, to = event["kind"], _text(event.get("file")), _text(event.get("to"))
         if kind == "upload" and file is not None:
             con.execute("INSERT INTO uploads (path, actor) VALUES (?, ?) ON CONFLICT (path) DO UPDATE SET "
@@ -131,12 +138,22 @@ class Journal:
         elif kind == "record_delete" and file is not None:
             # по этому пути потом может лечь другая запись — прежний автор и прежние расходы к ней не относятся
             con.execute("DELETE FROM uploads WHERE path = ?", (file,))
-            con.execute("UPDATE runs SET settled = 1 WHERE path = ?", (file,))
+            con.execute("UPDATE runs SET settled = ? WHERE settled = 0 AND path = ?", (number, file))
         elif kind == "folder_delete" and _text(event.get("folder")) is not None:
             # то же для всех записей папки: потом может появиться новая папка с тем же именем
             folder = event["folder"]
             con.execute(f"DELETE FROM uploads WHERE {db.below('path')}", db.span(folder))
-            con.execute(f"UPDATE runs SET settled = 1 WHERE {db.below('path')}", db.span(folder))
+            con.execute(f"UPDATE runs SET settled = ? WHERE settled = 0 AND {db.below('path')}",
+                        (number, *db.span(folder)))
+        elif kind in RESTORES and _text(event.get("trash")) is not None:
+            # вернули из корзины: прогоны, застывшие при том удалении, снова идут за записью, автор — снова её
+            deleted = con.execute("SELECT id FROM events WHERE kind IN ('record_delete', 'folder_delete') "
+                                  "AND json_extract(data, '$.trash') = ? ORDER BY id DESC LIMIT 1",
+                                  (event["trash"],)).fetchone()
+            if deleted is not None:
+                con.execute("UPDATE runs SET settled = 0 WHERE settled = ?", (deleted[0],))
+            con.executemany("INSERT INTO uploads (path, actor) VALUES (?, ?) ON CONFLICT (path) DO UPDATE SET "
+                            "actor = excluded.actor", list((event.get("uploads") or {}).items()))
 
     def run(self, record: dict, by: str, reason: str) -> dict:
         """Прогон записи закончился — сколько он стоил и кому его отнести. Прогон, отменённый
@@ -162,6 +179,15 @@ class Journal:
     def uploader(self, file: str) -> str:
         """Кто загрузил запись; пусто — неизвестно: файл положили мимо страницы."""
         return self.db.value("SELECT actor FROM uploads WHERE path = ?", file) or ""
+
+    def kept(self, file: str = "", folder: str = "") -> dict[str, str]:
+        """Кто загрузил удаляемую запись (file) или записи удаляемой папки (folder): путь → логин —
+        в опись корзины. Удаление их забывает, возврат по описи возвращает (событие из RESTORES)."""
+        if file:
+            rows = self.db.rows("SELECT path, actor FROM uploads WHERE path = ?", file)
+        else:
+            rows = self.db.rows(f"SELECT path, actor FROM uploads WHERE {db.below('path')}", *db.span(folder))
+        return {row["path"]: row["actor"] for row in rows}
 
     @property
     def uploaded(self) -> dict[str, str]:
@@ -273,6 +299,7 @@ def runs(events: list[dict]) -> list[dict]:
     должно утащить за собой чужие расходы."""
     out: list[dict] = []
     settled: set[int] = set()       # номера прогонов удалённых записей и папок
+    binned: dict[str, set[int]] = {}    # папка корзины → какие прогоны застыли при этом удалении
     for event in events:
         kind = event["kind"]
         if kind == "run":
@@ -284,10 +311,14 @@ def runs(events: list[dict]) -> list[dict]:
             for n, run in enumerate(out):
                 if n not in settled and run["file"] == event["file"]:
                     run["file"] = event["to"]
-        elif kind == "record_delete":
-            settled.update(n for n, run in enumerate(out) if run["file"] == event["file"])
-        elif kind == "folder_delete":
-            settled.update(n for n, run in enumerate(out) if run["file"].startswith(event["folder"] + "/"))
+        elif kind in ("record_delete", "folder_delete"):
+            hit = ((lambda f: f == event["file"]) if kind == "record_delete"
+                   else (lambda f: f.startswith(event["folder"] + "/")))
+            now = {n for n, run in enumerate(out) if n not in settled and hit(run["file"])}
+            settled |= now
+            binned[event.get("trash") or ""] = now
+        elif kind in RESTORES:
+            settled -= binned.pop(event.get("trash") or "", set())
     return out
 
 

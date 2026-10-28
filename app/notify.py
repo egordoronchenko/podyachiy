@@ -27,20 +27,34 @@
 
 Автор загрузки известен, если запись загружена через страницу или ключом (journal.uploaded).
 У файла, положенного в папку руками, автора нет — и письма нет.
+
+Напоминания о сроках поручений. Раз в день, после REMIND_HOUR по часам сервера, каждому, у кого в
+сервисе есть почта и кто напоминания не отключил (users.notify_due), уходит одно письмо-сводка: его
+незакрытые поручения с просроченным сроком, со сроком сегодня и завтра — только из папок, которые ему
+открыты. Просроченное — как на странице «Поручения»: дата срока, заданная человеком, прошла. Сегодня и
+завтра — по дате срока, заданной человеком, а без неё — вычисленной из слов протокола («до пятницы»).
+Нечего напомнить — письма нет. Чьё поручение — по ФИО исполнителя в протоколе (assigned): та же
+фамилия отдельным словом, а имя, отчество или инициалы, если они там есть, не расходятся с ФИО в учётной
+записи. Тот же способ, что «какие на мне поручения» — отбор реестра по фамилии, — только строже: «Иванова»
+Иванову не напоминают. Второй раз за день письма нет: день последней рассылки помнит база (web.py).
 """
 from __future__ import annotations
 
+import datetime
 import re
 from pathlib import PurePosixPath
 from urllib.parse import quote, urlencode
 
-from . import external, users
+from . import dictionary, external, marks, users
 from .ledger import MAX_FAILURES, RETRY_STATUSES, said
 
 READY, FAILED = "ready", "failed"
 AUTO = ("new", "retry")             # сервис взял запись сам
 BRIEF_MAX = 2000                    # «Кратко» длиннее этого в письмо не идёт: вместо него суть записи одной строкой
 RECIPIENTS_MAX = 20                 # получателей протокола за одну отправку
+REMIND_HOUR = 8                     # напоминания о сроках уходят после этого часа по часам сервера
+REMIND_MAX = 50                     # поручений одного раздела в письме; остальное — на странице «Поручения»
+OVERDUE, TODAY, TOMORROW = "overdue", "today", "tomorrow"
 
 
 def retrying(record: dict) -> bool:
@@ -158,4 +172,63 @@ def recipients(typed: str, domains: tuple[str, ...]) -> list[str]:
         raise AddressError("протокол можно отправлять только на адреса почтовых доменов "
                            f"{', '.join(domains)}; не подходят: {', '.join(foreign)}. "
                            "Список доменов задаёт администратор сервиса (MAIL_DOMAINS)")
+    return found
+
+
+# ---------- напоминания о сроках поручений ----------
+
+def _readings(name: str) -> list[tuple[str, list[str]]]:
+    """Как прочесть ФИО учётной записи: (фамилия, [имя, отчество]) — словами в виде marks.norm.
+    Обычно фамилия первая («Иванов Иван Петрович»); «Иван Петрович Иванов» узнаётся по отчеству,
+    а у двух слов («Иван Иванов») годятся оба прочтения."""
+    raw, words = name.split(), marks.norm(name).split()
+    if not words:
+        return []
+    if len(raw) == 3 == len(words) and dictionary._PATRONYMIC_RE.search(raw[1]):
+        return [(words[2], words[:2])]
+    found = [(words[0], words[1:])]
+    if len(words) == 2:
+        found.append((words[1], words[:1]))
+    return found
+
+
+def assigned(who: str | None, name: str) -> bool:
+    """Поручение с исполнителем who (как он записан в протоколе) — этого человека (ФИО name)? Фамилия —
+    отдельным словом; остальные слова — его имя или отчество, буквы — их инициалы по порядку."""
+    words = marks.norm(who).split()
+    for surname, given in _readings(name):
+        if surname not in words:
+            continue
+        rest = [w for w in words if w != surname]
+        full, initials = [w for w in rest if len(w) > 1], [w for w in rest if len(w) == 1]
+        if given and any(w not in given for w in full):
+            continue
+        if all(n >= len(given) or w == given[n][0] for n, w in enumerate(initials)):
+            return True
+    return False
+
+
+def surname(name: str) -> str:
+    """Фамилия из ФИО учётной записи, как она написана, — отбору «Поручений» в ссылке письма."""
+    raw = name.split()
+    if len(raw) == 3 and dictionary._PATRONYMIC_RE.search(raw[1]):
+        return raw[2]
+    return raw[0] if raw else ""
+
+
+def reminders(rows: list[dict], today: str) -> dict[str, list[dict]]:
+    """Что напомнить из строк реестра поручений (registry.rows): незакрытые просроченные, со сроком
+    сегодня и завтра. Одно поручение записи, стоящее в протоколе дважды, — один раз."""
+    tomorrow = (datetime.date.fromisoformat(today) + datetime.timedelta(days=1)).isoformat()
+    found: dict[str, list[dict]] = {OVERDUE: [], TODAY: [], TOMORROW: []}
+    seen = set()
+    for row in rows:
+        if not row["open"] or (row["file"], row["key"]) in seen:
+            continue
+        part = (OVERDUE if row["overdue"] else TODAY if row["due_date"] == today
+                else TOMORROW if row["due_date"] == tomorrow else None)
+        if part:
+            seen.add((row["file"], row["key"]))
+            found[part].append(row)
+    found[OVERDUE].sort(key=lambda r: (r["due"], r["date"]))
     return found

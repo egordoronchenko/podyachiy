@@ -760,6 +760,114 @@ function plural(n, one, few, many) {
 }
 
 
+/* ---------- корзина ----------
+   Удалённые записи и папки, которые человек может вернуть: запись — хозяин её папки, папку —
+   администратор сервиса. «Вернуть» — сразу, без подтверждения: действие обратимо, вернувшееся
+   снова удаляют. Итог — строкой под списком (aria-live), отказ — под строкой той записи (role="alert").
+   Обработка при возврате не запускается: протокол и расшифровка возвращаются с диска. */
+let trashOpen = false, trashItems = [], trashKeep = 30, trashDone = null;
+
+const trashWhere = item => item.dir ? `в папке «${item.dir}»` : "в корне";
+const trashBack = item => item.dir ? `в папку «${item.dir}»` : "в корень";
+
+function closeTrash() {
+  if (!trashOpen) return;
+  trashOpen = false;
+  const box = document.getElementById("trash");
+  box.hidden = true;
+  box.innerHTML = "";
+  document.getElementById("trbtn").focus();
+}
+
+function drawTrash(focusId) {
+  const box = document.getElementById("trash");
+  box.hidden = false;
+  const rows = trashItems.map((item, i) => `<li class="keyrow">
+      <div class="kmain"><b>${esc(item.kind === "folder" ? item.name : (item.title || item.name))}</b>
+        <span class="dim">${item.kind === "folder"
+          ? `папка, ${item.records} ${plural(item.records, "запись", "записи", "записей")}` : item.title ? esc(item.name) : ""}</span></div>
+      <div class="kmeta dim">${esc(trashWhere(item))} · удалено ${ruDay(item.at)} ${esc(item.at.slice(11, 16))}${
+        item.by ? ", " + esc(item.by) : ""} · хранится до ${ruDay(item.until)}${item.partial
+          ? " · удалено до версии 1.2.0: вернётся без словаря, прав на папку и автора загрузки" : ""}</div>
+      <div class="kact"><button type="button" data-restore="${i}" id="trgo${i}">${icon("undo", 15)}<span>Вернуть</span></button></div>
+      <div class="msg" id="trmsg${i}"></div>
+    </li>`).join("");
+  box.innerHTML = `<div class="veil" id="trveil"><div class="modal" role="dialog" aria-modal="true" aria-labelledby="trtitle">
+    <header><h2 id="trtitle">Корзина</h2>
+      <button class="ghost icon" id="trclose" aria-label="Закрыть">${icon("close", 15)}</button></header>
+    <div class="body">
+      <p class="klead">Удалённое хранится ${trashKeep} ${plural(trashKeep, "день", "дня", "дней")}, потом стирается само.
+        «Вернуть» кладёт запись или папку на прежнее место со всем, что было: протокол, расшифровка, подписи
+        говорящих, отметки и сроки поручений, словарь, права на папку. Заново ничего не обрабатывается и не оплачивается.</p>
+      ${trashItems.length ? `<ul class="keylist">${rows}</ul>`
+        : `<p class="kempty dim">Здесь нет ничего, что вы можете вернуть. Запись возвращает владелец её папки,
+           папку — администратор сервиса.</p>`}
+      <div class="msg${trashDone ? " " + trashDone.kind : ""}" id="trdone" role="status" aria-live="polite">${
+        trashDone ? esc(trashDone.text) : ""}</div>
+      <div class="row"><button type="button" class="ghost" id="trok">Закрыть</button></div>
+    </div></div></div>`;
+  const target = (focusId && document.getElementById(focusId)) || box.querySelector("[data-restore]")
+    || document.getElementById("trok");
+  target.focus();
+}
+
+async function openTrash() {
+  trashOpen = true;
+  trashDone = null;
+  try {
+    const d = await api("/api/trash");
+    trashItems = d.items;
+    trashKeep = d.keep_days;
+  } catch (e) {
+    trashItems = [];
+    trashDone = { kind: "err", text: "Корзина не открылась: " + e.message };
+  }
+  if (trashOpen) drawTrash();
+}
+
+async function restoreFromTrash(i) {
+  const item = trashItems[i], btn = document.getElementById("trgo" + i);
+  btn.disabled = true;
+  btn.lastElementChild.textContent = "Возвращаю…";
+  try {
+    const d = await api("/api/trash/restore", { id: item.id });
+    trashDone = { kind: "ok", text: d.kind === "folder"
+      ? `Папка «${item.name}» вернулась ${trashBack(item)}, записей в ней: ${d.records}.`
+      : `Запись «${item.title || item.name}» вернулась ${trashBack(item)}.` };
+    trashItems.splice(i, 1);
+    if (trashOpen) drawTrash();
+    load();
+  } catch (e) {
+    btn.disabled = false;
+    btn.lastElementChild.textContent = "Вернуть";
+    const msg = document.getElementById("trmsg" + i);
+    msg.setAttribute("role", "alert");
+    say("trmsg" + i, "err", "Не вернулось: " + e.message);
+  }
+}
+
+document.getElementById("trbtn").onclick = () => (trashOpen ? closeTrash() : openTrash());
+const trashBox = document.getElementById("trash");
+let trashDownOnVeil = false;
+trashBox.addEventListener("mousedown", e => { trashDownOnVeil = e.target.id === "trveil"; });
+trashBox.addEventListener("click", e => {
+  if (e.target.closest("#trclose, #trok") || (e.target.id === "trveil" && trashDownOnVeil)) return closeTrash();
+  const go = e.target.closest("[data-restore]");
+  if (go && !go.disabled) restoreFromTrash(+go.dataset.restore);
+});
+// Escape закрывает корзину, а не запись под ней; Tab ходит по кругу внутри окна
+addEventListener("keydown", e => {
+  if (!trashOpen || trashBox.hidden) return;
+  if (e.key === "Escape") { e.stopPropagation(); closeTrash(); return; }
+  if (e.key !== "Tab") return;
+  const stops = [...trashBox.querySelectorAll("button:not(:disabled)")];
+  const first = stops[0], last = stops[stops.length - 1];
+  if (!trashBox.contains(document.activeElement)) { e.preventDefault(); first.focus(); }
+  else if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+  else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+}, true);
+
+
 document.addEventListener("click", e => {
   const link = e.target.closest("[data-go]");
   if (!link) return;

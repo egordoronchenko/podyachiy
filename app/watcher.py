@@ -24,7 +24,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
 
-from . import folders, marks, media, notify, pipeline, records, upload
+from . import folders, marks, media, notify, pipeline, records, upload, webhook
 from .config import Settings
 from .journal import Journal
 from .ledger import CANCELLED, MAX_FAILURES, RETRY_AFTER_SEC, RETRY_STATUSES, SOURCE_CHANGED, SOURCE_STATE, Ledger
@@ -218,6 +218,10 @@ class Service:
     # задаёт сервис): перезапуск их не забывает.
     dropped: dict[str, dict] = field(default_factory=dict)
     keep_dropped: Callable[[dict], None] | None = None
+    # Webhook «запись готова»: (строка журнала обработки, событие webhook.READY | webhook.FAILED). Когда событие
+    # положено, решает webhook.due; задаёт сервис (web.py), зовётся из событийного цикла и не должен его держать:
+    # само событие только ложится в очередь доставки.
+    hook: Callable[[dict, str], None] | None = None
     # Обход входной папки и действия с записью (records.py) друг друга исключают: сканер
     # сверяет файлы на диске с журналом обработки по пути, а переименование меняет и то,
     # и другое не одним шагом. Застань сканер середину — принял бы запись за новую.
@@ -865,7 +869,19 @@ class Service:
             self.log(f"{item.path}: прогон отменён — автоматически не повторяю; нужна — запустите вручную")
             return
         self._say_retry_plan(item.path)
+        self._hook(item, record, prev)
         self._announce(item, record, prev)
+
+    def _hook(self, item: QueueItem, record: dict, prev: dict | None) -> None:
+        """Событие webhook об исходе прогона, если оно положено (webhook.due). Сбой очереди доставки
+        (база не приняла) исход записи не трогает: он уже записан — строка в журнал работы."""
+        kind = webhook.due(record, prev, item.reason) if self.hook else None
+        if kind is None:
+            return
+        try:
+            self.hook(record, kind)
+        except Exception as e:
+            self.log(f"ВНИМАНИЕ: событие webhook по записи {item.path} не поставлено в очередь доставки: {e!r}")
 
     def _announce(self, item: QueueItem, record: dict, prev: dict | None) -> None:
         """Письмо о том, чем кончился прогон, — кому и когда, решает notify.due. Само письмо

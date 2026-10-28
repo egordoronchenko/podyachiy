@@ -17,6 +17,7 @@
 
 Удаление — перенос в ту же корзину, что и у папок (.trash/<метка>/), со сведениями для
 возврата. Расходы в журнале событий остаются: деньги потрачены, удалена запись или нет.
+Возврат (restore) — обратный перенос по описи корзины тем же порядком: файлы, потом база.
 """
 from __future__ import annotations
 
@@ -176,7 +177,8 @@ def adopt(cfg, service, file: str, target: str, also=None) -> str:
 
 def remove(cfg, service, file: str, by: str, also=None) -> dict:
     """Исходник и результаты уходят в корзину, строка — из журнала обработки, вместе с ней —
-    отметки поручений. also(что убрано) — что ещё записать в базу той же транзакцией."""
+    отметки поручений. also(что убрано) — что ещё записать в базу той же транзакцией; что оно вернёт
+    (словарь: словарь записи, автор загрузки), ложится в опись (kept) — для возврата из корзины."""
     record = _known(service, file)
     stem = pipeline.stem_of(cfg.inbox, file, record)
     stamp = folders.trash_stamp(cfg)          # две записи удалили в одну секунду — папки корзины разные
@@ -193,12 +195,11 @@ def remove(cfg, service, file: str, by: str, also=None) -> dict:
         with service.ledger.db.write():
             noted = marks.Store(service.ledger.db).load(file)
             service.ledger.forget(file)
-            if also:
-                also(done)
-            # что это было и откуда — рядом с результатами, чтобы запись можно было вернуть руками.
+            kept = (also(done) or {}) if also else {}
+            # что это было и откуда — рядом с результатами, чтобы запись можно было вернуть кнопкой или руками.
             # До записи базы: не записалась опись — удаления нет, а не «удалено, но отказ 500»
             folders.trash_note(note, {"file": file, "by": by, "at": stamp, "moved": [str(binned) for _, binned in moved],
-                                      "records": [record], "marks": {file: noted} if noted else {}})
+                                      "records": [record], "marks": {file: noted} if noted else {}, "kept": kept})
     except BaseException:
         (note / folders.NOTE).unlink(missing_ok=True)
         for place, binned in reversed(moved):
@@ -207,3 +208,54 @@ def remove(cfg, service, file: str, by: str, also=None) -> dict:
         folders._tidy(note)
         raise
     return done
+
+
+RECORD_TAKEN = ("на прежнем месте уже есть запись с таким именем — переименуйте или перенесите её, "
+                "потом верните удалённую")
+
+
+def restore(cfg, service, stamp: str, also=None) -> str:
+    """Удалённую запись — из корзины на прежнее место: исходник и результаты, строку журнала обработки
+    и отметки поручений из описи. Обработки не будет: строка журнала возвращается вместе с файлом, и
+    сканер принимает его за уже обработанный. also(опись) — что ещё записать в базу той же транзакцией:
+    словарь записи, событие журнала. Прежнее место занято или папки записи больше нет — отказ 409.
+    Возвращает путь записи."""
+    try:
+        note = folders.read_note(cfg, stamp)
+    except folders.FolderError as e:
+        raise RecordError(e.status, e.detail)
+    if "file" not in note:
+        raise RecordError(404, folders.NOT_IN_TRASH)
+    file, record = note["file"], note["records"][0]
+    folder, name = _parent(file), PurePosixPath(file).name
+    stem = pipeline.stem_of(cfg.inbox, file, record)
+    here = cfg.inbox / folder
+    if folder and not here.is_dir():
+        raise RecordError(409, folders.PARENT_GONE)
+    busy = [i.path for i in service.queue] + list(service.pending) + [j["file"] for j in service.running]
+    # то же, что занимает имя при переименовании (_relocate): запись с тем же названием под другим
+    # расширением делила бы с ней папку результатов
+    twins = [p for p in here.iterdir() if p.is_file() and p.suffix.lower() in media.MEDIA_EXTS
+             and p.stem.lower() == stem.lower()]
+    if (file in busy or twins or (cfg.inbox / file).exists() or service.ledger.get(file) is not None
+            or (cfg.outbox / folder / stem).exists()):
+        raise RecordError(409, RECORD_TAKEN)
+    if any(p.is_dir() and p.name.lower() == stem.lower() for p in here.iterdir()):
+        raise RecordError(409, SUBFOLDER_TAKEN)
+    bin_in, bin_out = cfg.inbox / folders.TRASH / stamp, cfg.outbox / folders.TRASH / stamp
+    places = [(binned, place) for binned, place in ((bin_in / name, cfg.inbox / file),
+                                                     (bin_out / stem, cfg.outbox / folder / stem))
+              if binned.exists()]
+    if not places:
+        raise RecordError(409, folders.EMPTY_BIN)
+
+    def commit() -> None:
+        service.ledger.restore([record])
+        saved = (note.get("marks") or {}).get(file)
+        if saved:
+            marks.Store(service.ledger.db).restore(file, saved)
+        if also:
+            also(note)
+
+    folders.unbin(cfg, service.ledger.db, stamp, places, commit)
+    return file

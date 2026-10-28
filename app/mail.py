@@ -1,5 +1,5 @@
-"""Почта сервиса: заявка на доступ, ссылка «задать пароль», пробное письмо, «запись готова»
-и протокол на почту.
+"""Почта сервиса: заявка на доступ, ссылка «задать пароль», пробное письмо, «запись готова»,
+протокол на почту и напоминание о сроках поручений.
 
 Письма уходят через почтовый сервер организации (SMTP), настройки — в .env. Отправка
 блокирующая: зовут её через asyncio.to_thread. Ошибку сервера отдаём как есть — её читает
@@ -442,3 +442,49 @@ def protocol(cfg, sender: str, about: dict, note: str, attached: str) -> tuple[s
             _page("Протокол совещания", [html.escape(lead), *([table] if table else []), *brief_html, *wrote,
                                          html.escape(inside), html.escape(need)],
                   (about["url"], "Открыть запись в сервисе"), foot))
+
+
+# ---------- напоминание о сроках поручений ----------
+# tasks — {"overdue" | "today" | "tomorrow": строки реестра поручений (registry.rows)}, отобранные
+# notify.reminders: поручения человека из открытых ему папок. Сумм в письме нет.
+
+DUE_FOOT = ("Напоминания о сроках поручений приходят раз в день, когда есть о чём напомнить. Отключаются в сервисе: "
+            "меню учётной записи, «Напоминания о сроках».")
+DUE_PARTS = (("overdue", "Просрочено"), ("today", "Срок сегодня"), ("tomorrow", "Срок завтра"))
+
+
+def _day(iso: str | None) -> str:
+    return f"{iso[8:10]}.{iso[5:7]}.{iso[:4]}" if iso else ""
+
+
+def _due_line(row: dict) -> tuple[str, str]:
+    """Поручение одной строкой: что, с какого совещания, срок. Второе — ссылка на запись."""
+    meeting = (row.get("title") or "").strip() or row["file"].rpartition("/")[2]
+    due = _day(row["due"]) if row["due"] else f"{_day(row['due_date'])}, по словам протокола «{row['due_text']}»"
+    return f"{row['task']} — совещание «{meeting}» от {_day(row['date'])}, срок {due}", row["link"]
+
+
+def due_reminder(cfg, name: str, tasks: dict[str, list[dict]], url: str, most: int = 50) -> tuple[str, str, str]:
+    """Человеку: сводка его поручений со сроком — просроченные, сегодня, завтра. url — страница
+    «Поручения» с отбором по нему; most — сколько строк раздела показать, остальное — там."""
+    counts = [(title, len(tasks.get(part) or [])) for part, title in DUE_PARTS]
+    subject = "сроки поручений — " + ", ".join(f"{title.lower()}: {n}" for title, n in counts if n)
+    text = [f"Здравствуйте, {name}!", "", "Поручения на вас, у которых подходит или прошёл срок."]
+    parts_html = [f"Здравствуйте, {html.escape(name)}!", "Поручения на вас, у которых подходит или прошёл срок."]
+    for part, title in DUE_PARTS:
+        rows = tasks.get(part) or []
+        if not rows:
+            continue
+        lines = [_due_line(row) for row in rows[:most]]
+        more = len(rows) - len(lines)
+        text += ["", f"{title} ({len(rows)}):"] + [f"- {line}\n  {link}" for line, link in lines]
+        items = "".join(f'<li style="margin:0 0 6px">{html.escape(line)} — <a href="{html.escape(link, quote=True)}">'
+                        f'открыть запись</a></li>' for line, link in lines)
+        parts_html += [f"<b>{html.escape(title)}: {len(rows)}</b>",
+                       _Block(f'<ul style="margin:0 0 12px;padding-left:20px">{items}</ul>')]
+        if more:
+            text.append(f"- и ещё {more} — на странице «Поручения»")
+            parts_html.append(html.escape(f"И ещё {more} — на странице «Поручения»."))
+    text += ["", f"Все поручения: {url}", "", DUE_FOOT, ""]
+    return (subject, "\n".join(text),
+            _page("Сроки поручений", parts_html, (url, "Открыть поручения"), DUE_FOOT))
