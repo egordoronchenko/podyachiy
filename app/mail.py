@@ -117,12 +117,22 @@ def why_off(cfg) -> str | None:
     return None
 
 
+# Почта включена, а домены не заданы: заявку на доступ подают с любой почтой — на неё после одобрения
+# уйдёт ссылка «задать пароль», — а протокол совещания со страницы записи уходит на любой адрес.
+OPEN_DOMAINS = ("MAIL_DOMAINS не задан: заявку на доступ принимают с любой почтой, и ссылка «задать пароль» "
+                "после одобрения уйдёт на неё, а протокол со страницы записи можно отправить на любой адрес. "
+                "Задайте в .env MAIL_DOMAINS — домен почты организации (несколько — через запятую)")
+
+
 def warnings(cfg) -> list[str]:
     """Что в настройках почты небезопасно — для лога при запуске и блока «Почта»."""
+    found = []
     if cfg.smtp_security == "none" and cfg.smtp_user:
-        return ["SMTP_SECURITY=none при заданном SMTP_USER: логин и пароль почты идут до почтового сервера "
-                "открытым текстом. Задайте SMTP_SECURITY=starttls или ssl"]
-    return []
+        found.append("SMTP_SECURITY=none при заданном SMTP_USER: логин и пароль почты идут до почтового сервера "
+                     "открытым текстом. Задайте SMTP_SECURITY=starttls или ssl")
+    if not cfg.mail_domains:
+        found.append(OPEN_DOMAINS)
+    return found
 
 
 def tls_context(cfg) -> ssl.SSLContext:
@@ -309,6 +319,25 @@ def reset(cfg, name: str, login: str, token: str) -> tuple[str, str, str]:
                         f"Для вашей учётной записи в сервисе {SERVICE} запрошена смена пароля.",
                         name, login, token,
                         "Если вы этого не просили, ничего делать не нужно: прежний пароль продолжает действовать.")
+
+
+def known(cfg, name: str, login: str, domain: bool = False) -> tuple[str, str, str]:
+    """Владельцу ящика: с его почтой подали заявку на доступ, а учётная запись у него уже есть.
+    name — из учётной записи, не из заявки: текст, набранный в открытой форме, в письмо не попадает.
+    domain — учётная запись домена: пароль у неё доменный, сбрасывать здесь нечего."""
+    lead = (f"С этой почтой подана заявка на доступ к сервису {SERVICE}, но учётная запись с ней у вас уже есть. "
+            "Новая заявка не нужна — входите со своим логином.")
+    foot = "Если заявку подавали не вы, ничего делать не нужно: учётная запись не изменилась."
+    if domain:
+        url, forgot = f"{cfg.public_url}/login", "Входите логином и паролем домена — теми же, что на рабочем компьютере."
+    else:
+        url, forgot = (f"{cfg.public_url}/login?forgot",
+                       "Если забыли пароль, пришлём ссылку для нового — на странице входа «Забыл пароль».")
+    text = f"Здравствуйте, {name}!\n\n{lead}\n\nВаш логин: {login}\n\n{forgot}\n{url}\n\n{foot}\n"
+    return ("учётная запись уже есть", text,
+            _page("Учётная запись уже есть", [f"Здравствуйте, {html.escape(name)}!", html.escape(lead),
+                                               f"Ваш логин: <b>{html.escape(login)}</b>", html.escape(forgot)],
+                  (url, "Войти" if domain else "Забыл пароль"), foot))
 
 
 def probe(cfg) -> tuple[str, str, str]:

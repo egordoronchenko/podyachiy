@@ -245,7 +245,7 @@ def test_link_sets_the_password_once(tmp_path):
     with pytest.raises(users.UserError, match="короче"):
         s.use_link(token, "мало", now=2000)
     assert s.link_owner(token, now=2000) == "sidorov"                # слабый пароль ссылку не гасит
-    assert s.use_link(token, "пароль-из-письма", now=2000) == "sidorov"
+    assert s.use_link(token, "пароль-из-письма", now=2000) == ("sidorov", 0)
     assert s.verify("sidorov", "пароль-из-письма") and "link" not in s.users["sidorov"]
     assert s.link_owner(token, now=2000) is None
     with pytest.raises(users.UserError, match="недействительна"):
@@ -629,3 +629,75 @@ def test_key_uploads_only_where_its_owner_may(tmp_path):
     assert s.by_key(token).sees("Проекты") and not s.by_key(token).uploads("Проекты") and not s.by_key(token).uploader
     s.set_access("ivanov", "Проекты", upload="tree")
     assert s.by_key(token).uploads("Проекты/Сметы")                     # право выдали — ключ его получил сразу
+
+
+# ---------- штамп сессии, «выйти везде», пароль и ключи, одинаковое время сверки ----------
+
+def _stamp_of(token: str) -> str:
+    import base64
+    return base64.urlsafe_b64decode(token.split(".")[0]).decode("utf-8").split("|")[2]
+
+
+def test_session_stamp_reveals_nothing_about_the_password(tmp_path):
+    """В метке входа штамп виден всякому, у кого есть кука: по нему нельзя перебирать пароль
+    вне сервиса. Это подпись секретом сервиса, а не хеш пароля, — и у admin из .env, и у
+    пользователя из базы; другой ключ подписи — другой штамп."""
+    import hashlib
+    s = store(tmp_path / "one", admin="секрет-админа")
+    s.put("ivanov", "Иванов", "пароль-1234")
+    other = store(tmp_path / "two", admin="секрет-админа")
+    other.put("ivanov", "Иванов", "пароль-1234")
+    for login in ("admin", "ivanov"):
+        stamp = _stamp_of(s.token(login))
+        assert stamp != _stamp_of(other.token(login)) and len(stamp) == 32
+    assert _stamp_of(s.token("admin")) != hashlib.sha256("секрет-админа".encode()).hexdigest()[:16]
+    stored = s.db.value("SELECT password FROM users WHERE login = 'ivanov'")
+    assert _stamp_of(s.token("ivanov")) != hashlib.sha256(stored.encode()).hexdigest()[:16]
+
+
+def test_ending_sessions_makes_every_earlier_token_invalid(tmp_path):
+    """«Выйти везде»: счётчик сессий входит в штамп — прежние метки человека больше не подходят,
+    выданные после — подходят. У admin из .env счётчик в базе (meta), строки в users у него нет.
+    Других людей это не задевает; переживает перезапуск."""
+    s = store(tmp_path)
+    s.put("ivanov", "Иванов", "пароль-1234")
+    s.put("petrov", "Петров", "пароль-1234")
+    for login in ("ivanov", "admin"):
+        old, neighbour = s.token(login), s.token("petrov")
+        s.end_sessions(login)
+        assert s.by_token(old) is None and s.by_token(neighbour).login == "petrov"
+        fresh = s.token(login)
+        assert s.by_token(fresh).login == login and store(tmp_path).by_token(fresh).login == login
+    with pytest.raises(users.UserError, match="такого пользователя нет"):
+        s.end_sessions("nobody")
+
+
+def test_password_change_and_link_can_revoke_the_keys(tmp_path):
+    """Смена пароля и пароль по ссылке по просьбе человека отзывают и его ключи доступа — одной
+    транзакцией с паролем. Без просьбы ключи остаются: на них работают его интеграции."""
+    s = store(tmp_path)
+    s.put("ivanov", "Иванов", "пароль-1234")
+    first, _ = s.issue_key("ivanov", "Cursor")
+    assert s.set_password("ivanov", "пароль-1234", "пароль-5678") == 0 and s.by_key(first)
+    s.issue_key("ivanov", "1С")
+    assert s.set_password("ivanov", "пароль-5678", "пароль-9012", drop_keys=True) == 2
+    assert s.keys("ivanov") == [] and s.by_key(first) is None
+    third, _ = s.issue_key("ivanov", "Claude")
+    link = s.issue_link("ivanov")
+    assert s.use_link(link, "пароль-новый-1", drop_keys=True) == ("ivanov", 1) and s.by_key(third) is None
+    fourth, _ = s.issue_key("ivanov", "Claude")
+    assert s.use_link(s.issue_link("ivanov"), "пароль-новый-2") == ("ivanov", 0) and s.by_key(fourth)
+
+
+def test_unknown_login_costs_the_same_scrypt_as_a_known_one(tmp_path, monkeypatch):
+    """Для неизвестного логина и учётной записи без пароля пароль сверяется с фиктивным хешем:
+    по времени ответа (вход логином и паролем в запросе) не узнать, есть ли такой логин."""
+    s = store(tmp_path)
+    s.put("ivanov", "Иванов", "пароль-1234")
+    s.put("guest", "Гость", invited=True)
+    real, calls = users.hashlib.scrypt, []
+    monkeypatch.setattr(users.hashlib, "scrypt", lambda *a, **kw: calls.append(1) or real(*a, **kw))
+    for login, password, ok in (("ivanov", "пароль-1234", True), ("ivanov", "не тот", False),
+                                ("nobody", "пароль-1234", False), ("guest", "", False), ("guest", "пароль", False)):
+        calls.clear()
+        assert s.verify(login, password) is ok and len(calls) == 1, login

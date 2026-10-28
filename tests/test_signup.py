@@ -41,13 +41,8 @@ def test_bad_fields_are_refused_and_the_field_is_named(tmp_path, name, email, lo
     assert claims.pending() == [] and claims.all() == []
 
 
-def test_taken_login_known_email_and_repeated_request_are_refused(tmp_path):
+def test_repeated_request_is_refused(tmp_path):
     claims, people = stores(tmp_path)
-    people.put("ivanov", "Иванов", "пароль-1234", email="ivanov@example.ru")
-    for email, login, field in (("new@example.ru", "ivanov", "login"), ("Ivanov@example.ru", "ivan", "email")):
-        with pytest.raises(signup.RequestError) as refused:
-            claims.add("Иванов", email, login, "", people)
-        assert refused.value.status == 409 and refused.value.field == field
     claims.add("Сидоров", "sidorov@example.ru", "sidorov", "", people)
     for email, login in (("other@example.ru", "sidorov"), ("sidorov@example.ru", "other")):
         with pytest.raises(signup.RequestError) as refused:
@@ -109,3 +104,35 @@ def test_full_does_not_count_an_attempt():
     limit = signup.Throttle(1)
     assert not limit.full("a", now=0) and not limit.full("a", now=1)
     assert limit.allow("a", now=2) and limit.full("a", now=3)
+
+
+def test_taken_login_and_known_email_get_the_answer_of_any_request(tmp_path):
+    """Заявка не подсказывает, какие логины и почты заведены. Логин занят — заявка ложится
+    администратору как обычная: он поправит логин при одобрении, а человек узнает логин из письма.
+    Почта уже у учётной записи — заявку не сохраняем (Known): владельцу ящика сервис напишет, что
+    учётная запись есть (обращаясь по имени из учётной записи, а не из заявки: текст заявки
+    в чужое письмо не попадает), заявителю ответ тот же, что всем. Без почты в сервисе написать некому —
+    заявка ложится администратору, и он разберётся сам."""
+    claims, people = stores(tmp_path)
+    people.put("ivanov", "Иванов", "пароль-1234", email="ivanov@example.ru")
+    claim = claims.add("Иванов Иван", "new@example.ru", "Ivanov", "", people)
+    assert claim["login"] == "ivanov" and [c["id"] for c in claims.pending()] == [claim["id"]]
+    with pytest.raises(signup.Known) as known:
+        claims.add("Иван", " Ivanov@Example.ru ", "ivan", "", people)
+    assert (known.value.login, known.value.email) == ("ivanov", "ivanov@example.ru")
+    assert len(claims.pending()) == 1
+    quiet = claims.add("Иван", "ivanov@example.ru", "ivan", "", people, email_needed=False)
+    assert quiet["email"] == "ivanov@example.ru" and len(claims.pending()) == 2
+
+
+def test_request_email_is_taken_only_from_the_mail_domains(tmp_path):
+    """MAIL_DOMAINS задан — заявку принимают только с почтой этих доменов: ссылка на пароль после
+    одобрения уйдёт на неё. Домен сверяется целиком, без поддоменов."""
+    claims, people = stores(tmp_path)
+    for email in ("x@gmail.test", "x@sub.example.ru"):
+        with pytest.raises(signup.RequestError) as refused:
+            claims.add("Сидоров", email, "sidorov", "", people, domains=("example.ru", "corp.example"))
+        assert refused.value.status == 400 and refused.value.field == "email"
+        assert "example.ru, corp.example" in refused.value.detail
+    assert claims.add("Сидоров", "Sidorov@Corp.Example", "sidorov", "", people, domains=("example.ru", "corp.example"))
+    assert claims.add("Петров", "", "petrov", "", people, email_needed=False, domains=("example.ru",))

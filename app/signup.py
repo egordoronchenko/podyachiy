@@ -2,8 +2,9 @@
 
 Заявку оставляет человек без учётной записи, прямо со страницы входа. Форма открыта
 без входа, поэтому всё в ней проверяется здесь: длины полей, вид логина (тем же
-правилом, что у администратора) и почты, занятый логин, повтор уже поданной заявки
+правилом, что у администратора) и почты, домен почты, повтор уже поданной заявки
 и предел числа ожидающих — чтобы таблица и почта администратора не росли без конца.
+Какие логины и почты заведены, ответ формы не подсказывает (Requests.add).
 
 Решённые заявки остаются в базе с пометкой — одобрена или отклонена, кем и когда.
 """
@@ -29,6 +30,15 @@ class RequestError(Exception):
         self.status, self.detail, self.field = status, detail, field
 
 
+class Known(Exception):
+    """Почта заявки уже указана у учётной записи login. Заявка не сохраняется, заявитель получает
+    тот же ответ, что и все, а владельцу ящика сервис пишет, что учётная запись у него есть."""
+
+    def __init__(self, login: str, email: str):
+        super().__init__(login)
+        self.login, self.email = login, email
+
+
 class Requests:
     def __init__(self, base: db.Database):
         self.db = base
@@ -48,9 +58,17 @@ class Requests:
         return [self._claim(r) for r in self.db.rows("SELECT * FROM requests WHERE status = ? ORDER BY n", PENDING)]
 
     def add(self, name: str, email: str, login: str, comment: str, people: users.Users,
-            email_needed: bool = True) -> dict:
+            email_needed: bool = True, domains: tuple[str, ...] = ()) -> dict:
         """Новая заявка. email_needed — обязательна ли почта: да, когда сервис шлёт письма
-        (на неё придёт ссылка для входа); без почты в сервисе человек может её не указывать."""
+        (на неё придёт ссылка для входа); без почты в сервисе человек может её не указывать.
+        domains — почтовые домены организации (MAIL_DOMAINS): задан — почта только из них.
+
+        Форма открыта без входа, и ответ не подсказывает, какие логины и почты заведены.
+        Логин занят — заявка ложится как обычная: администратор поправит логин при одобрении,
+        а человек узнает его из письма или от администратора. Почта уже у учётной записи —
+        при почте в сервисе заявка не сохраняется (Known): письмо получит владелец ящика; без почты
+        сообщить ему нечем — заявка ложится, и администратор увидит отказ при одобрении. Логин или
+        почта уже в ожидающей заявке — отказ словами: это не учётная запись, а повтор заявки."""
         name = " ".join(name.split())
         comment = comment.strip()
         if not name:
@@ -65,6 +83,9 @@ class Requests:
             raise RequestError(400, str(e), "email")
         if not email and email_needed:
             raise RequestError(400, "укажите почту: на неё придёт ссылка для входа", "email")
+        if email and domains and email.rpartition("@")[2] not in domains:
+            raise RequestError(400, f"укажите рабочую почту: заявки принимаются с адресов доменов {', '.join(domains)}",
+                               "email")
         try:
             login = users.norm_login(login)
         except users.UserError as e:
@@ -75,14 +96,11 @@ class Requests:
             if len(waiting) >= PENDING_MAX:
                 raise RequestError(503, "сейчас ждёт решения слишком много заявок — попробуйте позже "
                                         "или обратитесь к администратору")
-            if people.source(login) is not None:
-                raise RequestError(409, "такой логин уже занят — выберите другой", "login")
-            if email and people.by_email(email):
-                raise RequestError(409, "учётная запись с такой почтой уже есть — "
-                                        + ("воспользуйтесь ссылкой «Забыл пароль»" if email_needed
-                                           else "обратитесь к администратору"), "email")
             if any(r["login"] == login or (email and r["email"] == email) for r in waiting):
                 raise RequestError(409, "заявка с таким логином или почтой уже подана и ждёт решения администратора")
+            holder = people.by_email(email)
+            if holder and email_needed:
+                raise Known(holder, email)
             claim = {"id": secrets.token_hex(8), "at": now_iso(), "name": name, "email": email,
                      "login": login, "comment": comment, "status": PENDING}
             con.execute("INSERT INTO requests (id, at, name, email, login, comment, status) "

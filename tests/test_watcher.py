@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from app import db, dictionary, pipeline, records, watcher
+from app import db, dictionary, media, pipeline, records, watcher
 from app.ledger import Ledger
 
 
@@ -450,3 +450,211 @@ def test_two_files_copied_into_one_folder_from_a_mac_are_both_taken(tmp_path):
         svc.scan_once()
     assert sorted(i.path for i in svc.queue) == ["Отчёт й/вторая.mp3", "Отчёт й/первая.mp3"]
     assert os.listdir(svc.cfg.inbox) == ["Отчёт й"] and svc.pending == {}
+
+
+# ---------- исходник записи переименован, скопирован, изменён или убран мимо сервиса ----------
+
+class Events(Trail):
+    """Журнал событий, в котором видно ещё и события: переименование записи сервисом."""
+
+    def __init__(self):
+        super().__init__()
+        self.events = []
+
+    def write(self, kind, by="", **fields):
+        self.events.append({"kind": kind, "by": by, **fields})
+
+
+def watched(tmp_path):
+    """Сканер со словарями и журналом событий, как в сервисе; строки журнала работы — в svc.lines."""
+    svc = logged(tmp_path)
+    svc.journal = Events()
+    svc.dictionaries = dictionary.Store(svc.ledger.db)
+    return svc
+
+
+def processed(svc, rel, data=b"video" * 4000, **fields):
+    """Запись обработана так, как её записывает pipeline.process: в журнале — размер исходника, время его
+    изменения и отпечаток содержимого; протокол — в папке результатов."""
+    path = svc.cfg.inbox / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    stem = Path(rel).stem
+    out = svc.cfg.outbox / Path(rel).parent / stem
+    (out / "summary").mkdir(parents=True, exist_ok=True)
+    (out / "summary" / f"{stem}.md").write_text("# Протокол", encoding="utf-8")
+    svc.ledger.put({"file": rel, "stem": stem, "status": "ok", "output": str(out), "cost": {"RUB": 30.0},
+                    "summary": f"summary/{stem}.md", "source_size": len(data), "source_mtime": path.stat().st_mtime,
+                    "source_print": media.fingerprint(path), "finished_at": pipeline.now_iso(), **fields})
+    return path
+
+
+def test_file_renamed_by_hand_in_the_inbox_keeps_its_record_and_is_not_recognised_again(tmp_path):
+    """Файл переименовали или перенесли во входной папке руками, мимо сервиса. Журнал ведётся по пути, и
+    прежде новый путь был новой записью — платное распознавание заново. Теперь отпечаток содержимого
+    совпал с записью, чей исходник пропал: это она же, и она переезжает на новый путь тем же переездом, что
+    кнопка «Переименовать» — с результатами, словарём и событием в журнале."""
+    svc = watched(tmp_path)
+    old = processed(svc, "Проекты/вкс.mp4")
+    svc.dictionaries.put(dictionary.RECORDS, "Проекты/вкс.mp4", [{"name": "Ершова Лидия"}], [], "ivanov")
+    (svc.cfg.inbox / "Архив").mkdir()
+    old.rename(svc.cfg.inbox / "Архив" / "Планёрка.mp4")
+    svc.scan_once()
+    svc.scan_once()
+    assert svc.queue == []                              # в распознавание не идёт
+    svc.settle()
+    new = "Архив/Планёрка.mp4"
+    rec = svc.ledger.get(new)
+    assert svc.ledger.get("Проекты/вкс.mp4") is None and rec["stem"] == "Планёрка" and rec["runs"] == 1
+    assert rec["cost_total"] == {"RUB": 30.0}           # прогона не было
+    assert (svc.cfg.outbox / "Архив/Планёрка/summary/Планёрка.md").is_file()
+    assert not (svc.cfg.outbox / "Проекты/вкс").exists()
+    assert svc.dictionaries.get(dictionary.RECORDS, new)["people"] == [{"name": "Ершова Лидия"}]
+    assert svc.journal.events == [{"kind": "record_move", "by": "", "file": "Проекты/вкс.mp4", "to": new}]
+    assert svc.pending == {}
+    for _ in range(2):
+        svc.scan_once()
+        svc.settle()
+    assert svc.queue == [] and svc.journal.runs == [] and svc.missing == set()
+    assert sum("мимо сервиса" in line for line in svc.lines) == 1
+
+
+def test_copy_of_a_processed_record_waits_for_the_administrator(tmp_path):
+    """Тот же файл ещё раз, в другой папке, а исходник прежней записи на месте — это копия. Распознавать её
+    заново за деньги сервис сам не станет: ждёт, пишет почему и что делать, страница показывает её отложенной."""
+    svc = watched(tmp_path)
+    data = b"audio" * 5000
+    processed(svc, "Проекты/вкс.mp4", data)
+    (svc.cfg.inbox / "Снабжение").mkdir()
+    (svc.cfg.inbox / "Снабжение" / "копия.mp4").write_bytes(data)
+    for _ in range(3):
+        svc.scan_once()
+        svc.settle()
+    assert svc.queue == [] and list(svc.pending) == ["Снабжение/копия.mp4"]
+    assert svc.pending["Снабжение/копия.mp4"].held
+    said = [line for line in svc.lines if "копия записи" in line]
+    assert len(said) == 1 and "Проекты/вкс.mp4" in said[0] and "вручную" in said[0]
+    assert svc.snapshot()["watching"][0]["held"]
+    svc.enqueue_manual("Снабжение/копия.mp4", None, False, "admin", "manual")      # администратор решил: нужна
+    assert [i.path for i in svc.queue] == ["Снабжение/копия.mp4"]
+    # другой файл того же размера — новая запись, как всегда
+    (svc.cfg.inbox / "Снабжение" / "другая.mp4").write_bytes(b"other" * 5000)
+    svc.scan_once()
+    svc.scan_once()
+    assert [i.path for i in svc.queue] == ["Снабжение/копия.mp4", "Снабжение/другая.mp4"]
+
+
+def test_record_processed_before_fingerprints_gets_one_when_it_is_needed(tmp_path):
+    """У записи, обработанной до этой версии, отпечатка нет. Считается он, когда понадобился: пришёл файл
+    того же размера, а исходник записи на месте. Файл того же размера, чей исходник пропал, при неизвестном
+    отпечатке не сличить — его сервис тоже не распознаёт сам."""
+    svc = watched(tmp_path)
+    data = b"audio" * 5000
+    processed(svc, "Проекты/вкс.mp4", data, source_print=None, source_mtime=None)
+    processed(svc, "Проекты/ушла.mp4", b"gone!" * 5000, source_print=None, source_mtime=None).unlink()
+    (svc.cfg.inbox / "копия.mp4").write_bytes(data)
+    (svc.cfg.inbox / "похожая.mp4").write_bytes(b"other" * 5000)
+    for _ in range(2):
+        svc.scan_once()
+        svc.settle()
+    assert svc.queue == [] and sorted(svc.pending) == ["копия.mp4", "похожая.mp4"]
+    assert svc.ledger.get("Проекты/вкс.mp4")["source_print"] == media.fingerprint(svc.cfg.inbox / "копия.mp4")
+    assert any("похожая.mp4" in line and "Проекты/ушла.mp4" in line and "вручную" in line for line in svc.lines)
+
+
+def test_changed_and_missing_source_of_a_processed_record_are_noticed_but_not_paid_for(tmp_path):
+    """Исходник готовой записи докопировали или перезаписали: автоматически заново сервис его не распознаёт,
+    а запоминает «исходник изменился» — для списка записей. Исходник убрали — «исходник отсутствует»."""
+    svc = watched(tmp_path)
+    grown = processed(svc, "Проекты/дописали.mp4")
+    same = processed(svc, "Проекты/перезаписали.mp4")
+    touched = processed(svc, "Проекты/тронули.mp4")
+    processed(svc, "Проекты/убрали.mp4").unlink()
+    with open(grown, "ab") as f:
+        f.write(b"tail")
+    same.write_bytes(b"VIDEO" * 4000)                   # тот же размер, другое содержимое
+    os.utime(same, (same.stat().st_atime, same.stat().st_mtime + 5))
+    os.utime(touched, (touched.stat().st_atime, touched.stat().st_mtime + 5))   # время другое, содержимое то же
+    for _ in range(3):
+        svc.scan_once()
+        svc.settle()
+    assert svc.queue == []
+    state = {rel: rec.get("source_state") for rel, rec in svc.ledger.records.items()}
+    assert state == {"Проекты/дописали.mp4": "changed", "Проекты/перезаписали.mp4": "changed",
+                     "Проекты/тронули.mp4": None, "Проекты/убрали.mp4": None}
+    assert svc.missing == {"Проекты/убрали.mp4"}
+    assert svc.ledger.get("Проекты/тронули.mp4")["source_mtime"] == touched.stat().st_mtime
+    assert sum("изменился после обработки" in line for line in svc.lines) == 2      # по разу на запись
+    # вернули прежний файл — отметки нет
+    grown.write_bytes(b"video" * 4000)
+    os.utime(grown, (grown.stat().st_atime, svc.ledger.get("Проекты/дописали.mp4")["source_mtime"]))
+    svc.scan_once()
+    assert svc.ledger.get("Проекты/дописали.mp4").get("source_state") is None
+
+
+def test_rebuild_from_the_old_transcript_keeps_the_mark_that_the_source_changed(tmp_path, monkeypatch):
+    """Пересборка без force берёт прежнюю расшифровку: протокол по-прежнему описывает прежний файл, и отметка
+    «исходник изменился» остаётся. Полный прогон заново (force) — уже по новому файлу, отметки нет."""
+    svc = watched(tmp_path)
+    path = processed(svc, "вкс.mp4", source_state="changed")
+    path.write_bytes(b"VIDEO" * 4000)
+
+    async def process(cfg, rel, stem, template, force, manual, log, on_progress=None, **kw):
+        src = cfg.inbox / rel
+        return {"file": rel, "stem": stem, "status": "ok", "cost": {}, "finished_at": pipeline.now_iso(),
+                "reused_transcript": not force, "source_size": src.stat().st_size,
+                "source_mtime": src.stat().st_mtime, "source_print": media.fingerprint(src)}
+    monkeypatch.setattr(pipeline, "process", process)
+    before = svc.ledger.get("вкс.mp4")
+    svc.enqueue_manual("вкс.mp4", None, False, "admin", "rebuild")
+    drain(svc)
+    after = svc.ledger.get("вкс.mp4")
+    assert after["source_state"] == "changed" and after["source_print"] == before["source_print"]
+    svc.enqueue_manual("вкс.mp4", None, True, "admin", "manual")
+    drain(svc)
+    after = svc.ledger.get("вкс.mp4")
+    assert after.get("source_state") is None and after["source_print"] == media.fingerprint(path)
+
+
+# ---------- записи и папки под разложенными именами, обработанные до 1.2.0 ----------
+
+def test_records_and_folders_known_under_decomposed_names_move_to_the_composed_form(tmp_path):
+    """Записи и папки, обработанные под разложенным именем (так пишет macOS) до этой версии, жили под ним, а
+    ссылки страницы теперь в составной форме — такая папка на странице не открывалась. При запуске сервис
+    один раз переименовывает их тем же переездом, что кнопки «Переименовать»: исходники, результаты, журнал,
+    словари, права, признак серии — всё под составным именем."""
+    from app import series, users
+    svc = watched(tmp_path)
+    people = users.Users(svc.ledger.db, "секрет")
+    people.put("ivanov", "Иванов", "пароль-1234")
+    people.set_access("ivanov", "Отчёт й", read="tree")         # права выданы со страницы — в составной форме
+    svc.people = people
+    folder, record = nfd("Отчёт й"), nfd("Встреча ё.mp3")
+    processed(svc, f"{folder}/{record}")
+    processed(svc, f"{folder}/план.mp3")
+    processed(svc, record)
+    svc.dictionaries.put(dictionary.FOLDERS, folder, [{"name": "Ершова Лидия"}], [], "ivanov")
+    svc.dictionaries.put(dictionary.RECORDS, record, [{"name": "Петров Пётр"}], [], "ivanov")
+    series.Store(svc.ledger.db).put(folder, False)
+    svc.known_to_nfc()
+    assert sorted(svc.ledger.records) == ["Встреча ё.mp3", "Отчёт й/Встреча ё.mp3", "Отчёт й/план.mp3"]
+    assert sorted(os.listdir(svc.cfg.inbox)) == ["Встреча ё.mp3", "Отчёт й"]
+    assert sorted(os.listdir(svc.cfg.inbox / "Отчёт й")) == ["Встреча ё.mp3", "план.mp3"]
+    assert (svc.cfg.outbox / "Отчёт й/Встреча ё/summary/Встреча ё.md").is_file()
+    assert (svc.cfg.outbox / "Встреча ё/summary/Встреча ё.md").is_file()
+    assert svc.dictionaries.get(dictionary.FOLDERS, "Отчёт й")["people"] == [{"name": "Ершова Лидия"}]
+    assert svc.dictionaries.get(dictionary.RECORDS, "Встреча ё.mp3")["people"] == [{"name": "Петров Пётр"}]
+    assert not series.Store(svc.ledger.db).on("Отчёт й")
+    assert people.access("ivanov").sees("Отчёт й")
+    assert sorted(e["kind"] for e in svc.journal.events) == ["folder_rename", "record_rename", "record_rename"]
+    svc.known_to_nfc()                                          # второй раз — нечего
+    assert len(svc.journal.events) == 3
+
+
+def test_decomposed_record_next_to_its_composed_twin_stays_and_is_said(tmp_path):
+    svc = watched(tmp_path)
+    processed(svc, nfd("Встреча ё.mp3"))
+    processed(svc, "Встреча ё.mp3", b"other" * 4000)
+    svc.known_to_nfc()
+    assert sorted(svc.ledger.records) == sorted(["Встреча ё.mp3", nfd("Встреча ё.mp3")])
+    assert sum("разложенной форме" in line and "оставляю" in line for line in svc.lines) == 1

@@ -141,6 +141,15 @@ function render() {
   renderFiles();
 }
 
+const SOURCE_LABELS = { changed: "исходник изменился", missing: "исходник отсутствует" };
+const SOURCE_HINTS = {
+  changed: "Файл записи во входной папке изменился после обработки: его докопировали или перезаписали. Протокол и " +
+    "расшифровка сделаны по прежнему файлу, заново сервис сам его не распознаёт — это стоило бы денег. Нужно по " +
+    "новому файлу — администратор сервиса запускает запись вручную с перезаписью.",
+  missing: "Файла записи нет во входной папке: его убрали или переименовали мимо сервиса. Протокол и расшифровка на " +
+    "месте, но пересобрать их не выйдет, пока файл не вернут.",
+};
+
 function renderFiles() {
   const busyHere = (data.pending || []).filter(p => !data.path || p.dir === data.path);
   const box = document.getElementById("files");
@@ -150,8 +159,10 @@ function renderFiles() {
     return;
   }
   box.innerHTML = busyHere.map(p => {
-      const label = { copying: "копируется", queued: "в очереди", running: "обрабатывается" }[p.state];
-      const note = p.state === "copying"
+      const label = { copying: "копируется", held: "отложена", queued: "в очереди", running: "обрабатывается" }[p.state];
+      // отложенная (похожа на недокопированную, ждёт решения администратора) — почему, словами от сервиса
+      const note = p.state === "held" ? p.note
+        : p.state === "copying"
         ? `не меняется ${p.quiet_sec} с из ${p.stable_sec}`
         : p.state === "running"
           ? (p.chunks_total ? `часть ${p.chunks_done} из ${p.chunks_total}` : (p.step || "готовлю звук"))
@@ -161,13 +172,17 @@ function renderFiles() {
         <div class="g">${esc(note)}</div>
         ${p.state === "running" && p.chunks_total
           ? `<div class="bar" style="margin-top:4px"><i style="width:${100 * p.chunks_done / p.chunks_total}%"></i></div>` : ""}
-        <div class="m"><span class="badge working">${icon(p.state === "copying" ? "copy" : "clock", 13)}${label}</span></div>
+        <div class="m"><span class="badge ${p.state === "held" ? "no_audio" : "working"}">${
+          icon(p.state === "copying" ? "copy" : p.state === "held" ? "alert" : "clock", 13)}${label}</span></div>
       </div>`;
     }).join("") +
     data.files.map(f => {
       const tags = [];
       if (f.status !== "ok") tags.push(`<span class="badge ${esc(f.status)}">${icon(STATUS_ICONS[f.status] || "alert", 13)}${
         esc(STATUS_LABELS[f.status] || f.status)}</span>`);
+      // файл записи во входной папке: изменился после обработки или пропал — словами на метке, подробно — в подсказке
+      if (f.source) tags.push(`<span class="tag warn" title="${esc(SOURCE_HINTS[f.source] || "")}">${
+        esc(SOURCE_LABELS[f.source] || f.source)}</span>`);
       if (f.speakers_unreliable) tags.push(`<span class="tag warn">метки ненадёжны</span>`);
       if (f.crowded_meeting) tags.push(`<span class="tag warn">многолюдно</span>`);
       if (f.type_unsure) tags.push(`<span class="tag warn" title="${

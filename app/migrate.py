@@ -44,6 +44,20 @@ USER_FIELDS = {"name", "email", "password", "home", "admin", "read", "upload", "
 KEY_FIELDS = ("id", "hash", "prefix", "owner", "name", "kind", "created", "expires", "used")
 CLAIM_FIELDS = {"id", "at", "name", "email", "login", "comment", "status", "decided_at", "decided_by"}
 MARK_FIELDS = {*marks.COLUMNS, "who", "task"}
+# Папки установки, которые должны быть подключены с хоста (тома в compose.yml): поле настроек, как назвать
+# словами, переменная .env и что пропадёт вместе с контейнером, если папка лежит в нём самом. Папка
+# состояния и папка результатов без тома — отказ запуска (open_base), остальные — предупреждение.
+VOLUMES = (
+    ("inbox", "входная папка", "HOST_INBOX", "записи, загруженные через страницу, а положенные на сервер сервис не видит"),
+    ("outbox", "папка результатов", "HOST_OUTBOX", "протоколы и расшифровки, за которые уже заплачено"),
+    ("state_dir", "папка состояния", "HOST_STATE", "база: пользователи, расходы и журнал обработки"),
+    ("backup_dir", "папка резервных копий", "HOST_BACKUP", "резервные копии"),
+    ("prompts_dir", "папка шаблонов", "HOST_PROMPTS", "правки шаблонов протоколов"),
+)
+# Свободного места на томе меньше — предупреждение. Два гигабайта — это несколько часов видео во входной
+# папке или звук и результаты сотни записей; меньше — новая загрузка, протокол или копия могут не уместиться.
+FREE_MIN = 2 * 2 ** 30
+ROOMY = ("inbox", "outbox", "state_dir", "backup_dir")          # чьё свободное место проверяется
 
 
 def human(size: int) -> str:
@@ -62,14 +76,51 @@ def storage_warnings(cfg, storage: dict) -> list[str]:
             "папка и папка результатов на сетевом диске допустимы"]
 
 
-def open_base(cfg, log, kept: bool) -> db.Database:
-    """База сервиса, проверенная и готовая к работе. Нельзя — db.Refusal с причиной."""
+def volume_warnings(cfg, kept=None, room=None) -> list[str]:
+    """Что не так с томами установки — для журнала работы и страницы «Обработка»: папка не подключена с хоста
+    (db.kept) или на её диске мало места (FREE_MIN). Каждое — что не так и что сделать, без путей на диске
+    сервера. Папки на одном диске — одним предупреждением о месте. Зовётся при запуске и раз в сутки.
+    kept и room — для проверок; по умолчанию db.kept и shutil.disk_usage."""
+    kept, room, found = kept or db.kept, room or shutil.disk_usage, []
+    for field, what, env, lost in VOLUMES:
+        if not kept(Path(getattr(cfg, field))):
+            found.append(f"{what} не подключена с хоста — лежит внутри контейнера, и при его пересоздании пропадут "
+                         f"{lost}. Что сделать: верните в compose.yml строку тома с {env} и пересоздайте контейнер "
+                         "(docker compose up -d)")
+    disks: dict[int, tuple[int, list[str]]] = {}
+    for field, what, _, _ in VOLUMES:
+        if field not in ROOMY:
+            continue
+        path = Path(getattr(cfg, field))
+        try:
+            disks.setdefault(os.stat(path).st_dev, (room(path).free, []))[1].append(what)
+        except OSError:
+            continue                    # папки нет (копий ещё не делали) — места на ней не занять
+    for free, names in disks.values():
+        if free < FREE_MIN:
+            found.append(f"на диске, где лежит {', '.join(names)}, свободно {human(free)} — меньше {human(FREE_MIN)}: "
+                         "новая запись, протокол или резервная копия могут не уместиться. Что сделать: освободите "
+                         "место (старые резервные копии, ненужные записи) или перенесите том на диск побольше")
+    return found
+
+
+def open_base(cfg, log, kept: bool, outbox_kept: bool = True) -> db.Database:
+    """База сервиса, проверенная и готовая к работе. Нельзя — db.Refusal с причиной. kept и outbox_kept —
+    подключены ли с хоста папка состояния и папка результатов (db.kept)."""
     state = Path(cfg.state_dir)
     if not kept:
         raise db.Refusal(
             f"папка состояния {state} не подключена с хоста: в ней база сервиса — пользователи, расходы и журнал "
             "обработки. Внутри контейнера она пропала бы при его пересоздании, и все записи пошли бы в "
             "обработку заново, за деньги. Верните в compose.yml строку с HOST_STATE (том /data/state)")
+    if not outbox_kept:
+        # Та же потеря, что у пропавшей базы, с другого конца: журнал обработки говорит «готово», а протоколов
+        # и расшифровок нет — открыть нечего, а пересобрать можно только новым платным распознаванием.
+        raise db.Refusal(
+            f"папка результатов {cfg.outbox} не подключена с хоста: протоколы и расшифровки легли бы внутрь "
+            "контейнера и пропали бы при его пересоздании, а журнал обработки считал бы записи готовыми — "
+            "вернуть их можно было бы только новым распознаванием, за деньги. Верните в compose.yml строку с "
+            "HOST_OUTBOX (том /data/outbox)")
     try:
         state.mkdir(parents=True, exist_ok=True)
     except OSError as e:

@@ -40,6 +40,18 @@ function storageChips(s) {
   return base + copy;
 }
 
+/* Отметка «сервис жив» в базе: когда последняя, сколько работает сервис, сколько обработчиков живо. Отметка
+   старше трёх периодов или мёртвый обработчик — тревожная плашка, со словами, а не только цветом. */
+function beatChip(b) {
+  if (!b) return `<span class="chip">отметок «сервис жив» в базе ещё нет</span>`;
+  const span = sec => sec >= 86400 ? `${Math.floor(sec / 86400)} д ${Math.floor(sec % 86400 / 3600)} ч`
+    : sec >= 3600 ? `${Math.floor(sec / 3600)} ч ${Math.floor(sec % 3600 / 60)} мин` : `${Math.max(0, Math.round(sec / 60))} мин`;
+  const late = b.ago_sec > 3 * b.every_sec, dead = b.workers < b.of;
+  return `<span class="chip${late || dead ? " alarm" : ""}" title="Сервис раз в ${b.every_sec} с отмечается в базе: так видно, жив ли он">${
+    late || dead ? icon("alert", 14) + " " : ""}отметился <b>${b.ago_sec} с назад</b>${late ? " — давно" : ""}, работает <b>${
+    span(b.uptime_sec || 0)}</b>, обработчиков <b>${b.workers} из ${b.of}</b>${dead ? " — часть остановилась" : ""}</span>`;
+}
+
 function render() {
   const c = state.config, t = state.totals, by = t.by_status || {};
 
@@ -53,10 +65,13 @@ function render() {
     `<span class="chip">модели <b>${esc(c.speech_model)}</b> + <b>${esc(c.summary_model)}</b></span>`,
     c.key_present ? "" : `<span class="chip alarm">${icon("alert", 14)} ключ API не задан</span>`,
     storageChips(state.storage),
+    beatChip(state.heartbeat),
   ].join("");
   // предупреждения о хранении: текстом и значком, не только цветом; меняются редко — перерисовываются только при смене
   const stored = state.storage.warnings.map(w => `<div class="nhint warn lines" role="alert">${icon("alert", 14)}<span><b>Внимание:</b> ${esc(w)}.
-      Подробно — <a href="/install-guide">в инструкции по установке</a>, раздел «Резервная копия и восстановление».</span></div>`).join("");
+      Подробно — <a href="/install-guide">в инструкции по установке</a>, раздел «Резервная копия и восстановление».</span></div>`).join("") +
+    // тома установки: не подключены с хоста, мало места — текст сервиса уже говорит, что сделать
+    state.volumes.warnings.map(w => `<div class="nhint warn lines" role="alert">${icon("alert", 14)}<span><b>Внимание:</b> ${esc(w)}.</span></div>`).join("");
   const box = document.getElementById("storagewarn");
   if (box.dataset.shown !== stored) { box.innerHTML = stored; box.dataset.shown = stored; }
 
@@ -111,7 +126,7 @@ function render() {
     q += `<div class="scroll" style="margin-top:${state.queue.length ? "12px" : "0"}">
       <table><thead><tr><th>копируется</th><th>размер</th><th>не меняется</th></tr></thead><tbody>` +
       state.watching.map(w => `<tr>
-        <td class="path">${esc(w.path)}</td>
+        <td class="path">${esc(w.path)}${w.held ? `<div class="err-text">${icon("alert", 13)} отложен: ${esc(w.held)}</div>` : ""}</td>
         <td class="num">${mb(w.size)}</td>
         <td class="num">${w.quiet_sec} с из ${w.stable_sec}
           <span class="dim">(замеров ${w.stable} из ${w.needed})</span></td></tr>`).join("") +
@@ -325,6 +340,7 @@ let claims = [], mailState = null;      // заявки, ждущие решен
 let claimAct = null;                    // решение по заявке: {id, kind: "approve" | "reject"}
 let userAct = null;                     // подтверждение удаления: логин
 let bindAct = null;                     // подтверждение привязки к домену: логин
+let endAct = null;                      // подтверждение «Завершить входы»: логин
 let usersNote = null;                   // что только что сделано: {kind: "ok" | "err", text}
 let linkShown = null;                   // ссылка «задать пароль», которую передаёт сам администратор: {login, name, url, hours}
 let allKeys = null;                     // все ключи доступа сервиса: {keys, stale_days}
@@ -621,6 +637,11 @@ function grants(map) {
   return rows.length ? rows.join("<br>") : `<span class="dim">—</span>`;
 }
 
+// «Завершить входы»: все браузеры человека выходят, ключи и пароль остаются — с подтверждением ниже таблицы
+const endButton = u => `<button class="ghost dangerlink" data-end="${esc(u.login)}"
+  aria-label="Завершить все входы пользователя ${esc(u.login)}"
+  title="Выкинуть со всех браузеров и устройств: войти заново он сможет своим паролем; ключи доступа не отзываются">Завершить входы</button>`;
+
 function renderUsers() {
   const box = document.getElementById("users");
   const list = people.users;
@@ -705,6 +726,15 @@ function renderUsers() {
       <div class="row"><button type="button" id="ubind">Привязать к домену</button>
         <button type="button" class="ghost" id="ubindcancel">Отмена</button></div>
       <div class="msg" id="ubindmsg" role="alert"></div></div>`;
+  const ended = endAct ? list.find(u => u.login === endAct) : null;
+  const endBox = !ended ? "" : `<div class="up dangerbox" style="margin-top:14px" role="alertdialog" aria-labelledby="uendtitle">
+      <div class="uphead"><span class="upname" id="uendtitle">Завершить все входы ${esc(ended.name)} (${esc(ended.login)})?</span></div>
+      <ul class="plain"><li>на всех его браузерах и устройствах вход перестанет действовать — сразу;</li>
+        <li>войти заново он сможет своим ${foreign(ended) ? "паролем домена" : "паролем"}: пароль, права и личная папка не меняются;</li>
+        <li>его ключи доступа продолжат работать — отозвать их можно ниже, в «Ключах доступа».</li></ul>
+      <div class="row"><button type="button" class="danger" id="uend">Завершить входы</button>
+        <button type="button" class="ghost" id="uendcancel">Отмена</button></div>
+      <div class="msg" id="uendmsg" role="alert"></div></div>`;
   const linkBox = !linkShown ? "" : `<div class="linkbox" role="group" aria-labelledby="linktitle">
       <div class="linktitle" id="linktitle">Ссылка «задать пароль» для ${esc(linkShown.name)} (логин <b class="mono">${esc(linkShown.login)}</b>)</div>
       <div class="linkrow">
@@ -726,7 +756,7 @@ function renderUsers() {
         <tr><td class="mono">admin</td><td>Администратор</td><td><span class="dim">—</span></td>
           <td>встроенный</td><td><span class="dim">—</span></td>
           <td colspan="3">всё<div class="dim" style="font-size:12px">администратор сервиса, пароль в .env</div></td><td></td></tr>` +
-      list.map(u => `<tr${u.login === userAct || u.login === editing || u.login === bindAct ? ' class="picked"' : ""}>
+      list.map(u => `<tr${[userAct, editing, bindAct, endAct].includes(u.login) ? ' class="picked"' : ""}>
         <td class="mono">${esc(u.login)}${u.has_password || foreign(u) ? "" :
           `<div><span class="tag warn" title="Человек ещё не задал пароль по одноразовой ссылке — войти он не может">пароль не задан</span></div>`}</td>
         <td>${esc(u.name)}</td><td>${u.email ? esc(u.email) : `<span class="dim">—</span>`}</td>
@@ -742,18 +772,20 @@ function renderUsers() {
           // но загрузку в личную папку и ей выдаёт администратор сервиса
           ? `<button class="ghost" data-edit="${esc(u.login)}">Изменить</button>
              <button class="ghost dangerlink" data-del="${esc(u.login)}"
-               aria-label="Убрать из сервиса пользователя ${esc(u.login)}" title="Убрать из сервиса. Учётная запись домена: при следующем входе заведётся снова, если человек остался в домене и в группе доступа">Убрать</button>`
+               aria-label="Убрать из сервиса пользователя ${esc(u.login)}" title="Убрать из сервиса. Учётная запись домена: при следующем входе заведётся снова, если человек остался в домене и в группе доступа">Убрать</button>
+             ${endButton(u)}`
           : `<button class="ghost" data-edit="${esc(u.login)}">Изменить</button>
             ${mailOn && u.email ? `<button class="ghost" data-link="${esc(u.login)}"
               title="Отправить на ${esc(u.email)} новую ссылку «задать пароль»; прежняя перестанет действовать">Выслать ссылку</button>`
             : `<button class="ghost" data-link="${esc(u.login)}"
               title="Выпустить новую одноразовую ссылку «задать пароль» и показать её здесь — передать человеку самому; прежняя перестанет действовать">Показать ссылку</button>`}
-            <button class="ghost dangerlink" data-del="${esc(u.login)}">Удалить</button>`}</div></td>
+            <button class="ghost dangerlink" data-del="${esc(u.login)}">Удалить</button>
+            ${endButton(u)}`}</div></td>
       </tr>`).join("") + `</tbody></table></div>` : "") +
     (dom && dom.on && list.some(u => !foreign(u)) ? `<div class="note" style="margin-top:12px">Локальная учётная запись сама доменной не становится.
       Пока она есть, человек с тем же логином в домене войти доменным паролем не может: логин занят. «Привязать к домену» (кнопка «Изменить» в строке пользователя) переводит
       запись на вход через домен с сохранением прав.</div>` : "") +
-    confirmBox + bindBox +
+    confirmBox + bindBox + endBox +
     (editing === null ? `<div class="row"><button class="ghost" id="uadd">Добавить пользователя</button></div>` : form);
 }
 
@@ -800,15 +832,28 @@ document.getElementById("mail").addEventListener("click", async e => {
 document.getElementById("users").addEventListener("click", async e => {
   const t = e.target.closest("button");
   if (!t) return;
-  if (t.id === "uadd") { editing = ""; userAct = null; usersNote = null; renderUsers(); document.getElementById("ulogin").focus(); }
+  if (t.id === "uadd") { editing = ""; userAct = endAct = null; usersNote = null; renderUsers(); document.getElementById("ulogin").focus(); }
   else if (t.id === "ucancel") { editing = null; renderUsers(); }
   else if (t.id === "ugen") { document.getElementById("upass").value = newPassword(); fieldError("upass", ""); }
   else if (t.id === "ucopy") { copyText(document.getElementById("upass").value); t.textContent = "Скопировано";
                                setTimeout(() => { t.textContent = "Копировать"; }, 2000); }
-  else if (t.dataset.edit) { editing = t.dataset.edit; userAct = null; usersNote = null; renderUsers(); document.getElementById("uname").focus(); }
-  else if (t.dataset.del) { userAct = t.dataset.del; bindAct = null; editing = null; usersNote = null; renderUsers(); document.getElementById("udelete").focus(); }
+  else if (t.dataset.edit) { editing = t.dataset.edit; userAct = endAct = null; usersNote = null; renderUsers(); document.getElementById("uname").focus(); }
+  else if (t.dataset.del) { userAct = t.dataset.del; bindAct = endAct = null; editing = null; usersNote = null; renderUsers(); document.getElementById("udelete").focus(); }
   else if (t.id === "udelcancel") { userAct = null; renderUsers(); }
-  else if (t.dataset.bind) { bindAct = t.dataset.bind; userAct = null; editing = null; usersNote = null; renderUsers(); document.getElementById("ubindcancel").focus(); }
+  else if (t.dataset.bind) { bindAct = t.dataset.bind; userAct = endAct = null; editing = null; usersNote = null; renderUsers(); document.getElementById("ubindcancel").focus(); }
+  // случайный Enter в подтверждении никого не выкинет: фокус — на «Отмене»
+  else if (t.dataset.end) { endAct = t.dataset.end; userAct = bindAct = null; editing = null; usersNote = null; renderUsers(); document.getElementById("uendcancel").focus(); }
+  else if (t.id === "uendcancel") { const back = endAct; endAct = null; renderUsers(); document.querySelector(`[data-end="${CSS.escape(back)}"]`)?.focus(); }
+  else if (t.id === "uend") {
+    t.disabled = true;
+    t.textContent = "Завершаю…";
+    try {
+      const done = await api("/api/admin/users/sessions", { login: endAct });
+      endAct = null;
+      usersNote = { kind: "ok", text: `Все входы ${done.login} завершены: на страницу он войдёт заново своим паролем. Ключи доступа не отозваны.` };
+      renderUsers();
+    } catch (err) { t.disabled = false; t.textContent = "Завершить входы"; say("uendmsg", "err", err.message); }
+  }
   else if (t.id === "ubindcancel") { bindAct = null; renderUsers(); }
   else if (t.id === "ubind") {
     t.disabled = true;
@@ -2340,7 +2385,10 @@ const ACTIONS = {
   domain_recheck_denied: e => `перепроверка в домене — вход закрыт: ${e.reason}`,
   domain_bind: e => `привязал учётную запись ${e.login} к домену (пароль сервиса стёрт)`,
   domain_check: e => `проверил подключение к домену${e.login ? ` и вход пользователя ${e.login}` : ""}: ${e.ok ? "пройдена" : "есть отказы"}`,
-  password: () => "сменил свой пароль",
+  password: e => "сменил свой пароль" + (e.keys ? ` и отозвал свои ключи доступа: ${e.keys}` : ""),
+  logout_all: () => "вышел на всех устройствах («Выйти везде»)",
+  sessions_end: e => `завершил все входы пользователя ${e.login}`,
+  request_known: e => `подана заявка с почтой, которая уже есть у ${e.login}: заявка не сохранена, ему ушло письмо «учётная запись уже есть»`,
   request_new: e => `подана заявка на доступ: ${e.name}, логин ${e.login}, почта ${e.email}`,
   request_approve: e => `одобрил заявку на доступ — заведён пользователь ${e.login}${
     e.home_upload ? "; загрузка в личную папку разрешена" : ""}`,
@@ -2349,7 +2397,7 @@ const ACTIONS = {
     ({ invite: "доступ открыт по заявке", reset: "человек нажал «Забыл пароль»", admin: "по кнопке администратора" }[e.why] || e.why),
   link_shown: e => `выпустил ссылку «задать пароль» для ${e.login} и получил её сам, чтобы передать: ` +
     ({ invite: "доступ открыт по заявке", admin: "по кнопке в строке пользователя" }[e.why] || e.why),
-  password_link: () => "задал пароль по одноразовой ссылке",
+  password_link: e => "задал пароль по одноразовой ссылке" + (e.keys ? ` и отозвал свои ключи доступа: ${e.keys}` : ""),
   reset_request: e => `запрошен сброс пароля для «${e.login}»`,
   upload: e => `загрузил запись «${e.file}» (${mb(e.size)})`,
   folder_create: e => `создал папку «${e.folder}»`,
@@ -2381,6 +2429,7 @@ const ACTIONS = {
     ? `протокол записи «${e.file}» не отправлен на ${(e.to || []).join(", ")}`
     : e.what === "notice" ? `письмо администраторам о заявке на доступ (логин ${e.login}) не ушло`
     : e.what === "link" ? `письмо со ссылкой «задать пароль» для ${e.login} не ушло`
+    : e.what === "known" ? `письмо «учётная запись уже есть» для ${e.login} не ушло`
     : `письмо о записи «${e.file}» для ${e.to} не ушло`) + `: ${e.error}`,
   notify: e => `${e.ready ? "включил" : "отключил"} себе письма о готовности записей`,
   task_done: e => `отметил выполненным поручение «${e.task}»${e.owner ? ` (${e.owner})` : ""} в записи «${e.file}»`,

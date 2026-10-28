@@ -73,6 +73,13 @@ def _size_of(path: Path) -> int | None:
         return None
 
 
+def _mtime_of(path: Path) -> float | None:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
+
+
 def source_note(src: Path) -> str:
     """Имя и дата файла записи — по ним протокол ставит дату встречи."""
     saved = datetime.datetime.fromtimestamp(src.stat().st_mtime).strftime("%d.%m.%Y")
@@ -229,7 +236,11 @@ async def process(
         "template_auto": template_key is None,
         "manual": manual,
         "force": force,
+        # каким был исходник, когда его взяли в работу: по размеру, времени изменения и отпечатку
+        # содержимого сканер узнаёт его под другим именем и замечает, что он изменился (watcher)
         "source_size": _size_of(src),
+        "source_mtime": _mtime_of(src),
+        "source_print": await asyncio.to_thread(media.fingerprint, src),
         "started_at": started,
         "finished_at": None,
         "duration_sec": None,

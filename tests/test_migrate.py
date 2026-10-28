@@ -414,3 +414,28 @@ def test_totals_before_and_after_are_counted_two_ways(tmp_path):
     assert migrate.counts(old) == migrate.counted(base)
     assert migrate.counted(base)["расходы"] == {"RUB": 25.0, "USD": 0.332468} == migrate.spent(old["events"])
     assert usage.text(migrate.counted(base)["расходы"]) == "25.00 ₽ + 0.33 $"
+
+
+def test_results_folder_inside_the_container_is_refused_too(tmp_path):
+    """Без тома папки результатов протоколы и расшифровки пропали бы с контейнером, а журнал обработки считал бы
+    записи готовыми: та же потеря оплаченного, что и у пропавшей базы, — отказ запуска."""
+    cfg = legacy.setup(tmp_path)
+    with pytest.raises(db.Refusal, match="папка результатов .* не подключена с хоста.*за деньги.*HOST_OUTBOX"):
+        migrate.open_base(cfg, lambda line: None, True, outbox_kept=False)
+    assert not (cfg.state_dir / db.FILE).exists()
+
+
+def test_volumes_not_mounted_and_short_of_space_are_warnings_with_what_to_do(tmp_path):
+    import types
+    cfg = legacy.setup(tmp_path)
+    cfg.backup_dir, cfg.prompts_dir = tmp_path / "backup", tmp_path / "prompts"
+    cfg.backup_dir.mkdir()
+    roomy = lambda path: types.SimpleNamespace(free=10 * 2 ** 30)
+    assert migrate.volume_warnings(cfg, kept=lambda path: True, room=roomy) == []
+    unmounted, = migrate.volume_warnings(cfg, kept=lambda path: path != cfg.inbox, room=roomy)
+    assert unmounted.startswith("входная папка не подключена с хоста") and "HOST_INBOX" in unmounted
+    assert "Что сделать" in unmounted and str(cfg.inbox) not in unmounted
+    # все папки на одном диске — одно предупреждение о месте, с их названиями
+    short, = migrate.volume_warnings(cfg, kept=lambda path: True, room=lambda path: types.SimpleNamespace(free=2 ** 29))
+    assert "входная папка, папка результатов, папка состояния, папка резервных копий" in short
+    assert "свободно 512.0 МБ" in short and "Что сделать" in short

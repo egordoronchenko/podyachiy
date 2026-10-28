@@ -53,7 +53,8 @@ DESKTOP_FS = {"9p", "virtiofs", "fuse.grpcfuse", "fuse.osxfs", "fakeowner"}
 LOCAL, DESKTOP, NETWORK = "local", "desktop", "network"
 
 # Шаги схемы по порядку: шаг N приводит базу к версии N. Прежние шаги не правятся — новое
-# дописывается следующим шагом.
+# дописывается следующим шагом. Шаг 3 — схема версии 1.2.0: пока она не выпущена, её изменения
+# дописываются в этот шаг.
 MIGRATIONS: tuple[tuple[str, ...], ...] = ((
     # сведения о самой базе: когда и какой версией сервиса создана, итог переноса с файлов
     "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT, WITHOUT ROWID",
@@ -239,6 +240,14 @@ MIGRATIONS: tuple[tuple[str, ...], ...] = ((
     # Признак включён у всех папок, кроме корня, поэтому хранятся только папки, где его выключили:
     # папки, бывшие до этого шага, и новые остаются сериями без единой строки здесь
     "CREATE TABLE series_off (folder TEXT PRIMARY KEY) STRICT, WITHOUT ROWID",
+), (
+    # ========== шаг 3 — схема версии 1.2.0 ==========
+    # Всё новое в схеме 1.2.0 — в этом шаге, разделами по темам, как в шаге 1.
+
+    # ---------- входы: «Выйти везде» ----------
+    # Счётчик сессий человека входит в штамп метки входа (users.py): «Выйти везде» увеличивает его,
+    # и все прежние метки перестают подходить. У admin из .env строки в users нет — его счётчик в meta.
+    "ALTER TABLE users ADD COLUMN sessions INTEGER NOT NULL DEFAULT 0",
 ),)
 SCHEMA_VERSION = len(MIGRATIONS)
 

@@ -56,7 +56,9 @@ def _swap(name: str, old: str, new: str) -> str:
     return new + name[len(old):] if name == old or name.startswith(old + ".") else name
 
 
-def _relocate(cfg, service, file: str, target: str, also=None) -> str:
+def _relocate(cfg, service, file: str, target: str, also=None, placed: bool = False) -> str:
+    """placed — исходник уже лежит по новому пути (его переименовали во входной папке мимо сервиса):
+    переезжают только результаты и база."""
     record = _known(service, file)
     if target == file:
         return file
@@ -69,9 +71,11 @@ def _relocate(cfg, service, file: str, target: str, also=None) -> str:
     here = cfg.inbox / folder         # при переименовании её может и не быть: исходники убрали
     twins = [p for p in (here.iterdir() if here.is_dir() else ())
              if p.is_file() and p.suffix.lower() in media.MEDIA_EXTS
-             and p.stem.lower() == new_stem.lower() and p != cfg.inbox / file]
+             and p.stem.lower() == new_stem.lower() and p != cfg.inbox / file
+             and not (placed and p == cfg.inbox / target)]
     # на томе без различия регистра «План.mp4» при «план.mp4» «уже есть» — это она сама (folders.same_place)
-    if (twins or ((cfg.inbox / target).exists() and not folders.same_place(cfg.inbox / file, cfg.inbox / target))
+    if (twins or (not placed and (cfg.inbox / target).exists()
+                  and not folders.same_place(cfg.inbox / file, cfg.inbox / target))
             or service.ledger.get(target) is not None
             or (new_out.exists() and new_out != old_out and not folders.same_place(old_out, new_out))):
         raise RecordError(409, "запись с таким именем в этой папке уже есть")
@@ -98,7 +102,7 @@ def _relocate(cfg, service, file: str, target: str, also=None) -> str:
 
     src = cfg.inbox / file
     try:
-        if src.is_file():             # исходник могли убрать руками — результаты переедут и без него
+        if src.is_file() and not placed:    # исходник могли убрать руками — результаты переедут и без него
             shift(src, cfg.inbox / target)
         if old_out.is_dir() and new_out != old_out:
             new_out.parent.mkdir(parents=True, exist_ok=True)
@@ -157,6 +161,17 @@ def move(cfg, service, file: str, folder: str, also=None) -> str:
         raise RecordError(404, folders.NO_FOLDER)
     name = PurePosixPath(file).name
     return _relocate(cfg, service, file, f"{folder}/{name}" if folder else name, also)
+
+
+def adopt(cfg, service, file: str, target: str, also=None) -> str:
+    """Исходник записи переименовали или перенесли во входной папке руками, мимо сервиса: файл уже лежит
+    по новому пути target, а результаты и строка журнала — под прежним. Их переезд тот же, что у rename
+    и move, только сам файл не трогается. Новый путь — с диска, его находит сканер (watcher). also — как
+    у rename."""
+    old, new = cfg.inbox / file, cfg.inbox / target
+    if not new.is_file() or (old.exists() and not folders.same_place(old, new)):
+        raise RecordError(409, "исходник записи не там, где его нашёл обход входной папки")
+    return _relocate(cfg, service, file, target, also, placed=True)
 
 
 def remove(cfg, service, file: str, by: str, also=None) -> dict:

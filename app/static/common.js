@@ -166,6 +166,20 @@ function newPassword() {
   return out;
 }
 
+/* Флажок «Отозвать мои ключи доступа» — при смене пароля (login.js) и на странице «задать пароль»
+   (set-password.js), только тому, у кого ключи есть. По умолчанию выключен: на ключах работают
+   интеграции человека (1С, ИИ-клиенты), и обрывать их без его слова нельзя; а если пароль мог узнать
+   кто-то ещё, пояснение подсказывает отозвать и ключи — ключом входят без пароля. */
+function revokeBox(count) {
+  if (!count) return "";
+  const word = count % 10 === 1 && count % 100 !== 11 ? "ключ"
+    : [2, 3, 4].includes(count % 10) && ![12, 13, 14].includes(count % 100) ? "ключа" : "ключей";
+  return `<label class="check"><input type="checkbox" id="revoke" aria-describedby="revoke-hint">
+      <span><b>Отозвать мои ключи доступа</b> — у вас ${count} ${word}</span></label>
+    <div class="fhint" id="revoke-hint">Программы и ИИ-клиенты, которые входят этими ключами, перестанут работать, пока
+      вы не выпустите новые. Отзовите, если пароль или ключ мог узнать кто-то ещё: ключом входят без пароля.</div>`;
+}
+
 // ---------- кто вошёл ----------
 let me = null;      // ответ /api/me: кто сейчас вошёл
 
@@ -192,17 +206,56 @@ async function initUser() {
       // у учётной записи домена пароля в сервисе нет: он меняется в домене
       `${me.mail ? `<button class="nav sm" id="notifybtn" role="switch"></button>` : ""}
        ${me.domain_account ? "" : `<a class="nav sm" href="/login?change">${icon("gear", 15)}<span>Сменить пароль</span></a>`}`) +
-    `<button class="nav sm" id="logout">${icon("back", 15)}<span>Выйти</span></button>`;
+    `<button class="nav sm" id="logout">${icon("back", 15)}<span>Выйти</span></button>
+     <button class="nav sm" id="logoutall" aria-expanded="false" aria-controls="logoutask">${icon("users", 15)}<span>Выйти везде</span></button>
+     <div id="logoutask" role="alertdialog" aria-labelledby="logoutasktext" hidden></div>`;
   drawNotify();
   document.getElementById("logout").onclick = async () => {
     await api("/api/logout", {});
     location.href = "/login";
   };
+  document.getElementById("logoutall").onclick = () => askLogoutAll(true);
   document.getElementById("keysbtn").onclick = openKeys;
   if (location.hash === "#keys") openKeys();      // сюда ведут справка и инструкция навыка
 }
 
-const ruDay = iso => iso ? `${iso.slice(8, 10)}.${iso.slice(5, 7)}.${iso.slice(0, 4)}` : "";
+/* «Выйти везде»: входы на других браузерах и устройствах перестают действовать, этот остаётся.
+   Сначала — подтверждение тут же, под кнопкой: по ошибке человек выкинул бы себя с телефона и
+   ноутбука. Ключи доступа не трогаются — об этом сказано, чтобы не ждали, что программы отключатся. */
+function askLogoutAll(open) {
+  const box = document.getElementById("logoutask"), btn = document.getElementById("logoutall");
+  btn.setAttribute("aria-expanded", String(open));
+  box.hidden = !open;
+  if (!open) { box.innerHTML = ""; btn.focus(); return; }
+  box.innerHTML = `<div class="note dangerbox" id="logoutasktext">Выйти на всех остальных браузерах и устройствах?
+      Этот браузер останется во входе. Ключи доступа продолжат работать — их отзывают в окне «Ключи доступа».</div>
+    <div class="row"><button type="button" class="danger" id="logoutallgo">Выйти на остальных</button>
+      <button type="button" class="ghost" id="logoutallno">Отмена</button></div>
+    <div class="msg" id="logoutallmsg" aria-live="polite"></div>`;
+  document.getElementById("logoutallno").onclick = () => askLogoutAll(false);
+  box.onkeydown = e => { if (e.key === "Escape") { e.stopPropagation(); askLogoutAll(false); } };
+  const go = document.getElementById("logoutallgo");
+  go.onclick = async () => {
+    go.disabled = true;
+    go.textContent = "Выхожу…";
+    try {
+      await api("/api/logout/all", {});
+      box.innerHTML = `<div class="msg ok" role="status" tabindex="-1" id="logoutalldone">Готово: на остальных браузерах и
+        устройствах вход больше не действует. Здесь вы остались во входе.</div>`;
+      document.getElementById("logoutalldone").focus();
+      btn.setAttribute("aria-expanded", "false");
+    } catch (err) {
+      go.disabled = false;
+      go.textContent = "Выйти на остальных";
+      const msg = document.getElementById("logoutallmsg");
+      msg.setAttribute("role", "alert");
+      say("logoutallmsg", "err", "Не получилось: " + err.message);
+    }
+  };
+  document.getElementById("logoutallno").focus();     // случайный Enter никого не выкинет
+}
+
+const ruDay = iso =>iso ? `${iso.slice(8, 10)}.${iso.slice(5, 7)}.${iso.slice(0, 4)}` : "";
 
 /* ---------- письма о готовности записи ----------
    Переключатель в меню учётной записи: «Уведомления на почту: когда моя запись готова».

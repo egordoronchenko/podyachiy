@@ -75,6 +75,7 @@ ADMIN_ONLY = [
     ("GET", "/api/admin/domain", None),
     ("POST", "/api/admin/domain/check", {}),
     ("POST", "/api/admin/users/domain", {"login": "petrov"}),
+    ("POST", "/api/admin/users/sessions", {"login": "petrov"}),
 ]
 # Параметры адреса для запросов из ADMIN_ONLY, которым без них отвечать нечем.
 QUERY = {"/api/admin/templates/text": {"id": "meeting"}, "/api/admin/templates/upload": {"id": "meeting"}}
@@ -110,6 +111,8 @@ PAGE_ONLY = {
     ("GET", "/api/keys"), ("POST", "/api/keys"), ("POST", "/api/keys/revoke"),
     ("POST", "/api/admin/keys/revoke"),
     ("POST", "/api/password"), ("POST", "/api/admin/users/link"),
+    # «Выйти везде» — свои входы на странице; ключом их не завершить (ключи — отдельные пропуска)
+    ("POST", "/api/logout/all"),
     ("POST", "/api/record/delete"), ("POST", "/api/admin/folders/delete"),
     # протокол на почту — содержимое совещания на произвольные адреса
     ("GET", "/api/record/recipients"), ("POST", "/api/record/send"),
@@ -139,7 +142,8 @@ COSTS = ("/api/v1/costs", "/api/admin/report", "/api/admin/report.csv", "/api/ad
 @contextmanager
 def running(tmp_path, mode="corporate", extra=None, kept=True):
     """Сервис с чистыми временными папками. Отдаёт модуль app.web и клиента без входа.
-    extra — добавка к окружению, например настройки почты; kept — подключена ли папка состояния с хоста."""
+    extra — добавка к окружению, например настройки почты; kept — подключена ли папка состояния с хоста
+    (или, функцией, — какая папка подключена)."""
     env = {
         "MODE": mode,
         "INBOX_DIR": str(tmp_path / "inbox"),
@@ -169,7 +173,7 @@ def running(tmp_path, mode="corporate", extra=None, kept=True):
         # Папка состояния во временной папке — не точка подключения: сервис решил бы, что база
         # пропадёт вместе с контейнером, и отказался бы запускаться. В тестах она «подключена»;
         # сам отказ и проверку блокировок (она запускает второй процесс) проверяют отдельные тесты.
-        patch.setattr(db, "kept", lambda path: kept)
+        patch.setattr(db, "kept", kept if callable(kept) else lambda path: kept)
         patch.setattr(db, "probe", lambda path: None)
         sys.modules.pop("app.web", None)
         # app.web при импорте подставляет почте свою функцию «название организации»; после теста
@@ -1179,7 +1183,7 @@ def test_request_to_login_chain(office):
     assert (claim["name"], claim["email"], claim["login"], claim["comment"], claim["status"]) == (
         "Сидоров <b>Пётр</b>", "sidorov@example.test", "sidorov", "Отдел продаж, протоколы планёрок", "pending")
     assert listed["mail"] == {"on": True, "why_off": None, "admin_emails": ["boss@example.test", "it@example.test"],
-                              "probe_to": ["boss@example.test", "it@example.test"], "warnings": []}
+                              "probe_to": ["boss@example.test", "it@example.test"], "warnings": [mail.OPEN_DOMAINS]}
     assert notice.reply_to == "sidorov@example.test"                 # «Ответить» в письме о заявке ведёт к заявителю
 
     # 3. открывает доступ, поправив логин и ФИО
@@ -1345,8 +1349,6 @@ def test_request_form_refuses_bad_and_repeated_data_and_names_the_field(office, 
     refused(400, "login", login="Сидоров")
     refused(400, "login", login="admin")
     refused(400, "comment", comment="ы" * 501)
-    assert "занят" in refused(409, "login", login="ivanov")
-    assert "Забыл пароль" in refused(409, "email", email="IVANOV@example.test")
     assert post.sent == [] and admin.get("/api/admin/requests").json()["requests"] == []
 
     assert guest.post("/api/request", json=CLAIM).status_code == 200
@@ -1498,12 +1500,13 @@ def test_missing_ca_file_turns_the_mail_off_and_says_why(tmp_path):
 
 
 def test_mail_password_in_the_clear_is_warned_about_at_start_and_in_the_mail_block(tmp_path):
-    with running(tmp_path, extra={**MAIL_ENV, "SMTP_USER": "robot", "SMTP_PASSWORD": "secret"}) as (web, guest):
+    with running(tmp_path, extra={**MAIL_ENV, "SMTP_USER": "robot", "SMTP_PASSWORD": "secret", "MAIL_DOMAINS": "example.test"}) as (web, guest):
         warning, = guest.get("/api/admin/requests", auth=("admin", ADMIN_PASSWORD)).json()["mail"]["warnings"]
         assert "SMTP_SECURITY=none" in warning and "открытым текстом" in warning and "secret" not in warning
         assert any("ВНИМАНИЕ" in line and "открытым текстом" in line for line in web.log.lines)
     (tmp_path / "tls").mkdir()
-    with running(tmp_path / "tls", extra={**MAIL_ENV, "SMTP_USER": "robot", "SMTP_SECURITY": "starttls"}) as (web, guest):
+    with running(tmp_path / "tls", extra={**MAIL_ENV, "SMTP_USER": "robot", "SMTP_SECURITY": "starttls",
+                                          "MAIL_DOMAINS": "example.test"}) as (web, guest):
         assert guest.get("/api/admin/requests", auth=("admin", ADMIN_PASSWORD)).json()["mail"]["warnings"] == []
         assert not any("открытым текстом" in line for line in web.log.lines)
 
@@ -4619,3 +4622,228 @@ def test_upload_finished_after_its_folder_was_renamed_or_deleted_is_refused(site
         assert not (web.cfg.inbox / name).exists(), name
     assert not list(web.cfg.inbox.rglob("вкс.mp3"))
     assert not [e for e in web.trail.read() if e["kind"] == "upload"]
+
+
+# ---------- выйти везде, завершить входы, пароль и ключи, заявка без подсказок, MAIL_DOMAINS ----------
+
+def test_sign_out_everywhere_keeps_this_browser_and_ends_the_others(site):
+    """«Выйти везде»: остальные браузеры человека выходят, этот получает новую метку и остаётся.
+    Ключи доступа — отдельные пропуска, они не отзываются. Только сам человек на странице."""
+    web, admin, ivanov, petrov = staffed(site)
+    laptop = enter(web, "ivanov")
+    robot, _ = keyed(web, ivanov, "Cursor")
+    assert ivanov.post("/api/logout/all").json() == {"ok": True}
+    assert ivanov.get("/api/browse").status_code == 200
+    assert laptop.get("/api/browse").status_code == 401 and petrov.get("/api/browse").status_code == 200
+    assert robot.get("/api/v1/whoami").status_code == 200
+    assert robot.post("/api/logout/all").status_code == 403
+    other = enter(web, "admin", ADMIN_PASSWORD)                      # admin из .env — так же
+    assert admin.post("/api/logout/all").status_code == 200
+    assert admin.get("/api/admin/status").status_code == 200 and other.get("/api/admin/status").status_code == 401
+    assert [e["by"] for e in web.trail.read() if e["kind"] == "logout_all"] == ["ivanov", "admin"]
+    assert TestClient(web.app).post("/api/logout/all").status_code == 401
+
+
+def test_service_admin_ends_all_sessions_of_a_user(site):
+    """Администратор сервиса завершает все входы человека: его браузеры выходят, войти заново он
+    может, ключи остаются. У admin из .env так нельзя — он выходит везде сам, из своего меню."""
+    web, admin, ivanov, petrov = staffed(site)
+    robot, _ = keyed(web, ivanov, "Cursor")
+    assert admin.post("/api/admin/users/sessions", json={"login": " Ivanov "}).json() == {"ok": True, "login": "ivanov"}
+    assert ivanov.get("/api/browse").status_code == 401 and petrov.get("/api/browse").status_code == 200
+    assert robot.get("/api/v1/whoami").status_code == 200 and admin.get("/api/browse").status_code == 200
+    assert enter(web, "ivanov").get("/api/browse").status_code == 200
+    for login in ("nobody", "admin"):
+        missing = admin.post("/api/admin/users/sessions", json={"login": login})
+        assert missing.status_code == 404 and missing.json()["detail"] == "такого пользователя нет"
+    event = [e for e in web.trail.read() if e["kind"] == "sessions_end"][-1]
+    assert (event["by"], event["login"]) == ("admin", "ivanov")
+
+
+def test_password_reset_and_link_end_the_other_sessions(office):
+    """Пароль задал заново администратор или сам человек по ссылке — прежние входы не действуют."""
+    web, guest, admin, post = office
+    admin.post("/api/admin/users/save", json={"login": "ivanov", "name": "Иванов", "password": PASSWORD,
+                                              "email": "ivanov@example.test"})
+    first = enter(web, "ivanov")
+    assert admin.post("/api/admin/users/save", json={"login": "ivanov", "password": "пароль-админа-1"}).status_code == 200
+    assert first.get("/api/browse").status_code == 401
+    second = enter(web, "ivanov", "пароль-админа-1")
+    assert guest.post("/api/forgot", json={"login": "ivanov"}).status_code == 200
+    assert guest.post("/api/set-password", json={"token": post.token(), "password": "пароль-по-ссылке"}).status_code == 200
+    assert second.get("/api/browse").status_code == 401
+    assert enter(web, "ivanov", "пароль-по-ссылке").get("/api/browse").status_code == 200
+
+
+def test_password_change_revokes_the_keys_when_asked(site):
+    """Смена пароля: флажок «Отозвать мои ключи доступа» — по умолчанию выключен, ключи остаются;
+    включён — отзываются все ключи человека. Сколько отозвано — в ответе и в журнале действий."""
+    web, admin, ivanov, _ = staffed(site)
+    robot, _ = keyed(web, ivanov, "Cursor")
+    keyed(web, ivanov, "1С")
+    assert ivanov.post("/api/password", json={"old": PASSWORD, "new": "новый-пароль-1"}).json() == {"ok": True}
+    assert robot.get("/api/v1/whoami").status_code == 200
+    ivanov = enter(web, "ivanov", "новый-пароль-1")
+    changed = ivanov.post("/api/password", json={"old": "новый-пароль-1", "new": "новый-пароль-2", "revoke_keys": True})
+    assert changed.json() == {"ok": True, "keys_revoked": 2}
+    assert robot.get("/api/v1/whoami").status_code == 401 and web.people.keys("ivanov") == []
+    assert [e.get("keys") for e in web.trail.read() if e["kind"] == "password"] == [None, 2]
+
+
+def test_password_by_link_revokes_the_keys_when_asked(office):
+    """Страница «задать пароль» знает, сколько у человека ключей, и предлагает их отозвать."""
+    web, guest, admin, post = office
+    admin.post("/api/admin/users/save", json={"login": "ivanov", "name": "Иванов", "password": PASSWORD,
+                                              "email": "ivanov@example.test"})
+    robot, _ = keyed(web, enter(web, "ivanov"), "Cursor")
+    guest.post("/api/forgot", json={"login": "ivanov"})
+    token = post.token()
+    assert guest.post("/api/set-password/check", json={"token": token}).json()["keys"] == 1
+    done = guest.post("/api/set-password", json={"token": token, "password": "пароль-из-письма", "revoke_keys": True})
+    assert done.json() == {"ok": True, "login": "ivanov", "keys_revoked": 1}
+    assert robot.get("/api/v1/whoami").status_code == 401
+    assert [e.get("keys") for e in web.trail.read() if e["kind"] == "password_link"] == [1]
+
+
+def test_request_form_does_not_tell_which_logins_and_addresses_are_taken(office):
+    """Ответ заявки один и тот же, занят логин или почта или нет. Занятый логин администратор
+    поправит при одобрении; владельцу занятой почты уходит письмо «учётная запись уже есть»."""
+    web, guest, admin, post = office
+    admin.post("/api/admin/users/save", json={"login": "ivanov", "name": "Иванов Иван", "password": PASSWORD,
+                                              "email": "ivanov@example.test"})
+    taken = guest.post("/api/request", json={**CLAIM, "login": "ivanov"})
+    known = guest.post("/api/request", json={**CLAIM, "login": "sidorov.p", "email": "IVANOV@example.test"})
+    assert taken.status_code == known.status_code == 200 and taken.json() == known.json() == {"ok": True}
+    claim, = admin.get("/api/admin/requests").json()["requests"]
+    assert (claim["login"], claim["email"]) == ("ivanov", "sidorov@example.test")
+    notice, letter = post.sent
+    assert notice.subject == "заявка на доступ — ivanov"
+    assert letter.to == ["ivanov@example.test"] and letter.subject == "учётная запись уже есть"
+    assert "ivanov" in letter.text and "http://podyachiy.test/login?forgot" in letter.text
+    assert "Иванов Иван" in letter.text and "Сидоров" not in letter.text and "set-password" not in letter.text
+    assert kinds(web).count("request_new") == 1 and kinds(web).count("request_known") == 1
+    refused = admin.post("/api/admin/requests/approve", json={"id": claim["id"], "login": "ivanov", "name": "Сидоров"})
+    assert refused.status_code == 409 and "поправьте логин" in refused.json()["detail"]
+
+
+def test_mail_without_mail_domains_is_warned_about_at_start_and_in_the_mail_block(office):
+    web, guest, admin, post = office
+    assert admin.get("/api/admin/requests").json()["mail"]["warnings"] == [mail.OPEN_DOMAINS]
+    assert any("ВНИМАНИЕ!!! НЕБЕЗОПАСНО" in line and "MAIL_DOMAINS" in line for line in web.log.lines)
+
+
+def test_request_address_must_be_from_mail_domains(tmp_path, monkeypatch):
+    with running(tmp_path, extra={**MAIL_ENV, "MAIL_DOMAINS": "example.test"}) as (web, guest):
+        monkeypatch.setattr(web.mail, "send", Post().send)
+        refused = guest.post("/api/request", json={**CLAIM, "email": "x@gmail.test"})
+        assert refused.status_code == 400 and refused.headers["x-field"] == "email"
+        assert "example.test" in refused.json()["detail"]
+        assert guest.post("/api/request", json=CLAIM).status_code == 200
+        assert guest.get("/api/admin/requests", auth=("admin", ADMIN_PASSWORD)).json()["mail"]["warnings"] == []
+        assert not any("MAIL_DOMAINS" in line and "ВНИМАНИЕ" in line for line in web.log.lines)
+
+
+def test_pages_offer_sign_out_everywhere_and_revoking_the_keys():
+    """Страницы: «Выйти везде» в меню человека, «Завершить входы» у пользователя, флажок
+    «Отозвать мои ключи доступа» при смене пароля и по ссылке — проверено и в браузере."""
+    common = (ROOT / "app" / "static" / "common.js").read_text(encoding="utf-8")
+    admin = page_source("admin")
+    assert '"/api/logout/all"' in common and "Выйти везде" in common and "Отозвать мои ключи доступа" in common
+    assert '"/api/admin/users/sessions"' in admin and "Завершить входы" in admin
+    assert "logout_all" in admin and "sessions_end" in admin and "request_known" in admin
+    for page in ("login", "set-password"):
+        assert "revoke_keys" in page_source(page) and "revokeBox(" in page_source(page), page
+
+
+# ---------- исходник записи, тома установки, отметка «сервис жив», имена в разложенной форме ----------
+
+def test_record_list_says_when_the_source_changed_or_is_missing(site):
+    """Исходник готовой записи изменился или пропал — в списке записей и в /api/v1/record это видно полем
+    source, а страница показывает метку словами с пояснением, что делать."""
+    web, admin, ivanov, _ = staffed(site)
+    for rel in ("Проекты/изменили.mp4", "Проекты/убрали.mp4", "Проекты/на месте.mp4"):
+        recorded(web, rel)
+    web.service.ledger.amend("Проекты/изменили.mp4", source_state="changed")
+    (web.cfg.inbox / "Проекты/убрали.mp4").unlink()
+    web.service.scan_once()
+    shown = {f["name"]: f["source"] for f in admin.get("/api/browse", params={"path": "Проекты"}).json()["files"]}
+    assert shown == {"изменили.mp4": "changed", "убрали.mp4": "missing", "на месте.mp4": None}
+    assert admin.get("/api/v1/record", params={"file": "Проекты/убрали.mp4"}).json()["source"] == "missing"
+    page = page_source("index")
+    assert "исходник изменился" in page and "исходник отсутствует" in page and "вручную с перезаписью" in page
+
+
+def test_file_held_by_the_scanner_is_shown_as_held_and_not_copying(site):
+    """Файл, который сам в обработку не пойдёт (похож на недокопированный, копия готовой записи), человек видит
+    отложенным, с причиной словами, — без имени записи, копией которой он оказался: она может быть чужой."""
+    web, admin, _, _ = staffed(site)
+    (web.cfg.inbox / "Проекты").mkdir()
+    (web.cfg.inbox / "Проекты/копия.mp4").write_bytes(b"video")
+    web.service.scan_once()
+    web.service.pending["Проекты/копия.mp4"].held = "копия записи Снабжение/вкс.mp4 — запустите вручную или уберите файл"
+    item, = admin.get("/api/browse", params={"path": "Проекты"}).json()["pending"]
+    assert item["state"] == "held" and item["note"] == web.HELD_DECISION and "Снабжение" not in json.dumps(item)
+    watching, = admin.get("/api/admin/status").json()["watching"]
+    assert "Снабжение/вкс.mp4" in watching["held"]                      # администратору — подробно
+    assert '"held"' in page_source("index") and "отложен:" in page_source("admin")
+
+
+def test_results_folder_not_mounted_from_the_host_refuses_the_start(tmp_path):
+    """Без тома папки результатов протоколы легли бы внутрь контейнера и пропали бы при его пересоздании, а
+    журнал обработки считал бы записи готовыми — вернуть их можно было бы только новым распознаванием."""
+    outbox = str(tmp_path / "outbox")
+    with pytest.raises(SystemExit, match="папка результатов .* не подключена с хоста"):
+        with running(tmp_path, kept=lambda path: str(path) != outbox):
+            pytest.fail("сервис запустился без подключённой папки результатов")
+    assert "ОТКАЗ ЗАПУСКА" in (tmp_path / "outbox" / "_logs" / "podyachiy.log").read_text(encoding="utf-8")
+
+
+def test_volumes_are_checked_at_start_and_daily_with_a_warning_on_the_page(tmp_path, monkeypatch):
+    """Том не подключён с хоста или на диске мало места — предупреждение на «Обработке» и строка в журнале
+    работы: при запуске и при проверке раз в сутки; прошло — строка, что снова в порядке."""
+    prompts = str(tmp_path / "prompts")
+    monkeypatch.setattr(migrate.shutil, "disk_usage", lambda path: types.SimpleNamespace(free=10 * 2 ** 30))
+    with running(tmp_path, kept=lambda path: str(path) != prompts) as (web, client):
+        admin = enter(web, "admin", ADMIN_PASSWORD)
+        warning, = admin.get("/api/admin/status").json()["volumes"]["warnings"]
+        assert warning.startswith("папка шаблонов не подключена с хоста") and "HOST_PROMPTS" in warning
+        assert prompts not in warning
+        assert sum("ВНИМАНИЕ: папка шаблонов не подключена" in line for line in web.log.lines) == 1
+        web._check_volumes()                                    # суточная проверка: то же — строки нет
+        assert sum("ВНИМАНИЕ: папка шаблонов не подключена" in line for line in web.log.lines) == 1
+        monkeypatch.setattr(migrate, "volume_warnings", lambda cfg: [])
+        web._check_volumes()
+        assert admin.get("/api/admin/status").json()["volumes"]["warnings"] == []
+        assert any("тома установки подключены" in line for line in web.log.lines)
+    assert "state.volumes.warnings" in page_source("admin")
+
+
+def test_service_marks_itself_alive_in_the_base(site):
+    """Раз в HEARTBEAT_SEC сервис пишет в базу, что жив: когда, какой версии, с какого времени работает и сколько
+    обработчиков живо. Это видят страница «Обработка» и всякий, кто открыл базу без сервиса."""
+    web, client = site
+    admin = enter(web, "admin", ADMIN_PASSWORD)
+    deadline = time.monotonic() + 5
+    while web.base.noted(web.ALIVE) is None and time.monotonic() < deadline:
+        time.sleep(0.05)
+    beat = json.loads(web.base.noted(web.ALIVE))
+    assert beat["version"] == (ROOT / "VERSION").read_text().strip() and beat["workers"] == beat["of"] == web.cfg.workers
+    shown = admin.get("/api/admin/status").json()["heartbeat"]
+    assert shown["at"] == beat["at"] and 0 <= shown["ago_sec"] < 60 and shown["every_sec"] == web.HEARTBEAT_SEC
+    assert shown["started"] == web.started_at and shown["uptime_sec"] >= 0
+    assert "beatChip(state.heartbeat)" in page_source("admin")
+
+
+def test_names_known_in_the_decomposed_form_are_composed_once_at_start(tmp_path):
+    """Запись, обработанная до этой версии под разложенным именем папки (так пишет macOS), при следующем
+    запуске переезжает под составное имя — и открывается по ссылке страницы."""
+    import unicodedata
+    folder = unicodedata.normalize("NFD", "Отчёт й")
+    with running(tmp_path) as (web, client):
+        recorded(web, f"{folder}/вкс.mp4")
+    with running(tmp_path) as (web, client):
+        assert list(web.service.ledger.records) == ["Отчёт й/вкс.mp4"]
+        admin = enter(web, "admin", ADMIN_PASSWORD)
+        assert [f["name"] for f in admin.get("/api/browse", params={"path": "Отчёт й"}).json()["files"]] == ["вкс.mp4"]
+        assert any(e["kind"] == "folder_rename" and e["to"] == "Отчёт й"
+                   for e in admin.get("/api/admin/journal").json()["events"])

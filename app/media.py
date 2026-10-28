@@ -6,6 +6,8 @@
 """
 from __future__ import annotations
 
+import hashlib
+import os
 import subprocess
 import threading
 from pathlib import Path
@@ -45,6 +47,31 @@ def run_ffmpeg(args: list[str], **kwargs) -> subprocess.CompletedProcess:
 def run_ffprobe(args: list[str], **kwargs) -> subprocess.CompletedProcess:
     """Любой запуск ffprobe — через эту функцию: входу разрешены только файлы на диске."""
     return subprocess.run(["ffprobe", *LOCAL_ONLY, *args], **kwargs)
+
+
+# Отпечаток содержимого файла записи: по нему сервис узнаёт ту же запись под другим именем и замечает, что
+# исходник готовой записи изменился. Читаются начало и конец файла по PRINT_EDGE и размер, а не весь файл:
+# часовое видео — гигабайты, часто на сетевой папке, а сличать приходится и при обходе входной папки. Две
+# разные записи с одним размером до байта и одинаковыми первыми и последними мегабайтами не встречаются:
+# в начале — заголовки контейнера, в конце — оглавление или последние секунды звука. Докопированный файл
+# отличается размером, перезаписанный — содержимым концов.
+PRINT_EDGE = 4 * 2 ** 20
+
+
+def fingerprint(path: Path) -> str | None:
+    """Отпечаток содержимого файла (sha256 размера, первых и последних PRINT_EDGE байт); None — файл не
+    прочитать."""
+    try:
+        with open(path, "rb") as f:
+            size = os.fstat(f.fileno()).st_size
+            digest = hashlib.sha256(str(size).encode())
+            digest.update(f.read(PRINT_EDGE))
+            if size > PRINT_EDGE:
+                f.seek(max(PRINT_EDGE, size - PRINT_EDGE))
+                digest.update(f.read(PRINT_EDGE))
+    except OSError:
+        return None
+    return digest.hexdigest()
 
 
 SILENCE_DB = -60.0  # ниже этого порога в дорожке нет сигнала вообще

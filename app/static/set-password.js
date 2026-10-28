@@ -56,6 +56,7 @@ async function start() {
     ${formField("again", "Пароль ещё раз",
       `<input type="password" id="again" autocomplete="new-password" spellcheck="false" autocapitalize="none"
               aria-describedby="again-err" required>`, "", true)}
+    ${revokeBox(who.keys || 0)}
     <div class="row"><button id="go">Сохранить пароль</button>
       <button type="button" class="ghost" id="gen">Придумать за меня</button></div>
     <div class="msg" id="msg" role="alert"></div>`;
@@ -86,11 +87,15 @@ form.addEventListener("submit", async e => {
   button.disabled = true;
   button.textContent = "Сохраняю…";
   try {
-    const done = await api("/api/set-password", { token, password: document.getElementById("pass").value });
+    // ключи можно отозвать вместе с паролем — флажок есть, только если они у человека есть (revokeBox)
+    const revoke = document.getElementById("revoke");
+    const done = await api("/api/set-password", { token, password: document.getElementById("pass").value,
+                                                  revoke_keys: !!(revoke && revoke.checked) });
     window.history.replaceState(null, "", "/set-password");     // использованная ссылка в адресе больше не нужна
     form.innerHTML = `<h2>Пароль сохранён</h2>
       <div class="done" role="status" tabindex="-1" id="done">${icon("ok", 18)}
-        <span>Теперь войдите: логин <b class="mono">${esc(done.login)}</b> и пароль, который вы только что задали.</span></div>
+        <span>Теперь войдите: логин <b class="mono">${esc(done.login)}</b> и пароль, который вы только что задали.${
+          done.keys_revoked ? ` Ключи доступа отозваны: ${done.keys_revoked}.` : ""}</span></div>
       <div class="row"><a class="navlink" href="/login">Перейти ко входу</a></div>`;
     document.getElementById("done").focus();
     setTimeout(() => { location.href = "/login"; }, 4000);

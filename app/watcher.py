@@ -24,10 +24,10 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
 
-from . import folders, marks, media, notify, pipeline, upload
+from . import folders, marks, media, notify, pipeline, records, upload
 from .config import Settings
 from .journal import Journal
-from .ledger import MAX_FAILURES, RETRY_AFTER_SEC, RETRY_STATUSES, Ledger
+from .ledger import MAX_FAILURES, RETRY_AFTER_SEC, RETRY_STATUSES, SOURCE_CHANGED, SOURCE_STATE, Ledger
 
 # временные файлы копирования: пока идёт передача, имя выглядит так
 TEMP_SUFFIXES = {".tmp", ".part", ".crdownload", ".partial", ".!ut"}
@@ -139,6 +139,9 @@ class Pending:
     since: float = 0.0           # monotonic: когда этот замер увидели впервые
     first_seen: str = ""
     cut: str | None = None       # чем файл в этом замере похож на недокопированный (cut_short); None — не проверен
+    # почему файл ждёт решения администратора, а не идёт в обработку сам: это копия готовой записи или её же
+    # исходник под другим именем (Service._twin); "" — проверен, это новая запись; None — не проверен
+    held: str | None = None
 
     def quiet_sec(self) -> float:
         return time.monotonic() - self.since
@@ -198,8 +201,17 @@ class Service:
     scans: int = 0
     last_scan: str | None = None
     skipped_outbox: bool = False
-    warned_changed: set[str] = field(default_factory=set)
     warned_form: set[str] = field(default_factory=set)      # имена в разложенной форме, о которых уже сказано
+    # Записи журнала обработки, чьих исходников последний обход во входной папке не нашёл: для списка записей
+    # («исходник отсутствует»). До первого обхода пусто.
+    missing: set[str] = field(default_factory=set)
+    # Исходники, переименованные во входной папке мимо сервиса, которые нашёл обход: новый путь → запись.
+    # Переезжают в событийном цикле (settle), а не в потоке обхода.
+    adopt: dict[str, str] = field(default_factory=dict)
+    # Для переезда записей и папок тем же путём, что у кнопок «Переименовать» (records.py, folders.py): права
+    # пользователей (users.Users) и словари (dictionary.Store). Задаёт сервис (web.py).
+    people: object | None = None
+    dictionaries: object | None = None
     # Обход входной папки и действия с записью (records.py) друг друга исключают: сканер
     # сверяет файлы на диске с журналом обработки по пути, а переименование меняет и то,
     # и другое не одним шагом. Застань сканер середину — принял бы запись за новую.
@@ -224,17 +236,91 @@ class Service:
             return False
         return Path(rel).is_relative_to(inside)
 
-    def _warn_if_replaced(self, rel: str, size: int) -> None:
-        """Журнал ведётся по путям: файл, перезаписанный под тем же именем,
-        автоматика повторно не возьмёт. Сказать об этом надо один раз."""
+    def _check_source(self, rel: str, p: Path, st) -> None:
+        """Исходник готовой записи изменился с тех пор, как его обработали (докопировали, перезаписали)?
+        Журнал ведётся по путям: такой файл автоматика заново не возьмёт — распознавание снова стоило бы
+        денег, — а запомнит, что исходник изменился (SOURCE_STATE): это видно в списке записей. Вернули
+        прежний файл — отметка снимается. Сличаются размер и время изменения; время другое при том же
+        размере — ещё и отпечаток: файл могли только тронуть. Строка журнала работы — при смене состояния."""
         rec = self.ledger.get(rel) or {}
-        known = rec.get("source_size")
-        if known is None or known == size or rel in self.warned_changed:
+        size, mtime = rec.get("source_size"), rec.get("source_mtime")
+        if size is None:
+            return                      # строка давних версий: каким был исходник, не записано
+        changed = rec.get(SOURCE_STATE) == SOURCE_CHANGED
+        same = size == st.st_size and mtime in (None, st.st_mtime)
+        if not same and not changed and size == st.st_size and rec.get("source_print"):
+            same = media.fingerprint(p) == rec["source_print"]
+            if same:
+                self.ledger.amend(rel, source_mtime=st.st_mtime)
+        if same != changed:
             return
-        self.warned_changed.add(rel)
-        self.log(f"{rel}: размер изменился ({known} → {size} байт), но файл уже есть "
-                 f"в журнале — автоматически повторно не обрабатываю. Нужно — "
-                 f"запустите вручную с перезаписью")
+        if same:
+            self.ledger.amend(rel, **{SOURCE_STATE: None})
+            self.log(f"{rel}: исходник снова тот, что был при обработке")
+            return
+        self.ledger.amend(rel, **{SOURCE_STATE: SOURCE_CHANGED})
+        how = (f"размер {size} → {st.st_size} байт" if size != st.st_size
+               else "размер тот же, а содержимое другое" if rec.get("source_print") else "другое время изменения")
+        self.log(f"{rel}: исходник изменился после обработки ({how}) — протокол и расшифровка сделаны по прежнему "
+                 f"файлу. Автоматически заново не распознаю: это стоило бы денег. Нужно по новому файлу — запустите "
+                 f"запись вручную с перезаписью (force)")
+
+    def _twin(self, rel: str, p: Path, size: int, busy: set[str]) -> str | None:
+        """Не известна ли журналу обработки эта запись под другим путём. Журнал ведётся по путям, и файл,
+        переименованный или скопированный во входной папке мимо сервиса, был бы для него новой записью —
+        платное распознавание заново. Сличаются размер до байта, а у совпавших — отпечаток содержимого
+        (media.fingerprint):
+          - совпал с записью, чей исходник пропал с прежнего пути, — это она же, переименованная: запись
+            с результатами переезжает на новый путь (settle) тем же переездом, что у кнопки «Переименовать»;
+          - совпал с записью, чей исходник на месте, — копия. Сам сервис её не распознаёт: та же запись
+            за те же деньги второй раз, а результаты копии разошлись бы с прежними (подписи, отметки,
+            словари). Ждёт решения администратора: нужна и здесь — ручной запуск, нет — убрать файл;
+          - у записи без отпечатка (обработана до версии 1.2.0) он считается сейчас, если её исходник на
+            месте и того же размера; исходника нет — не сличить, и файл тоже ждёт решения.
+        Отдаёт, почему файл ждёт (для страницы), "" — это новая запись, None — решать на следующем обходе:
+        прежняя запись сейчас в работе."""
+        same = [rec for file, rec in list(self.ledger.records.items()) if file != rel and rec.get("source_size") == size]
+        if not same:
+            return ""
+        mine = media.fingerprint(p)
+        if mine is None:
+            return ""
+        copy = unsure = None
+        for rec in same:
+            file = rec["file"]
+            there = self.cfg.inbox / file
+            on_disk = there.is_file()
+            known = rec.get("source_print")
+            if (known is None and on_disk and file not in busy and rec.get(SOURCE_STATE) != SOURCE_CHANGED
+                    and pipeline._size_of(there) == size):
+                known = media.fingerprint(there)            # обработана до отпечатков: считаем, раз понадобился
+                if known:
+                    self.ledger.amend(file, source_print=known)
+            if known is None:
+                if not on_disk:
+                    unsure = unsure or file
+                continue
+            if known != mine:
+                continue
+            if on_disk:
+                copy = copy or file
+                continue
+            if file in busy:
+                return None
+            self.adopt[rel] = file
+            return f"это запись {file}, переименованная мимо сервиса, — переносится"
+        if copy:
+            self.log(f"{rel}: копия записи {copy} (то же содержимое, её исходник на месте) — в обработку не беру: "
+                     f"распознавание той же записи снова стоило бы денег. Нужна и здесь — запустите её вручную; "
+                     f"не нужна — уберите файл")
+            return f"копия записи {copy} — запустите вручную или уберите файл"
+        if unsure:
+            self.log(f"{rel}: размер до байта тот же, что у записи {unsure}, чей исходник пропал, а отпечатка "
+                     f"содержимого у неё нет (обработана до версии 1.2.0) — в обработку не беру. Если это она же под "
+                     f"новым именем — верните файлу прежнее имя и переименуйте запись на странице: результаты переедут "
+                     f"без распознавания; если другая — запустите её вручную")
+            return f"того же размера, что запись {unsure} без исходника, — проверьте и запустите вручную"
+        return ""
 
     def scan_once(self) -> None:
         with self.scan_lock:
@@ -254,6 +340,7 @@ class Service:
         # убирает из очереди, и при таком порядке чтения она не выпадет из обоих списков.
         busy = ({i.path for i in list(self.queue)} | {j["file"] for j in list(self.running)}
                 | set(list(self.unsaved)))
+        present: set[str] = set()       # все файлы входной папки: чьих исходников нет (missing)
         if self._folders_to_nfc(candidates, busy):
             try:
                 candidates = sorted(self.cfg.inbox.rglob("*"))
@@ -268,6 +355,7 @@ class Service:
                 rel = p.relative_to(self.cfg.inbox).as_posix()
             except (OSError, ValueError):
                 continue
+            present.add(rel)
 
             if self._under_outbox(rel):
                 if not self.skipped_outbox:
@@ -295,7 +383,7 @@ class Service:
                              f"из {MAX_FAILURES}): {rel} — прошлый раз: "
                              f"{(rec.get('error') or rec.get('status'))[:150]}")
                 else:
-                    self._warn_if_replaced(rel, st.st_size)
+                    self._check_source(rel, p, st)
                 continue
 
             seen.add(rel)
@@ -311,7 +399,7 @@ class Service:
                 prev.stable += 1
             else:
                 prev.size, prev.mtime = st.st_size, st.st_mtime
-                prev.stable, prev.since, prev.cut = 1, time.monotonic(), None
+                prev.stable, prev.since, prev.cut, prev.held = 1, time.monotonic(), None, None
 
             # решение по фактически прошедшему времени, а не по числу замеров:
             # требование — размер и mtime не менялись STABLE_SEC
@@ -323,6 +411,10 @@ class Service:
                                  f"жду, пока он изменится. Если запись такая и есть — запустите её вручную")
                 if prev.cut:
                     continue
+                if prev.held is None:
+                    prev.held = self._twin(rel, p, st.st_size, busy)
+                if prev.held != "":
+                    continue                    # ждёт решения администратора или переезда записи (settle)
                 taken = self._file_to_nfc(rel, busy)
                 if taken is None:
                     continue                    # рядом ещё копируется другой файл той же папки — следующим обходом
@@ -335,6 +427,45 @@ class Service:
         # файл исчез или переехал — забываем накопленную стабильность
         for rel in [r for r in self.pending if r not in seen]:
             self.pending.pop(rel, None)
+            self.adopt.pop(rel, None)
+        self.missing = {file for file in list(self.ledger.records) if file not in present}
+
+    def settle(self) -> None:
+        """Переезды записей, найденные обходом (_twin), — уже не в его потоке, а в событийном цикле: там же
+        живут обработчики и ручной запуск, и переезд, как у кнопки «Переименовать», идёт без await под
+        замком сканера (подробно — в records.py). Замок занят действием со страницы — до следующего обхода."""
+        if not self.adopt or not self.scan_lock.acquire(blocking=False):
+            return
+        try:
+            for new, old in list(self.adopt.items()):
+                del self.adopt[new]
+                self._adopt(old, new)
+        finally:
+            self.scan_lock.release()
+
+    def _adopt(self, old: str, new: str) -> None:
+        """Запись old, чей исходник переименовали мимо сервиса в new, — на новый путь: результаты, строка
+        журнала, отметки поручений, словарь записи и событие в журнале (records.adopt). Не вышло — файл ждёт
+        решения администратора, распознавания нет."""
+        kind = "record_rename" if old.rpartition("/")[0] == new.rpartition("/")[0] else "record_move"
+
+        def also(target: str) -> None:
+            if self.dictionaries is not None:
+                self.dictionaries.move_record(old, target)
+            self.journal.write(kind, "", file=old, to=target)
+
+        try:
+            records.adopt(self.cfg, self, old, new, also=also)
+        except Exception as e:
+            why = e.detail if isinstance(e, records.RecordError) else (getattr(e, "strerror", None) or str(e))
+            held = f"похоже, это запись {old}, переименованная мимо сервиса, но её результаты не перенести ({why})"
+            if (watch := self.pending.get(new)) is not None:
+                watch.held = held
+            self.log(f"{new}: {held} — в обработку не беру. Верните файлу прежнее имя или запустите его вручную")
+            return
+        self.pending.pop(new, None)
+        self.log(f"{old} → {new}: исходник записи переименован во входной папке мимо сервиса (содержимое то же) — "
+                 f"запись с результатами переехала следом, заново не распознаю")
 
     # ---------- имена в разложенной форме (NFD) ----------
     # Страница, база и права знают имена в составной форме (upload.nfc): так их приводит всё, что
@@ -362,6 +493,54 @@ class Service:
         copying = [path for path, seen in self.pending.items() if seen.quiet_sec() < self.cfg.stable_sec]
         if any(inside(path) and path != own for path in [*copying, *busy]):
             return "wait"
+        return None
+
+    def known_to_nfc(self) -> None:
+        """Разовое приведение при запуске: записи и папки, которые журнал обработки знает под именем в
+        разложенной форме (обработаны так до версии 1.2.0), — к составной. Ссылки страницы и права — в
+        составной форме, и такая папка на странице не открывалась бы. Переезд — тот же, что у кнопок
+        «Переименовать» (folders.to_nfc, records.rename): исходники, результаты, журнал, отметки, права,
+        словари, признак серии и событие в журнале. Сначала — самая верхняя часть пути в разложенной
+        форме; не вышло (рядом то же имя в составной форме) — остаётся как есть, строкой в журнале работы."""
+        kept: set[str] = set()
+        while True:
+            todo = sorted({here for file in list(self.ledger.records) if (here := self._decomposed(file))} - kept)
+            if not todo:
+                return
+            for here in todo:
+                try:
+                    new = self._to_nfc(here)
+                except Exception as e:
+                    kept.add(here)
+                    why = (e.detail if isinstance(e, (records.RecordError, folders.FolderError))
+                           else getattr(e, "strerror", None) or str(e))
+                    self._form_kept(here, f"а переименовать не вышло ({why})")
+                    continue
+                self.log(f"{here}: имя приведено к составной форме Unicode (разложенным его пишет macOS) — {new}; "
+                         "результаты, журнал, права и словари — под новым именем")
+
+    def _to_nfc(self, here: str) -> str:
+        """Запись или папку here (последняя часть пути — в разложенной форме) — в составную. Новый путь."""
+        if here in self.ledger.records:
+            def moved(target: str) -> None:
+                if self.dictionaries is not None:
+                    self.dictionaries.move_record(here, target)
+                self.journal.write("record_rename", "", file=here, to=target)
+            return records.rename(self.cfg, self, here, upload.nfc(Path(here).name), also=moved)
+
+        def renamed(target: str) -> None:
+            if self.dictionaries is not None:
+                self.dictionaries.move_folder(here, target)
+            self.journal.write("folder_rename", "", folder=here, to=target)
+        return folders.to_nfc(self.cfg, self, self.people, here, also=renamed)
+
+    @staticmethod
+    def _decomposed(rel: str) -> str | None:
+        """Самая верхняя часть пути в разложенной форме — путём до неё включительно; None — таких нет."""
+        parts = rel.split("/")
+        for n, part in enumerate(parts, 1):
+            if not unicodedata.is_normalized("NFC", part):
+                return "/".join(parts[:n])
         return None
 
     def _rename_nfc(self, rel: str) -> str:
@@ -431,6 +610,7 @@ class Service:
         while True:
             try:
                 await asyncio.to_thread(self.scan_once)
+                self.settle()
             except Exception as e:  # сканер не должен умирать ни при чём
                 self.log(f"сбой сканера (продолжаю): {e!r}")
             await asyncio.sleep(self.cfg.scan_interval_sec)
@@ -541,12 +721,26 @@ class Service:
                     "manual": item.manual, "force": item.force,
                 }
                 run = False
+            self._source_kept(record, prev)
             saved = self._save(item, record, prev, run)
         finally:
             # после записи в журнал или в unsaved: иначе сканер успел бы принять запись за новую
             self.running.remove(job)
         if saved:
             self._after(item, record, prev)
+
+    @staticmethod
+    def _source_kept(record: dict, prev: dict | None) -> None:
+        """Пересборка по прежней расшифровке описывает прежний файл. Если исходник с тех пор изменился,
+        в строке остаётся, каким он был при распознавании, и отметка «исходник изменился»: иначе прогон
+        выдал бы старый протокол за протокол нового файла. Полный прогон (force) расшифровку не берёт."""
+        if not prev or not record.get("reused_transcript"):
+            return
+        if (prev.get(SOURCE_STATE) == SOURCE_CHANGED
+                or prev.get("source_size") not in (None, record.get("source_size"))
+                or prev.get("source_print") not in (None, record.get("source_print"))):
+            record.update({name: prev.get(name) for name in ("source_size", "source_mtime", "source_print")})
+            record[SOURCE_STATE] = SOURCE_CHANGED
 
     def _save(self, item: QueueItem, record: dict, prev: dict | None, run: bool) -> bool:
         """Исход прогона — в базу. Исход записи и её расход — одной транзакцией: строка журнала
@@ -660,7 +854,9 @@ class Service:
                 {"path": rel, "size": p.size, "stable": p.stable,
                  "needed": self.cfg.stable_samples,
                  "quiet_sec": round(p.quiet_sec()), "stable_sec": self.cfg.stable_sec,
-                 "first_seen": p.first_seen}
+                 "first_seen": p.first_seen,
+                 # почему в обработку не идёт сам: похож на недокопированный, копия готовой записи…
+                 "held": f"похоже, докопирован не до конца: {p.cut}" if p.cut else p.held or ""}
                 for rel, p in sorted(self.pending.items())
             ],
             "scans": self.scans,

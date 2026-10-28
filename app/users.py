@@ -46,6 +46,11 @@
 Пароли хранятся только хешами (scrypt). Сессия — подписанная метка в куке:
 серверу нечего хранить, перезапуск никого не разлогинивает, а смена пароля
 или удаление пользователя сразу делают его старые метки недействительными.
+В метке — штамп: подпись секретом сервиса от пароля (у admin из .env) или его хеша и от
+счётчика сессий человека. По штампу из чужой куки пароль не перебрать — без секрета сервиса
+его не посчитать. «Выйти везде» увеличивает счётчик: все прежние метки человека перестают
+подходить сразу, на любом браузере. Счётчик пользователя — в его строке users, у admin из .env
+строки там нет, и его счётчик лежит в meta.
 """
 from __future__ import annotations
 
@@ -74,6 +79,11 @@ EMAIL_RE = re.compile(r"""[^@\s<>"',;:()\\]+@[^@\s<>"',;:()\\]+\.[^@\s<>"',;:()\
 LINK_SEC = 48 * 3600          # сколько живёт ссылка «задать пароль»
 SESSION_SEC = 30 * 86400
 COOKIE = "tw_session"
+ADMIN_SESSIONS = "admin_sessions"       # ключ в meta: счётчик сессий admin из .env
+# Фиктивный хеш: с ним сверяется пароль неизвестного логина и учётной записи без пароля, чтобы
+# ответ не приходил быстрее, чем для существующей, — по времени не узнать, есть ли такой логин.
+# Пароль к нему случайный и нигде не записан; совпадение в счёт не идёт.
+DUMMY_HASH = "scrypt$e07da6bc55aceed10910cee42d58f788$62ee0be23c949fb34dfe887c494c3008407cfc1cc934199e74d628086ec2bed3"
 LOCAL, DOMAIN = "local", "domain"       # источник учётной записи
 IN_DOMAIN = "это учётная запись домена: пароль проверяется и меняется в домене, в сервисе его нет"
 
@@ -455,23 +465,27 @@ class Users:
     def _stored(self, login: str) -> str | None:
         return self.db.value("SELECT password FROM users WHERE login = ?", login)
 
-    def _replace_password(self, login: str, stored: str, fresh: str) -> None:
+    def _replace_password(self, login: str, stored: str, fresh: str, drop_keys: bool) -> int:
         """Пишет новый хеш, если учётную запись за время подсчёта хеша никто не поменял.
-        Со сменой пароля гаснет и высланная ссылка."""
+        Со сменой пароля гаснет и высланная ссылка. drop_keys — отозвать заодно все ключи
+        человека, той же транзакцией. Отдаёт, сколько ключей отозвано."""
         with self.db.write() as con:
             changed = con.execute("UPDATE users SET password = ?, link_hash = NULL, link_expires = NULL "
                                   "WHERE login = ? AND password = ?", (fresh, login, stored)).rowcount
             if not changed:
                 raise UserError("учётная запись только что изменилась — повторите")
+            return self.vault.drop_owner(login) if drop_keys else 0
 
-    def set_password(self, login: str, old: str, new: str) -> None:
+    def set_password(self, login: str, old: str, new: str, drop_keys: bool = False) -> int:
+        """Человек меняет себе пароль. drop_keys — и отзывает свои ключи доступа: пароль мог
+        узнать кто-то ещё, а ключом входят без пароля. Отдаёт, сколько ключей отозвано."""
         if self.source(login) == DOMAIN:
             raise UserError(IN_DOMAIN)
         stored = self._stored(login)
         if stored is None or not check_password(old, stored):
             raise UserError("текущий пароль неверный")
         check_new_password(new)
-        self._replace_password(login, stored, hash_password(new))
+        return self._replace_password(login, stored, hash_password(new), drop_keys)
 
     def public(self) -> list[dict]:
         return [{"login": k, "name": v["name"], "email": v["email"], "home": v["home"], "admin": v["admin"],
@@ -503,8 +517,10 @@ class Users:
             return None
         return row["login"] if row["link_expires"] >= (time.time() if now is None else now) else None
 
-    def use_link(self, token: str, password: str, now: float | None = None) -> str:
-        """Задаёт пароль по ссылке и гасит её. Отдаёт логин."""
+    def use_link(self, token: str, password: str, now: float | None = None,
+                 drop_keys: bool = False) -> tuple[str, int]:
+        """Задаёт пароль по ссылке и гасит её; drop_keys — заодно отзывает ключи человека.
+        Отдаёт логин и сколько ключей отозвано."""
         gone = "ссылка недействительна или её срок вышел — запросите новую"
         login = self.link_owner(token, now)
         if login is None:
@@ -516,8 +532,7 @@ class Users:
             # пока считался хеш, ссылку могли использовать или выпустить новую
             if self.link_owner(token, now) != login:
                 raise UserError(gone)
-            self._replace_password(login, stored, fresh)
-        return login
+            return login, self._replace_password(login, stored, fresh, drop_keys)
 
     # ---------- ключи доступа ----------
 
@@ -568,9 +583,13 @@ class Users:
             return bool(self.admin_password) and hmac.compare_digest(
                 password.encode("utf-8"), self.admin_password.encode("utf-8"))
         # у приглашённого пароля ещё нет, у доменного его нет вовсе: пустой хеш не подходит ни к
-        # какому паролю — доменный пароль с записью сервиса здесь не сверяется никогда
+        # какому паролю — доменный пароль с записью сервиса здесь не сверяется никогда. И для них,
+        # и для неизвестного логина scrypt считается так же, как для настоящего, — с фиктивным хешем
         stored = self._stored(login)
-        return bool(stored) and check_password(password, stored)
+        if not stored:
+            check_password(password, DUMMY_HASH)
+            return False
+        return check_password(password, stored)
 
     def access(self, login: str) -> Access | None:
         if login == ADMIN:
@@ -594,11 +613,26 @@ class Users:
         return self._key
 
     def _stamp(self, login: str) -> str:
-        """Меняется вместе с паролем: старые метки перестают подходить."""
-        source = self.admin_password if login == ADMIN else self._stored(login)
-        if source is None:
-            raise KeyError(login)
-        return hashlib.sha256(source.encode("utf-8")).hexdigest()[:16]
+        """Меняется вместе с паролем и счётчиком сессий: старые метки перестают подходить.
+        Подпись секретом сервиса — по штампу из куки пароль не перебрать."""
+        if login == ADMIN:
+            source, sessions = self.admin_password, self.db.noted(ADMIN_SESSIONS) or "0"
+        else:
+            row = self.db.row("SELECT password, sessions FROM users WHERE login = ?", login)
+            if row is None:
+                raise KeyError(login)
+            source, sessions = row["password"], row["sessions"]
+        return self._sign(f"stamp|{login}|{sessions}|{source}")[:32]
+
+    def end_sessions(self, login: str) -> None:
+        """«Выйти везде»: все выданные человеку метки входа перестают действовать. Ключи доступа
+        не трогает — они отзываются отдельно."""
+        with self.db.write() as con:
+            if login == ADMIN:
+                con.execute("INSERT INTO meta (key, value) VALUES (?, '1') ON CONFLICT (key) DO UPDATE "
+                            "SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT)", (ADMIN_SESSIONS,))
+            elif not con.execute("UPDATE users SET sessions = sessions + 1 WHERE login = ?", (login,)).rowcount:
+                raise UserError("такого пользователя нет")
 
     def _sign(self, payload: str) -> str:
         return hmac.new(self._secret(), payload.encode("utf-8"), hashlib.sha256).hexdigest()

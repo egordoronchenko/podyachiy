@@ -25,7 +25,8 @@ from app import mail
 
 def cfg(**over):
     base = dict(smtp_host="smtp.test", smtp_port=0, smtp_user="", smtp_password="", personal=False, smtp_ca_file="",
-                smtp_from="podyachiy@example.test", smtp_security="none", public_url="http://192.0.2.10:8082")
+                smtp_from="podyachiy@example.test", smtp_security="none", public_url="http://192.0.2.10:8082",
+                mail_domains=("example.test",))
     return types.SimpleNamespace(**{**base, **over})
 
 
@@ -603,3 +604,23 @@ def test_launcher_is_told_where_the_reason_is_and_not_sent_to_the_administrator(
             assert ("попробует ещё раз сам" in text) is retrying and ("запустите запись ещё раз" in text) is not retrying
     # нет звука — совет тот же, что автору: дело в файле, а не в сбое
     assert mail.failed(cfg(), "Пётр", ABOUT, "no_audio", False, by_hand=True) == mail.failed(cfg(), "Пётр", ABOUT, "no_audio", False)
+
+
+def test_mail_without_mail_domains_is_warned_about():
+    """Почта включена, а MAIL_DOMAINS пуст: заявку подают с любой почтой (на неё после одобрения
+    уйдёт ссылка на пароль), протокол уходит на любой адрес. Предупреждение — в журнал при запуске
+    и в блок «Почта»; сервис при этом работает."""
+    warning, = mail.warnings(cfg(mail_domains=()))
+    assert "MAIL_DOMAINS" in warning and "любой" in warning and "домен почты организации" in warning
+    assert mail.warnings(cfg(mail_domains=("example.test",))) == []
+    both = mail.warnings(cfg(mail_domains=(), smtp_user="robot"))
+    assert len(both) == 2 and "открытым текстом" in both[0]
+
+
+def test_letter_about_a_known_address_names_the_login_and_the_way_back():
+    """Заявку подали с почтой, у которой уже есть учётная запись: владельцу ящика — логин и куда
+    идти, если забыл пароль; ссылки на пароль в письме нет."""
+    subject, text, body = mail.known(cfg(), "Иван <b>", "ivanov")
+    assert subject == "учётная запись уже есть"
+    assert "ivanov" in text and "http://192.0.2.10:8082/login?forgot" in text and "set-password" not in text
+    assert "Иван &lt;b&gt;" in body and "<b>ivanov</b>" in body and "Иван <b>" not in body

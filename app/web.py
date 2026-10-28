@@ -24,6 +24,7 @@ import errno
 import hashlib
 import io
 import ipaddress
+import json
 import os
 import re
 import shutil
@@ -48,7 +49,7 @@ from . import (about, apidoc, backup, brand, costbook, db, dictionary, directory
                marks, media, migrate, mindmap, names, notify, pipeline, providers, records, registry, search, series,
                settings, signup, speech, templates, upload, users)
 from .config import Settings
-from .ledger import REMOVED, Ledger
+from .ledger import REMOVED, SOURCE_CHANGED, SOURCE_MISSING, SOURCE_STATE, Ledger
 from .logbook import Logbook
 from .watcher import Service, hidden
 
@@ -79,7 +80,7 @@ service: Service | None = None
 state_kept = db.kept(cfg.state_dir)
 try:
     # при первом запуске после обновления сюда же входит перенос прежних файлов состояния в базу
-    base = migrate.open_base(cfg, log, state_kept)
+    base = migrate.open_base(cfg, log, state_kept, db.kept(cfg.outbox))
 except db.Refusal as refusal:
     log(f"ОТКАЗ ЗАПУСКА: {refusal}")
     raise SystemExit(f"сервис не запущен: {refusal}")
@@ -267,13 +268,15 @@ def _startup_checks() -> None:
         if not cfg.admin_emails:
             log("ВНИМАНИЕ: ADMIN_EMAIL не задан — о новых заявках на доступ письмо никому не уйдёт, "
                 "их будет видно только счётчиком в меню")
-        log("протокол со страницы записи можно отправить " + (
-            f"только на адреса доменов: {', '.join(cfg.mail_domains)}" if cfg.mail_domains
-            else "на любой адрес — чтобы ограничить, задайте в .env MAIL_DOMAINS (домен почты организации)"))
+        if cfg.mail_domains:
+            # без них — предупреждение выше (mail.warnings): заявки и протокол — на любые адреса
+            log(f"заявки на доступ принимаются и протокол со страницы записи отправляется только на адреса "
+                f"доменов: {', '.join(cfg.mail_domains)}")
     elif mail.why_off(cfg):
         log(f"ВНИМАНИЕ: почта выключена — {mail.why_off(cfg)}")
     for warning in storage_warnings:
         log(f"ВНИМАНИЕ: {warning}")
+    _check_volumes()
     global upload_ready
     upload_ready = cfg.inbox.is_dir() and upload.writable(cfg.inbox)
     if not upload_ready:
@@ -287,6 +290,21 @@ storage = db.filesystem(cfg.state_dir)
 # О чём администратору надо знать про хранение — в журнал работы при запуске и на страницу «Обработка».
 storage_warnings: list[str] = migrate.storage_warnings(cfg, storage)
 clean_skipped: dict[str, str] = {}      # чья корзина → причина, по которой её не чистили в прошлый раз
+# Что не так с томами установки (не подключены с хоста, мало места) — по последней проверке: при запуске и
+# раз в сутки (_check_volumes). На страницу «Обработка» и в /api/admin/status.
+volume_warnings: list[str] = []
+
+
+def _check_volumes() -> None:
+    """Тома установки и место на них (migrate.volume_warnings). Новое предупреждение — строкой в журнал
+    работы, а когда всё прошло — строкой, что снова в порядке."""
+    found = migrate.volume_warnings(cfg)
+    for warning in found:
+        if warning not in volume_warnings:
+            log(f"ВНИМАНИЕ: {warning}")
+    if volume_warnings and not found:
+        log("тома установки подключены, места на них достаточно")
+    volume_warnings[:] = found
 
 
 def _clean() -> None:
@@ -309,13 +327,64 @@ def _clean() -> None:
 
 
 async def _clean_loop() -> None:
-    """Сервис работает месяцами без перезапуска — чистки при запуске мало."""
+    """Сервис работает месяцами без перезапуска — чистки и проверки томов при запуске мало."""
     while True:
         await asyncio.sleep(CLEAN_EVERY_SEC)
         try:
             await asyncio.to_thread(_clean)
         except Exception as e:  # сетевая папка отвалилась — попробуем через сутки
             log(f"сбой чистки корзины и недогрузок (продолжаю): {e!r}")
+        try:
+            await asyncio.to_thread(_check_volumes)
+        except Exception as e:
+            log(f"сбой проверки томов (продолжаю): {e!r}")
+
+
+# Сервис раз в HEARTBEAT_SEC отмечается в базе (таблица meta, ключ ALIVE): когда, какой версии, с какого
+# времени работает и сколько обработчиков живо. Отметку видят страница «Обработка», внешний мониторинг (тот же
+# /api/admin/status) и тот, кто открыл базу без сервиса: копия или восстановление понимают по ней, когда
+# сервис над этой базой работал последний раз.
+HEARTBEAT_SEC = 30
+ALIVE = "alive"
+started_at = ""                     # когда запущен этот процесс сервиса
+workers: list[asyncio.Task] = []    # обработчики: живы ли они, видно по задачам
+
+
+def _beat() -> None:
+    assert service is not None
+    base.note(ALIVE, json.dumps({
+        "at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "version": about.version() or "", "started": started_at,
+        "workers": sum(not task.done() for task in workers), "of": cfg.workers,
+        "running": len(service.running), "queue": len(service.queue)}, ensure_ascii=False))
+
+
+async def _beat_loop() -> None:
+    """Отметка «сервис жив» — раз в HEARTBEAT_SEC. Не пишется (база занята, диск полон) — одна строка в журнал
+    работы, а когда снова пишется — ещё одна."""
+    failing = False
+    while True:
+        try:
+            await asyncio.to_thread(_beat)
+            if failing:
+                log("отметка «сервис жив» снова пишется в базу")
+            failing = False
+        except Exception as e:
+            if not failing:
+                log(f"ВНИМАНИЕ: отметка «сервис жив» не пишется в базу: {e!r}")
+            failing = True
+        await asyncio.sleep(HEARTBEAT_SEC)
+
+
+def _heartbeat() -> dict | None:
+    """Последняя отметка «сервис жив» из базы — и сколько секунд назад она сделана; None — отметок не было."""
+    noted = base.noted(ALIVE)
+    if not noted:
+        return None
+    beat = json.loads(noted)
+    now = datetime.datetime.now().astimezone()
+    ago = lambda at: round((now - datetime.datetime.fromisoformat(at)).total_seconds()) if at else None
+    return {**beat, "ago_sec": ago(beat.get("at")), "uptime_sec": ago(beat.get("started")), "every_sec": HEARTBEAT_SEC}
 
 
 def _key_targets() -> list[tuple[str, providers.Provider, tuple[str, ...]]]:
@@ -361,14 +430,21 @@ async def lifespan(app: FastAPI):
     if cfg.summary_base_url != cfg.base_url:
         log(f"текстовые этапы идут по своему адресу: {cfg.summary_base_url} "
             f"(поручения: {', '.join(cfg.actions_models)}) — запасной поставщик на них не действует")
+    global started_at
     service = Service(cfg=cfg, log=log, ledger=Ledger(base, log), journal=trail,
                       speech_model=speech_model, tell=_tell, words=words.effective, marked=noted,
-                      series=lambda rel: serial.on(_parent_of(rel)))
+                      series=lambda rel: serial.on(_parent_of(rel)), people=people, dictionaries=words)
+    try:
+        service.known_to_nfc()          # записи и папки под разложенными именами — разово, до обхода
+    except Exception as e:
+        log(f"сбой приведения имён к составной форме (продолжаю): {e!r}")
     log(f"обработчиков: {cfg.workers} — столько записей идёт одновременно (WORKERS в .env)")
-    tasks = [asyncio.create_task(service.scan_loop()),
-             *(asyncio.create_task(service.worker_loop()) for _ in range(cfg.workers)),
+    started_at = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+    workers[:] = [asyncio.create_task(service.worker_loop()) for _ in range(cfg.workers)]
+    tasks = [asyncio.create_task(service.scan_loop()), *workers,
              asyncio.create_task(_check_keys_on_start())]     # не ждём: запуск не зависит от поставщика
     tasks.append(asyncio.create_task(_clean_loop()))
+    tasks.append(asyncio.create_task(_beat_loop()))
     try:
         yield
     finally:
@@ -739,7 +815,7 @@ def _upload_denied(who: users.Access, folder: str) -> str:
 
 
 PAGE_ONLY = ("это делается только на странице сервиса, даже ключом с управлением: ключи доступа, пароли "
-             "и ссылки на пароль, роль администратора сервиса и почта пользователя, удаление записей и папок, "
+             "и ссылки на пароль, «Выйти везде», роль администратора сервиса и почта пользователя, удаление записей и папок, "
              "отправка протокола на почту, правка шаблонов и оформления, проверка подключения к домену и "
              "привязка к нему")
 
@@ -1018,6 +1094,10 @@ def admin_status(log_from: int = 0, history_version: int = -1):
         # системы без путей), предупреждения и когда команда копии отработала последний раз
         "storage": {"schema": base.version, "bytes": base.size(), "fs": storage["type"], "kind": storage["kind"],
                     "warnings": storage_warnings, "backup": backup.last(base)},
+        # тома установки: не подключены с хоста, мало места — по проверке при запуске и раз в сутки
+        "volumes": {"warnings": volume_warnings},
+        # последняя отметка «сервис жив» в базе
+        "heartbeat": _heartbeat(),
         "templates": {k: v["title"] for k, v in templates.types(cfg.prompts_dir).items()},
         "speech": _speech_choice(),
         "providers": _providers(),
@@ -1098,7 +1178,18 @@ def _shown(rec: dict, who: users.Access) -> dict:
     return {**rec, "error": _failure(rec, who)} if rec.get("error") else rec
 
 
+def _source(file: str, rec: dict) -> str | None:
+    """Что с исходником записи: "missing" — его нет во входной папке (по последнему обходу), "changed" —
+    изменился после обработки (докопировали, перезаписали), None — на месте и тот же."""
+    assert service is not None
+    if file in service.missing:
+        return SOURCE_MISSING
+    return SOURCE_CHANGED if rec.get(SOURCE_STATE) == SOURCE_CHANGED else None
+
+
 FLAT_LIMIT = 300     # «все записи» — это недавние: глубже ищут поиском или идут в папку
+HELD_CUT = "похоже, файл докопирован не до конца — обработка начнётся, когда он изменится"
+HELD_DECISION = "в обработку сама не пойдёт — ждёт решения администратора сервиса"
 
 # какие результаты имеет смысл открывать при таком исходе обработки
 KINDS_BY_STATUS = {
@@ -1158,6 +1249,7 @@ def browse(path: str = "", flat: bool = False, who: users.Access = Depends(viewe
                 "timestamps_unknown": rec.get("timestamps_unknown"),
                 "runs": rec.get("runs"),
                 "error": _failure(rec, who),
+                "source": _source(key, rec),
             })
         if parent == rel:
             continue
@@ -1184,10 +1276,13 @@ def browse(path: str = "", flat: bool = False, who: users.Access = Depends(viewe
     for path, watch in list(service.pending.items()):
         if not who.sees(_parent_of(path)):
             continue
+        # сам в обработку не пойдёт: похож на недокопированный или ждёт решения администратора (копия готовой
+        # записи) — человеку без подробностей: чья это копия, ему знать незачем
+        held = (HELD_CUT if watch.cut else HELD_DECISION if watch.held else "")
         pending.append({"file": path, "name": PurePosixPath(path).name,
-                        "dir": _parent_of(path), "state": "copying",
+                        "dir": _parent_of(path), "state": "held" if held else "copying",
                         "size": watch.size, "quiet_sec": round(watch.quiet_sec()),
-                        "stable_sec": cfg.stable_sec})
+                        "stable_sec": cfg.stable_sec, **({"note": held} if held else {})})
     for item in list(service.queue):
         # пересборка, запрошенная посреди прогона, ждёт его конца: запись и так в списке
         if not who.sees(_parent_of(item.path)) or item.path in in_work:
@@ -1578,7 +1673,7 @@ def v1_record(request: Request, file: str, transcript: bool = False, who: users.
     protocol = _protocol(file, record)
     out = {**external.brief(_shown(record, who), _base(request)), "protocol": protocol,
            "tasks": _marked(file, record, protocol) if protocol else [],
-           "can_mark": who.owns(_parent_of(file))}
+           "can_mark": who.owns(_parent_of(file)), "source": _source(file, record)}
     out["links"]["audio"] = (_base(request) + "/api/audio?" + urlencode({"file": file}, quote_via=quote)
                              if _audio_path(file, record) else None)
     if transcript:
@@ -2655,16 +2750,32 @@ async def login(req: LoginRequest, request: Request, response: Response):
         await asyncio.sleep(max(0.0, WRONG_PASSWORD_DELAY_SEC - (time.monotonic() - started)))
         raise
     jot("login", who, **how)
+    _session_cookie(response, request, who.login)
+    return {"login": who.login, "name": who.name, "admin": who.admin}
+
+
+def _session_cookie(response: Response, request: Request, login: str) -> None:
     # метка недоступна скриптам страницы и не уходит с запросами с чужих сайтов
     # выдана по HTTPS — по HTTP браузер её не отправит
-    response.set_cookie(users.COOKIE, people.token(who.login), max_age=users.SESSION_SEC,
+    response.set_cookie(users.COOKIE, people.token(login), max_age=users.SESSION_SEC,
                         httponly=True, samesite="lax", path="/", secure=request.url.scheme == "https")
-    return {"login": who.login, "name": who.name, "admin": who.admin}
 
 
 @app.post("/api/logout")
 async def logout(response: Response):
     response.delete_cookie(users.COOKIE, path="/")
+    return {"ok": True}
+
+
+@app.post("/api/logout/all")
+async def logout_everywhere(request: Request, response: Response, who: users.Access = Depends(person)):
+    """«Выйти везде»: все входы человека на других браузерах и устройствах перестают действовать,
+    этот получает новую метку и остаётся — человек сам нажал кнопку здесь. Ключи доступа — отдельные
+    пропуска программ: они не отзываются, для этого есть окно «Ключи доступа»."""
+    await asyncio.to_thread(people.end_sessions, who.login)
+    _session_cookie(response, request, who.login)
+    log(f"пользователь {who.login} вышел на всех устройствах")
+    jot("logout_all", who)
     return {"ok": True}
 
 
@@ -2710,22 +2821,31 @@ async def me(request: Request):
 class PasswordRequest(BaseModel):
     old: str
     new: str
+    revoke_keys: bool = False     # заодно отозвать свои ключи доступа
+
+
+def _revoked(count: int) -> dict:
+    """Сколько ключей отозвано вместе с паролем — в ответ и в журнал, если отозваны."""
+    return {"keys_revoked": count} if count else {}
 
 
 @app.post("/api/password")
 async def change_password(req: PasswordRequest, who: users.Access = Depends(person)):
+    """Смена своего пароля. Все входы человека, и этот тоже, перестают действовать: метка входа
+    подписана вместе с паролем. revoke_keys — отозвать и ключи доступа: по умолчанию нет, на них
+    работают интеграции человека, и обрывать их без его слова нельзя."""
     if who.login == users.ADMIN:
         raise HTTPException(400, "пароль администратора задаётся в .env на сервере")
     if who.domain:
         raise HTTPException(400, users.IN_DOMAIN)
     try:
-        await asyncio.to_thread(people.set_password, who.login, req.old, req.new)
+        dropped = await asyncio.to_thread(people.set_password, who.login, req.old, req.new, req.revoke_keys)
     except users.UserError as e:
         await asyncio.sleep(WRONG_PASSWORD_DELAY_SEC)
         raise HTTPException(400, str(e))
-    log(f"пользователь {who.login} сменил пароль")
-    jot("password", who)
-    return {"ok": True}
+    log(f"пользователь {who.login} сменил пароль" + (f" и отозвал свои ключи доступа: {dropped}" if dropped else ""))
+    jot("password", who, **({"keys": dropped} if dropped else {}))
+    return {"ok": True, **_revoked(dropped)}
 
 
 class NotifyRequest(BaseModel):
@@ -2792,6 +2912,18 @@ async def _notify_admins(claim: dict) -> None:
         trail.write("mail_failed", "", what="notice", login=claim["login"], error=str(e)[:300])
 
 
+async def _tell_known(login: str, email: str) -> None:
+    """Письмо владельцу ящика: с его почтой подали заявку, а учётная запись у него уже есть."""
+    user = people.get(login)
+    if not user:
+        return
+    try:
+        await _post([email], mail.known(cfg, user["name"], login, user["source"] == users.DOMAIN))
+    except mail.MailError as e:
+        log(f"ВНИМАНИЕ: письмо «учётная запись уже есть» ({login}) не ушло: {e}")
+        trail.write("mail_failed", "", what="known", login=login, error=str(e)[:300])
+
+
 @app.post("/api/request")
 async def claim_new(req: ClaimRequest, request: Request, background: BackgroundTasks):
     """Заявка на доступ — от человека без учётной записи, без входа. Почта сервису для этого
@@ -2803,10 +2935,18 @@ async def claim_new(req: ClaimRequest, request: Request, background: BackgroundT
         raise HTTPException(429, TOO_OFTEN)
     try:
         claim = await asyncio.to_thread(claims.add, req.name, req.email, req.login, req.comment, people,
-                                        cfg.mail_on)
+                                        cfg.mail_on, cfg.mail_domains)
     except signup.RequestError as e:
         # X-Field — к какому полю формы относится отказ: страница покажет его под этим полем
         raise HTTPException(e.status, e.detail, headers={"X-Field": e.field} if e.field else None)
+    except signup.Known as e:
+        # ответ — как на любую заявку, и в счёт принятых она идёт так же: по ответу и по пределу не
+        # узнать, что почта заведена. Владельцу ящика — письмо после ответа
+        claim_accepted.allow(address)
+        log(f"заявка на доступ с почтой учётной записи {e.login} — не сохранена, владельцу ушло письмо ({address})")
+        trail.write("request_known", "", login=e.login)
+        background.add_task(_tell_known, e.login, e.email)
+        return {"ok": True}
     claim_accepted.allow(address)
     log(f"заявка на доступ: {claim['login']} ({address})")
     trail.write("request_new", "", login=claim["login"], name=claim["name"], email=claim["email"])
@@ -2857,28 +2997,34 @@ async def forgot(req: ForgotRequest, request: Request, background: BackgroundTas
 class LinkRequest(BaseModel):
     token: str
     password: str = ""
+    revoke_keys: bool = False     # заодно отозвать ключи доступа человека
 
 
 @app.post("/api/set-password/check")
 async def link_check(req: LinkRequest):
     """Действует ли ссылка и чья она — странице, прежде чем спрашивать пароль. Строка ссылки
-    приходит телом запроса, а не в адресе: в журнал запросов она не попадает."""
+    приходит телом запроса, а не в адресе: в журнал запросов она не попадает. keys — сколько у
+    человека ключей доступа (если есть): страница предложит отозвать их вместе с паролем."""
     login = people.link_owner(req.token)
     if login is None:
         raise HTTPException(404, "ссылка недействительна или её срок вышел — запросите новую")
-    return {"login": login, "name": people.get(login)["name"], "password_min": users.PASSWORD_MIN}
+    held = len(people.keys(login))
+    return {"login": login, "name": people.get(login)["name"], "password_min": users.PASSWORD_MIN,
+            **({"keys": held} if held else {})}
 
 
 @app.post("/api/set-password")
 async def link_use(req: LinkRequest):
-    """Пароль по одноразовой ссылке: первый — после одобренной заявки, новый — после «Забыл пароль»."""
+    """Пароль по одноразовой ссылке: первый — после одобренной заявки, новый — после «Забыл пароль».
+    Прежние входы человека перестают действовать; revoke_keys — отзываются и его ключи доступа."""
     try:
-        login = await asyncio.to_thread(people.use_link, req.token, req.password)
+        login, dropped = await asyncio.to_thread(people.use_link, req.token, req.password, None, req.revoke_keys)
     except users.UserError as e:
         raise HTTPException(400, str(e))
-    log(f"пользователь {login} задал пароль по одноразовой ссылке")
-    trail.write("password_link", login)
-    return {"ok": True, "login": login}
+    log(f"пользователь {login} задал пароль по одноразовой ссылке"
+        + (f" и отозвал свои ключи доступа: {dropped}" if dropped else ""))
+    trail.write("password_link", login, **({"keys": dropped} if dropped else {}))
+    return {"ok": True, "login": login, **_revoked(dropped)}
 
 
 @app.get("/api/access")
@@ -3194,6 +3340,28 @@ async def admin_user_delete(req: UserDelete, who: users.Access = Depends(viewer)
     domain_seen.pop(login, None)
     log(f"пользователь {login}: удалён")
     return {"ok": True, "users": people.public()}
+
+
+class UserSessions(BaseModel):
+    login: str
+
+
+@app.post("/api/admin/users/sessions", dependencies=[Depends(admin_guard)])
+async def admin_user_sessions(req: UserSessions, who: users.Access = Depends(viewer)):
+    """Завершает все входы человека на страницу: его браузеры выходят, войти заново он может
+    своим паролем. Ключи доступа не трогаются — их отзывают отдельно. Управление входом не даёт,
+    поэтому открыто и ключу с управлением. У admin из .env так нельзя: его, как и удалить или
+    разжаловать, не могут другие администраторы, — он выходит везде сам, из своего меню."""
+    login = req.login.strip().lower()
+    if login == users.ADMIN or people.source(login) is None:
+        raise HTTPException(404, "такого пользователя нет")
+    try:
+        await asyncio.to_thread(people.end_sessions, login)
+    except users.UserError as e:
+        raise HTTPException(404, str(e))
+    log(f"пользователь {login}: все входы завершены ({who.login})")
+    jot("sessions_end", who, login=login)
+    return {"ok": True, "login": login}
 
 
 class UserLink(BaseModel):

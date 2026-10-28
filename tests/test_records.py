@@ -91,8 +91,9 @@ def test_scanner_does_not_take_a_renamed_or_moved_record_for_a_new_one(tmp_path)
     scan.scan_once()
     scan.scan_once()
     assert scan.queue == [] and scan.pending == {} and list(service.ledger.records) == [moved]
-    # обратная проверка: файл без строки в журнале сканер берёт — значит, выше молчал не случайно
-    (cfg.inbox / "Снабжение" / "новая.mp4").write_bytes(b"video")
+    # обратная проверка: файл без строки в журнале сканер берёт — значит, выше молчал не случайно. Другой:
+    # тот же файл был бы копией записи, а копию сервис сам не распознаёт (test_watcher)
+    (cfg.inbox / "Снабжение" / "новая.mp4").write_bytes(b"other video")
     scan.scan_once()
     scan.scan_once()
     assert [i.path for i in scan.queue] == ["Снабжение/новая.mp4"]
@@ -301,3 +302,19 @@ def test_new_record_name_from_a_mac_is_stored_in_one_form(tmp_path):
     cfg, service = setup(tmp_path)
     new = records.rename(cfg, service, FILE, unicodedata.normalize("NFD", "Итоги ё"))
     assert new == "Проекты отдела/Итоги ё.mp4" and (cfg.inbox / new).is_file() and list(service.ledger.records) == [new]
+
+
+def test_adopt_moves_results_to_a_file_already_renamed_on_disk_and_refuses_otherwise(tmp_path):
+    """Исходник переименовали мимо сервиса: файл уже по новому пути, переезжают результаты и строка журнала.
+    Прежний файл на месте или нового нет — это не переименование, и ничего не трогается."""
+    cfg, service = setup(tmp_path)
+    with pytest.raises(records.RecordError):
+        records.adopt(cfg, service, FILE, "Снабжение/план.mp4")              # нового файла нет
+    (cfg.inbox / "Снабжение/план.mp4").write_bytes(b"video")
+    with pytest.raises(records.RecordError):
+        records.adopt(cfg, service, FILE, "Снабжение/план.mp4")              # а прежний на месте — копия
+    assert service.ledger.get(FILE) and (cfg.outbox / "Проекты отдела/план/summary/план.md").is_file()
+    (cfg.inbox / FILE).unlink()
+    assert records.adopt(cfg, service, FILE, "Снабжение/план.mp4") == "Снабжение/план.mp4"
+    assert (cfg.outbox / "Снабжение/план/summary/план.md").is_file() and service.ledger.get(FILE) is None
+    assert (cfg.inbox / "Снабжение/план.mp4").read_bytes() == b"video"

@@ -297,3 +297,23 @@ def test_lock_probe_passes_on_a_local_disk_and_refuses_a_folder_that_does_not_ho
             db.probe(tmp_path)
         assert why in str(refused.value) and "локальном диске" in str(refused.value)
         assert list(tmp_path.iterdir()) == []
+
+
+def test_base_of_version_1_1_1_takes_the_step_of_1_2_0(tmp_path):
+    """Обновление с 1.1.1 (схема 2): шаг 3 проходит, люди и их входы на месте, у каждого счётчик
+    сессий с нуля — метки входа, выданные этой версией до «Выйти везде», действуют."""
+    from app import users
+    old = db.Database(tmp_path, steps=db.MIGRATIONS[:2])
+    with old.write() as con:
+        con.execute("INSERT INTO users (login, name, password, home) VALUES ('ivanov', 'Иванов', '', 'Пользовательские/ivanov')")
+    assert old.version == 2
+    old.close()
+    lines = []
+    base = db.Database(tmp_path, lines.append)
+    assert base.version == db.SCHEMA_VERSION == 3 and lines == ["схема базы обновлена: версия 2 → 3"]
+    assert dict(base.row("SELECT login, sessions FROM users")) == {"login": "ivanov", "sessions": 0}
+    people = users.Users(base, "секрет-админа")
+    people.put("ivanov", "Иванов", "пароль-1234")
+    token = people.token("ivanov")
+    people.end_sessions("ivanov")
+    assert base.value("SELECT sessions FROM users WHERE login = 'ivanov'") == 1 and people.by_token(token) is None

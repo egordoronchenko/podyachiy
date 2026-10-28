@@ -34,6 +34,8 @@ function inside(raw) {
   return "/";
 }
 
+let keyCount = 0;       // сколько у человека ключей доступа: при смене пароля их можно отозвать (revokeBox)
+
 function check(id) {
   const problem = RULES[id] ? RULES[id](val(id)) : "";
   fieldError(id, problem);
@@ -68,6 +70,7 @@ const VIEWS = {
     <input type="password" id="old" autocomplete="current-password" required>
     <label for="new">Новый пароль, не короче 8 знаков</label>
     <input type="password" id="new" autocomplete="new-password" minlength="8" required>
+    ${revokeBox(keyCount)}
     <div class="row"><button id="go">Сменить пароль</button><a class="navlink" href="/">Отмена</a></div>
     <div class="msg" id="msg" role="alert"></div>`,
 
@@ -134,6 +137,10 @@ async function start() {
     dom = said.domain || {};
     notice = said.notice ? said.notice.charAt(0).toUpperCase() + said.notice.slice(1) : "";
   } catch (e) { /* сервис недоступен — покажем обычный вход */ }
+  if (view === "change") {
+    try { keyCount = (await api("/api/keys")).keys.length; }
+    catch (e) { /* список ключей не получен — флажка не будет, пароль сменить можно и так */ }
+  }
   form.innerHTML = VIEWS[view](signup);
   document.title = document.title.replace("вход",
     { login: "вход", change: "смена пароля", request: "заявка на доступ", forgot: "новый пароль" }[view]);
@@ -160,10 +167,14 @@ form.addEventListener("submit", async e => {
   say("msg", "", "");
   try {
     if (view === "change") {
-      await api("/api/password", { old: document.getElementById("old").value, new: document.getElementById("new").value });
-      // прежняя метка входа с новым паролем не действует — входим заново
-      say("msg", "ok", "Пароль изменён. Войдите с новым паролем.");
-      setTimeout(() => { location.href = "/login"; }, 1500);
+      const revoke = document.getElementById("revoke");
+      const done = await api("/api/password", { old: document.getElementById("old").value,
+                                                new: document.getElementById("new").value,
+                                                revoke_keys: !!(revoke && revoke.checked) });
+      // прежние метки входа, и эта, с новым паролем не действуют — входим заново
+      say("msg", "ok", "Пароль изменён" + (done.keys_revoked ? `, ключи доступа отозваны: ${done.keys_revoked}` : "") +
+                       ". Все входы завершены, и этот тоже: войдите с новым паролем.");
+      setTimeout(() => { location.href = "/login"; }, 2500);
     } else if (view === "request") {
       await api("/api/request", { name: val("name"), email: val("email"), login: val("login"), comment: val("comment") });
       finished("Заявка отправлена", DONE.request());

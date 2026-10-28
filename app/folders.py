@@ -96,7 +96,20 @@ def _check(folder: str, service, people: users.Users) -> None:
 def rename(cfg, service, people: users.Users, folder: str, name: str, also=None) -> str:
     """Новое имя папки на том же месте. Возвращает новый путь.
     also(новый путь) — что ещё записать в базу той же транзакцией: словари, событие журнала."""
-    folder = _path(cfg, folder)
+    return _rename(cfg, service, people, _path(cfg, folder), name, also)
+
+
+def to_nfc(cfg, service, people: users.Users, folder: str, also=None) -> str:
+    """Папку, известную сервису под именем в разложенной форме Unicode (так пишет macOS), — в составную
+    (upload.nfc): тем же переездом, что rename. Путь — как он записан на диске и в базе: проверка пути
+    приводит его к составной форме, и он вёл бы уже к другой папке. Папки выше — уже в составной."""
+    parent, _, name = folder.rpartition("/")
+    if _path(cfg, folder) != upload.nfc(folder) or upload.nfc(parent) != parent:
+        raise FolderError(400, "папки выше ещё в разложенной форме — сначала они")
+    return _rename(cfg, service, people, folder, name, also)
+
+
+def _rename(cfg, service, people: users.Users, folder: str, name: str, also) -> str:
     _check(folder, service, people)
     name = upload.nfc(name.strip())
     try:

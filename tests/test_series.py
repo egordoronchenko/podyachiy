@@ -37,7 +37,7 @@ def test_base_of_the_previous_schema_is_updated_and_its_folders_stay_series(tmp_
 
     lines = []
     base = db.Database(tmp_path, lines.append)
-    assert base.version == db.SCHEMA_VERSION == 2 and lines == ["схема базы обновлена: версия 1 → 2"]
+    assert base.version == db.SCHEMA_VERSION and lines[0] == "схема базы обновлена: версия 1 → 2"
     store = series.Store(base)
     assert store.off() == set() and store.on("Снабжение/Планёрки") and store.on("Проекты/Склад")
     assert ledger.Ledger(base).get("Проекты/Склад/статус.mp4")["status"] == "ok"      # прежнее на месте

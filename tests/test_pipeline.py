@@ -90,3 +90,27 @@ def test_transcript_with_speech_still_goes_on_to_the_text_steps(silent, monkeypa
     monkeypatch.setattr(speech, "call_stt", stt)
     record = run(cfg, seen)
     assert record["status"] == "no_summary" and seen.text == 1     # дошло до разбора — пустой расшифровки нет
+
+
+def test_record_keeps_what_the_source_was_when_it_was_taken(silent):
+    """Каким был исходник, когда его взяли в работу: размер, время изменения и отпечаток содержимого. По ним
+    сканер узнаёт запись под другим именем и замечает, что исходник изменился (test_watcher)."""
+    from app import media
+    cfg, seen = silent
+    src = cfg.inbox / REL
+    record = run(cfg, seen)
+    assert record["source_size"] == 1 and record["source_mtime"] == src.stat().st_mtime
+    assert record["source_print"] == media.fingerprint(src) and len(record["source_print"]) == 64
+
+
+def test_fingerprint_reads_the_edges_and_tells_files_apart(tmp_path, monkeypatch):
+    from app import media
+    monkeypatch.setattr(media, "PRINT_EDGE", 4)
+    a, b, c, d = (tmp_path / n for n in "abcd")
+    a.write_bytes(b"head-middle-tail")
+    b.write_bytes(b"head-MIDDLE-tail")                  # середину отпечаток не читает
+    c.write_bytes(b"head-middle-tall")
+    d.write_bytes(b"head-middle-tail!")
+    assert media.fingerprint(a) == media.fingerprint(b)
+    assert len({media.fingerprint(p) for p in (a, c, d)}) == 3
+    assert media.fingerprint(tmp_path / "нет") is None
