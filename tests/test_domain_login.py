@@ -52,14 +52,14 @@ def entered(web, login, password=PASSWORD):
 
 
 def events(web, kind):
-    return [e for e in web.trail.read() if e["kind"] == kind]
+    return [e for e in web.core.trail.read() if e["kind"] == kind]
 
 
 def everything_written(web):
     """Всё, что сервис записал: журнал работы, журнал действий, учётные записи."""
-    state = web.cfg.state_dir
+    state = web.core.cfg.state_dir
     files = [p.read_text(encoding="utf-8") for p in state.rglob("*") if p.is_file() and p.suffix in (".json", ".jsonl")]
-    return "\n".join(web.log.tail_from(0)[1]) + "\n".join(files)
+    return "\n".join(web.core.log.tail_from(0)[1]) + "\n".join(files)
 
 
 # ---------- вход и автозаведение ----------
@@ -71,8 +71,8 @@ def test_first_login_creates_the_user_with_a_home_folder(office):
                                                            "admin": False}
     me = browser.get("/api/me").json()
     assert me["login"] == "ivanov" and me["domain_account"] and me["home"] == f"{tw.HOME}/ivanov"
-    assert (web.cfg.inbox / tw.HOME / "ivanov").is_dir()
-    saved = web.people.users["ivanov"]
+    assert (web.core.cfg.inbox / tw.HOME / "ivanov").is_dir()
+    saved = web.core.people.users["ivanov"]
     assert saved["source"] == "domain" and saved["password"] == "" and saved["email"] == "ivanov@corp.test"
     assert saved["checked"] >= int(time.time()) - 5 and saved["read"] == {} and not saved["admin"]
     assert browser.get("/api/browse").status_code == 200
@@ -88,7 +88,7 @@ def test_first_login_creates_the_user_with_a_home_folder(office):
 def test_any_form_of_the_login_enters_the_same_account(office, typed):
     web, _, browser = office
     assert sign(browser, typed).json()["login"] == "ivanov"
-    assert sorted(web.people.users) == ["ivanov"]
+    assert sorted(web.core.people.users) == ["ivanov"]
 
 
 def test_next_login_updates_name_and_mail_from_the_domain(office):
@@ -97,7 +97,7 @@ def test_next_login_updates_name_and_mail_from_the_domain(office):
     entry = forest.entries[forest.dn("ivanov")]
     entry["displayName"], entry["mail"] = ["Иванов-Петров Иван Иванович"], ["i.ivanov@corp.test"]
     assert sign(https(web), "ivanov").json()["name"] == "Иванов-Петров Иван Иванович"
-    assert web.people.users["ivanov"]["email"] == "i.ivanov@corp.test"
+    assert web.core.people.users["ivanov"]["email"] == "i.ivanov@corp.test"
     assert len(events(web, "domain_user_new")) == 1
 
 
@@ -106,7 +106,7 @@ def test_wrong_and_empty_password_and_unknown_login_look_the_same(office):
     answers = [sign(browser, "ivanov", "не тот"), sign(browser, "nobody"), sign(browser, "ivanov", ""),
                sign(browser, "admin", "не тот")]
     assert {(a.status_code, a.json()["detail"]) for a in answers} == {(401, WRONG)}
-    assert web.people.users == {} and users.COOKIE not in browser.cookies
+    assert web.core.people.users == {} and users.COOKIE not in browser.cookies
     assert all(password for _, _, password in forest.binds)             # пустой пароль в каталог не уходил
 
 
@@ -118,14 +118,14 @@ def test_refusals_of_the_domain_are_told_in_plain_words(office, login, words):
     web, _, browser = office
     answer = sign(browser, login)
     assert answer.status_code == 401 and words in answer.json()["detail"]
-    assert web.people.users == {}                                       # отказ никого не заводит
+    assert web.core.people.users == {}                                       # отказ никого не заводит
     failed = events(web, "login_failed")
     assert failed[-1]["by"] == login and words in failed[-1]["reason"]
 
 
 def test_nested_group_member_enters(office):
     web, _, browser = office
-    assert sign(browser, "sidorov").status_code == 200 and not web.people.users["sidorov"]["admin"]
+    assert sign(browser, "sidorov").status_code == 200 and not web.core.people.users["sidorov"]["admin"]
 
 
 # ---------- роль по группе ----------
@@ -150,9 +150,9 @@ def test_role_of_a_domain_user_is_not_set_by_hand_when_the_group_rules(office):
     refused = admin.post("/api/admin/users/save", json={"login": "ivanov", "name": "Иванов", "admin": True})
     assert refused.status_code == 400 and "группа домена" in refused.json()["detail"]
     kept = admin.post("/api/admin/users/save", json={"login": "ivanov", "name": "Другое имя", "admin": False})
-    assert kept.status_code == 200 and web.people.users["ivanov"]["name"] == "Иванов Иван Иванович"
+    assert kept.status_code == 200 and web.core.people.users["ivanov"]["name"] == "Иванов Иван Иванович"
     with_password = admin.post("/api/admin/users/save", json={"login": "ivanov", "password": "новый-пароль-1"})
-    assert with_password.status_code == 400 and web.people.users["ivanov"]["password"] == ""
+    assert with_password.status_code == 400 and web.core.people.users["ivanov"]["password"] == ""
 
 
 # ---------- локальный или доменный ----------
@@ -192,11 +192,11 @@ def test_local_account_with_a_domain_login_stays_local_until_the_admin_binds_it(
     # доменный пароль к локальной записи не подходит и в домен не уходит; локальный — подходит
     assert sign(https(web), "ivanov", PASSWORD).status_code == 401 and forest.binds == []
     local = entered(web, "ivanov", LOCAL_PASSWORD)
-    assert web.people.users["ivanov"]["source"] == "local"
+    assert web.core.people.users["ivanov"]["source"] == "local"
     # администратор привязывает запись к домену: пароль сервиса стирается, права остаются
     bound = admin.post("/api/admin/users/domain", json={"login": "ivanov"})
     assert bound.status_code == 200
-    saved = web.people.users["ivanov"]
+    saved = web.core.people.users["ivanov"]
     assert (saved["source"], saved["password"], saved["read"]) == ("domain", "", {"Проекты": "tree"})
     assert saved["name"] == "Иванов Иван Иванович"
     assert local.get("/api/browse").status_code == 401                  # вход по прежнему паролю погашен
@@ -209,7 +209,7 @@ def test_local_account_with_a_domain_login_stays_local_until_the_admin_binds_it(
     assert "группу доступа" in admin.post("/api/admin/users/domain", json={"login": "kuznetsov"}).json()["detail"]
     assert admin.post("/api/admin/users/domain", json={"login": "stranger"}).status_code == 400
     assert admin.post("/api/admin/users/domain", json={"login": "ivanov"}).status_code == 404   # уже доменная
-    assert web.people.users["kuznetsov"]["source"] == "local"
+    assert web.core.people.users["kuznetsov"]["source"] == "local"
 
 
 def test_principal_name_that_resolves_to_a_local_login_is_a_conflict(office):
@@ -220,14 +220,14 @@ def test_principal_name_that_resolves_to_a_local_login_is_a_conflict(office):
         "/api/admin/users/save", json={"login": "a.sokolova", "name": "Местная", "password": LOCAL_PASSWORD})
     answer = sign(browser, "alina@corp.test")
     assert answer.status_code == 403 and "локальная учётная запись" in answer.json()["detail"]
-    assert web.people.users["a.sokolova"]["source"] == "local" and users.COOKIE not in browser.cookies
+    assert web.core.people.users["a.sokolova"]["source"] == "local" and users.COOKIE not in browser.cookies
 
 
 def test_domain_login_that_does_not_fit_the_service_is_refused(office):
     web, forest, browser = office
     forest.user("Иванова", "Иванова Ольга", ["podyachiy-users"])
     answer = sign(browser, "Иванова")
-    assert answer.status_code == 403 and "латинские буквы" in answer.json()["detail"] and web.people.users == {}
+    assert answer.status_code == 403 and "латинские буквы" in answer.json()["detail"] and web.core.people.users == {}
 
 
 # ---------- только по HTTPS ----------
@@ -239,7 +239,7 @@ def test_over_http_the_domain_login_is_refused_and_the_password_goes_nowhere(off
     assert me["on"] is False and me["blocked"] is True
     answer = sign(plain, "ivanov")
     assert answer.status_code == 401 and "https://" in answer.json()["detail"] and "HTTPS" in answer.json()["detail"]
-    assert forest.opened == [] and web.people.users == {}
+    assert forest.opened == [] and web.core.people.users == {}
     # отказ слово в слово тот же для локального логина: по тексту не узнать, какой логин локальный
     assert sign(plain, "admin", "не тот").json()["detail"] == answer.json()["detail"]
     assert sign(plain, "admin", tw.ADMIN_PASSWORD).status_code == 200  # локальный вход по HTTP работает, как раньше
@@ -260,13 +260,13 @@ def test_https_localhost_and_a_trusted_proxy_are_accepted(office):
     assert trusted.post("/api/login", json={"login": "ivanov", "password": PASSWORD}, headers=forwarded).status_code == 200
     stranger = TestClient(ProxyHeadersMiddleware(web.app, trusted_hosts="172.18.0.5"), client=("10.0.0.7", 40000))
     lied = stranger.post("/api/login", json={"login": "sidorov", "password": PASSWORD}, headers=forwarded)
-    assert lied.status_code == 401 and "sidorov" not in web.people.users     # заголовок от постороннего не в счёт
+    assert lied.status_code == 401 and "sidorov" not in web.core.people.users     # заголовок от постороннего не в счёт
 
 
 def test_stand_exception_allows_http_and_is_loud_about_it(tmp_path, forest):
     with tw.running(tmp_path, extra={**ENV, "LDAP_ALLOW_HTTP": "1"}) as (web, client):
         assert sign(client, "ivanov").status_code == 200
-        assert any("НЕБЕЗОПАСНО" in line and "LDAP_ALLOW_HTTP" in line for line in web.log.tail_from(0)[1])
+        assert any("НЕБЕЗОПАСНО" in line and "LDAP_ALLOW_HTTP" in line for line in web.core.log.tail_from(0)[1])
         view = tw.enter(web, "admin", tw.ADMIN_PASSWORD).get("/api/admin/domain").json()
         assert view["on"] and len(view["warnings"]) == 1 and view["params"]["allow_http"]
 
@@ -286,7 +286,7 @@ def test_unencrypted_controller_address_switches_the_login_off(tmp_path, forest)
         assert sign(https(web), "ivanov").status_code == 401 and forest.opened == []
         view = tw.enter(web, "admin", tw.ADMIN_PASSWORD).get("/api/admin/domain").json()
         assert not view["on"] and "без шифрования" in view["why_off"]
-        assert any("вход через домен выключен" in line for line in web.log.tail_from(0)[1])
+        assert any("вход через домен выключен" in line for line in web.core.log.tail_from(0)[1])
 
 
 def test_not_configured_service_behaves_as_before(tmp_path, forest):
@@ -311,7 +311,7 @@ def test_all_controllers_down_local_admin_still_enters(office):
     answer = sign(browser, "ivanov")
     assert answer.status_code == 503 and "домен сейчас не отвечает" in answer.json()["detail"]
     assert sign(https(web), "admin", tw.ADMIN_PASSWORD).status_code == 200
-    assert any("домен недоступен" in line for line in web.log.tail_from(0)[1])
+    assert any("домен недоступен" in line for line in web.core.log.tail_from(0)[1])
 
 
 # ---------- перебор ----------
@@ -333,7 +333,7 @@ def test_failed_domain_logins_are_limited_per_login(office):
 
 def test_failed_domain_logins_are_limited_per_address(office, monkeypatch):
     web, forest, browser = office
-    monkeypatch.setattr(web, "domain_fails_by_address", web.signup.Throttle(3, 900))
+    monkeypatch.setattr(web.login, "domain_fails_by_address", web.core.signup.Throttle(3, 900))
     for n in range(3):
         assert sign(browser, f"user{n}", "не тот").status_code == 401
     assert sign(browser, "ivanov").status_code == 429
@@ -348,12 +348,12 @@ def test_session_is_rechecked_and_a_removed_person_loses_access(office, monkeypa
     assert browser.get("/api/browse").status_code == 200 and len(forest.filters) == searches   # недавно подтверждён
     forest.leave("ivanov", "podyachiy-users")
     assert browser.get("/api/browse").status_code == 200               # до перепроверки домен не спрашивают
-    monkeypatch.setattr(web, "RECHECK_SEC", 0)
+    monkeypatch.setattr(web.access, "RECHECK_SEC", 0)
     refused = browser.get("/api/browse")
     assert refused.status_code == 401 and "группу доступа" in refused.json()["detail"]
     me = browser.get("/api/me").json()
     assert me["login"] is None and "группу доступа" in me["notice"]
-    assert web.people.users["ivanov"]["checked"] == 0
+    assert web.core.people.users["ivanov"]["checked"] == 0
     assert [e["by"] for e in events(web, "domain_recheck_denied")] == ["ivanov"]       # один раз, не на каждый запрос
     # вернули в группу — человек входит заново, и прежняя сессия снова действует
     forest.entries[forest.dn("podyachiy-users")]["member"].append(forest.dn("ivanov"))
@@ -363,7 +363,7 @@ def test_session_is_rechecked_and_a_removed_person_loses_access(office, monkeypa
 def test_disabled_account_and_lost_admin_role_are_seen_at_recheck(office, monkeypatch):
     web, forest, _ = office
     ivanov, petrova = entered(web, "ivanov"), entered(web, "petrova")
-    monkeypatch.setattr(web, "RECHECK_SEC", 0)
+    monkeypatch.setattr(web.access, "RECHECK_SEC", 0)
     forest.entries[forest.dn("ivanov")]["userAccountControl"] = ["514"]
     assert "отключена" in ivanov.get("/api/browse").json()["detail"]
     forest.leave("Petrova", "podyachiy-admins")
@@ -378,7 +378,7 @@ def test_access_key_of_a_domain_user_stops_with_him(office, monkeypatch):
     token = browser.post("/api/keys", json={"name": "Cursor", "days": 365}).json()["key"]
     robot = TestClient(web.app, headers={"Authorization": f"Bearer {token}"})    # ключ — и по HTTP, как раньше
     assert robot.get("/api/v1/whoami").json()["login"] == "ivanov"
-    monkeypatch.setattr(web, "RECHECK_SEC", 0)
+    monkeypatch.setattr(web.access, "RECHECK_SEC", 0)
     assert robot.get("/api/v1/whoami").status_code == 200
     forest.entries[forest.dn("ivanov")]["userAccountControl"] = ["514"]
     assert robot.get("/api/v1/whoami").status_code == 401
@@ -388,25 +388,25 @@ def test_access_key_of_a_domain_user_stops_with_him(office, monkeypatch):
 def test_controller_outage_keeps_people_for_a_limited_time(office, monkeypatch):
     web, forest, browser = office
     sign(browser, "ivanov")
-    monkeypatch.setattr(web, "RECHECK_SEC", 0)
-    monkeypatch.setattr(web, "RETRY_SEC", 0)
+    monkeypatch.setattr(web.access, "RECHECK_SEC", 0)
+    monkeypatch.setattr(web.access, "RETRY_SEC", 0)
     forest.dead.update(URLS)
     assert browser.get("/api/browse").status_code == 200               # домен молчит — верим последнему подтверждению
-    with web.base.write() as con:
-        con.execute("UPDATE users SET checked = ? WHERE login = 'ivanov'", (int(time.time()) - web.GRACE_SEC - 60,))
+    with web.core.base.write() as con:
+        con.execute("UPDATE users SET checked = ? WHERE login = 'ivanov'", (int(time.time()) - web.access.GRACE_SEC - 60,))
     late = browser.get("/api/browse")
     assert late.status_code == 401 and "домен недоступен" in late.json()["detail"]
     assert tw.enter(web, "admin", tw.ADMIN_PASSWORD).get("/api/browse").status_code == 200
     forest.dead.clear()
     assert browser.get("/api/browse").status_code == 200               # домен ответил — человек снова работает
-    assert web.people.users["ivanov"]["checked"] >= int(time.time()) - 5
-    assert any("домен снова отвечает" in line for line in web.log.tail_from(0)[1])
+    assert web.core.people.users["ivanov"]["checked"] >= int(time.time()) - 5
+    assert any("домен снова отвечает" in line for line in web.core.log.tail_from(0)[1])
 
 
 def test_outage_is_not_asked_again_on_every_request(office, monkeypatch):
     web, forest, browser = office
     sign(browser, "ivanov")
-    web.domain_seen.clear()                                             # как после перезапуска сервиса
+    web.access.domain_seen.clear()                                             # как после перезапуска сервиса
     forest.dead.update(URLS)
     assert browser.get("/api/browse").status_code == 200
     forest.dead.clear()
@@ -459,7 +459,7 @@ def test_domain_user_has_no_password_in_the_service(tmp_path, forest):
         link = admin.post("/api/admin/users/link", json={"login": "ivanov"})
         assert link.status_code == 400 and "в домене" in link.json()["detail"]
         assert https(web).post("/api/forgot", json={"login": "ivanov"}).status_code == 200      # ответ как всем
-        assert "link" not in web.people.users["ivanov"] and events(web, "link_sent") == []
+        assert "link" not in web.core.people.users["ivanov"] and events(web, "link_sent") == []
         assert browser.get("/api/me").json()["domain"]["https"] == "https://podyachiy.corp.test"
         # убрали из сервиса — при следующем входе заведётся снова
         assert admin.post("/api/admin/users/delete", json={"login": "ivanov"}).status_code == 200
@@ -473,7 +473,7 @@ def test_users_file_of_the_previous_kind_is_read_as_local(tmp_path, forest):
         "name": "Петров", "email": "", "password": users.hash_password(LOCAL_PASSWORD), "home": f"{tw.HOME}/petrov",
         "admin": False, "read": {}, "manage": {}, "notify_ready": True}}}), encoding="utf-8")
     with tw.running(tmp_path, extra=ENV) as (web, _):
-        assert web.people.users["petrov"]["source"] == "local"
+        assert web.core.people.users["petrov"]["source"] == "local"
         assert entered(web, "petrov", LOCAL_PASSWORD).get("/api/me").json()["domain_account"] is False
 
 
@@ -499,7 +499,7 @@ def test_connection_check_reports_steps_and_creates_nobody(office):
         "База поиска", "Группа доступа", "Группа администраторов сервиса"]
     person = admin.post("/api/admin/domain/check", json={"login": "CORP\\ivanov", "password": PASSWORD}).json()
     assert person["ok"] and "Иванов Иван Иванович" in person["steps"][-1]["text"]
-    assert web.people.users == {}                                       # проверка никого не заводит
+    assert web.core.people.users == {}                                       # проверка никого не заводит
     wrong = admin.post("/api/admin/domain/check", json={"login": "ivanov", "password": "не-тот-пароль-Я1"}).json()
     assert not wrong["ok"] and WRONG in wrong["steps"][-1]["text"]
     forest.dead.update(URLS)
@@ -524,7 +524,7 @@ def test_passwords_never_reach_the_log_the_journal_or_the_answers(office, monkey
     forest.passwords[BIND_DN] = "сменили"                               # служебную запись контроллер больше не принимает
     answers += [sign(https(web), "sidorov"), admin.post("/api/admin/domain/check", json={})]
     forest.dead.update(URLS)
-    monkeypatch.setattr(web, "RECHECK_SEC", 0)
+    monkeypatch.setattr(web.access, "RECHECK_SEC", 0)
     answers += [sign(https(web), "sidorov"), browser.get("/api/browse"), admin.get("/api/admin/status")]
     seen = everything_written(web) + "\n".join(a.text for a in answers)
     assert "ivanov" in seen and "вход через домен" in seen              # журнал и лог не пусты

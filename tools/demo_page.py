@@ -86,7 +86,7 @@ def layers(meta: dict, folder: str, file: str = "") -> list[dict]:
 
 
 def words_view(meta: dict, folder: str, file: str = "") -> dict:
-    """Ответ /api/dictionary — как его собирает app/web.py (_dict_view)."""
+    """Ответ /api/dictionary — как его собирает app/web/dictionaries.py (_dict_view)."""
     home = parent(file) if file else folder
     own = words_of(meta, "records" if file else "folders", file or folder)
     owner = meta["folders"].get(home, {"owner": False})["owner"]
@@ -173,7 +173,7 @@ def build_record(rec: dict, work: Path, meta: dict) -> dict:
 
 
 def browse(rel: str, flat: bool, files: list[dict], meta: dict) -> dict:
-    """Ответ /api/browse: «все записи» (flat) либо одна папка — как собирает его app/web.py."""
+    """Ответ /api/browse: «все записи» (flat) либо одна папка — как собирает его app/web/browse.py."""
     prefix = f"{rel}/" if rel else ""
     dirs: dict[str, dict] = {}
     for f in files:

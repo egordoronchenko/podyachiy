@@ -39,12 +39,12 @@ def test_cookie_request_from_another_site_is_refused(site):
     for headers in ({"origin": "https://evil.example"}, {"origin": "https://sub.meetings.example.test"},
                     {"origin": "null"}, {"sec-fetch-site": "same-site"}, {"sec-fetch-site": "cross-site"}):
         refused = ivanov.post("/api/folder", json={"dir": folder}, headers=headers)
-        assert refused.status_code == 403 and refused.json()["detail"] == web.FOREIGN_PAGE, headers
+        assert refused.status_code == 403 and refused.json()["detail"] == web.server.FOREIGN_PAGE, headers
         # параметры в адресе, без тела — такой запрос чужая страница шлёт обычной формой
         moved = ivanov.post("/api/v1/speakers", params={"file": f"{HOME}/ivanov/вкс.mp4", "rebuild": "true"},
                             headers=headers)
-        assert moved.status_code == 403 and moved.json()["detail"] == web.FOREIGN_PAGE, headers
-    assert not (web.cfg.inbox / folder).exists()
+        assert moved.status_code == 403 and moved.json()["detail"] == web.server.FOREIGN_PAGE, headers
+    assert not (web.core.cfg.inbox / folder).exists()
     # чтение не меняет ничего, а ответ чужой странице браузер без CORS не отдаст
     assert ivanov.get("/api/browse", headers={"origin": "https://evil.example"}).status_code == 200
     # вход с чужой страницы тоже не принимается: иначе она входит в сервис под своей учётной записью
@@ -74,7 +74,7 @@ def test_personal_mode_checks_the_same_way(tmp_path):
     with running(tmp_path, mode="personal") as (web, client):
         for headers in ({"origin": "https://evil.example"}, {"sec-fetch-site": "same-site"}):
             refused = client.post("/api/folder", json={"dir": "Чужая"}, headers={"host": "localhost:8080", **headers})
-            assert refused.status_code == 403 and refused.json()["detail"] == web.FOREIGN_PAGE
+            assert refused.status_code == 403 and refused.json()["detail"] == web.server.FOREIGN_PAGE
         assert client.post("/api/folder", json={"dir": "Своя"},
                            headers={"host": "localhost:8080", "origin": "http://localhost:8080"}).status_code == 200
 
@@ -85,11 +85,11 @@ def test_every_answer_carries_the_security_headers(site):
     web, admin, ivanov, _ = staffed(site)
     for path in ("/", "/login", "/static/app.css", "/api/status", "/api/browse", "/no-such-page"):
         answer = ivanov.get(path)
-        assert answer.headers["content-security-policy"] == web.CSP, path
+        assert answer.headers["content-security-policy"] == web.common.CSP, path
         assert answer.headers["x-content-type-options"] == "nosniff", path
         assert answer.headers["referrer-policy"] == "same-origin", path
         assert "strict-transport-security" not in answer.headers, path         # по HTTP HSTS не ставят
-    policy = dict(part.strip().split(" ", 1) for part in web.CSP.split(";"))
+    policy = dict(part.strip().split(" ", 1) for part in web.common.CSP.split(";"))
     assert policy["script-src"] == "'self'" and policy["frame-ancestors"] == "'none'" and policy["object-src"] == "'none'"
 
 
@@ -107,7 +107,7 @@ def test_api_answers_and_files_are_not_stored_by_the_browser(site):
     web, admin, ivanov, _ = staffed(site)
     rel = f"{HOME}/ivanov/вкс.mp4"
     recorded(web, rel)
-    out = web.cfg.outbox / HOME / "ivanov" / "вкс"
+    out = web.core.cfg.outbox / HOME / "ivanov" / "вкс"
     (out / f"вкс{media.AUDIO_SUFFIX}").write_bytes(b"ID3audio")
     for path, params in (("/api/browse", {}), ("/api/audio", {"file": rel}), ("/api/export", {"file": rel, "format": "docx"}),
                          ("/api/map", {"file": rel, "download": "true"}), ("/api/v1/tasks.csv", {}),
@@ -131,7 +131,7 @@ def test_map_page_runs_its_own_script_and_nothing_else(site):
     digest = base64.b64encode(hashlib.sha256(scripts[0].encode("utf-8")).digest()).decode()
     policy = shown.headers["content-security-policy"]
     assert f"script-src 'self' 'sha256-{digest}';" in policy and "'unsafe-inline'" not in policy.split("script-src")[1].split(";")[0]
-    assert policy.replace(f" 'sha256-{digest}'", "") == web.CSP
+    assert policy.replace(f" 'sha256-{digest}'", "") == web.common.CSP
 
 
 @pytest.mark.parametrize("page", PAGES, ids=lambda p: p.name)
@@ -184,7 +184,7 @@ def test_tasks_csv_cells_never_start_a_formula(site, monkeypatch):
     async def tasks(*args, **kwargs):
         return {"tasks": [task]}
 
-    monkeypatch.setattr(web, "_tasks", tasks)
+    monkeypatch.setattr(web.api_v1, "_tasks", tasks)
     sheet = ivanov.get("/api/v1/tasks.csv").content.decode("utf-8-sig").splitlines()
     row = sheet[1].split(";")
     assert row[0] == "'=cmd|' /C calc'!A0" and row[1] == "'-сделать отчёт" and row[3] == "'+1 день"
@@ -208,17 +208,17 @@ def test_file_errors_do_not_show_server_paths(site, monkeypatch):
     """Сбой файловой системы — отказ 500 словами, без путей сервера: путь целиком — в журнал работы."""
     web, admin, ivanov, _ = staffed(site)
     lines = []
-    monkeypatch.setattr(web, "log", lines.append)
+    monkeypatch.setattr(web.access, "log", lines.append)
 
     def broken(self, *args, **kwargs):
         raise PermissionError(13, "Permission denied", str(self))
 
-    monkeypatch.setattr(web.Path, "mkdir", broken)
+    monkeypatch.setattr(web.core.Path, "mkdir", broken)
     refused = ivanov.post("/api/folder", json={"dir": f"{HOME}/ivanov/Совещания"})
     assert refused.status_code == 500
     detail = refused.json()["detail"]
-    assert detail == "не удалось создать папку: нет прав на запись в папку" and str(web.cfg.inbox) not in detail
-    assert any(str(web.cfg.inbox) in line for line in lines)
+    assert detail == "не удалось создать папку: нет прав на запись в папку" and str(web.core.cfg.inbox) not in detail
+    assert any(str(web.core.cfg.inbox) in line for line in lines)
 
 
 # ---------- ручной запуск ----------
@@ -231,18 +231,18 @@ def test_manual_run_takes_only_what_the_list_offers(site):
     run = lambda file: client.post("/api/admin/run", json={"file": file}, auth=("admin", ADMIN_PASSWORD))
     for rel in (".trash/20261001-120000/Проекты/запись.mp4", ".uploads/ab12.mp4", "Проекты/.uploads/запись.mp4",
                 "Проекты/заметки.txt", "Проекты/~$запись.mp4", "Проекты/запись.mp4.part"):
-        path = web.cfg.inbox / rel
+        path = web.core.cfg.inbox / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"video")
         refused = run(rel)
-        assert refused.status_code == 400 and refused.json()["detail"] == web.NOT_RUNNABLE, rel
-    (web.cfg.inbox / "Проекты" / "вкс.mp4").write_bytes(b"video")
-    web.service.scan_once()
-    assert "Проекты/вкс.mp4" in web.service.pending
+        assert refused.status_code == 400 and refused.json()["detail"] == web.processing.NOT_RUNNABLE, rel
+    (web.core.cfg.inbox / "Проекты" / "вкс.mp4").write_bytes(b"video")
+    web.core.service.scan_once()
+    assert "Проекты/вкс.mp4" in web.core.service.pending
     busy = run("Проекты/вкс.mp4")
-    assert busy.status_code == 409 and busy.json()["detail"] == web.STILL_WRITTEN
-    assert web.service.queue == []
-    web.service.pending.clear()
+    assert busy.status_code == 409 and busy.json()["detail"] == web.processing.STILL_WRITTEN
+    assert web.core.service.queue == []
+    web.core.service.pending.clear()
     assert run("Проекты/вкс.mp4").json()["queued"] == "Проекты/вкс.mp4"
 
 

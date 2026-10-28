@@ -158,12 +158,12 @@ find "$SRC" -maxdepth 3 -name Dockerfile -exec dirname {} \;
 
 ```powershell
 $Src = "$HOME\Podyachiy-source"
-"Dockerfile","requirements.txt","VERSION","app\web.py","prompts","install\compose.yml","install\.env.example" | ForEach-Object { "$_ : $(Test-Path (Join-Path $Src $_))" }
+"Dockerfile","requirements.txt","VERSION","app\web\__init__.py","prompts","install\compose.yml","install\.env.example" | ForEach-Object { "$_ : $(Test-Path (Join-Path $Src $_))" }
 ```
 
 ```bash
 SRC="$HOME/Podyachiy-source"
-for f in Dockerfile requirements.txt VERSION app/web.py prompts install/compose.yml install/.env.example; do [ -e "$SRC/$f" ] && echo "есть $f" || echo "НЕТ $f"; done
+for f in Dockerfile requirements.txt VERSION app/web/__init__.py prompts install/compose.yml install/.env.example; do [ -e "$SRC/$f" ] && echo "есть $f" || echo "НЕТ $f"; done
 ```
 
 ### 2.2. Папка установки

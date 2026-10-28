@@ -103,7 +103,7 @@ def test_costs_for_a_month_are_picked_by_the_index_and_for_all_time_stay_bearabl
     assert whole["total"]["runs"] == 2 * RECORDS and whole["total"]["records"] == RECORDS
     assert whole["total"]["cost"] == {"RUB": float(sum(23.0 + n % 7 for n in range(RECORDS)))}      # до копейки
     # запрос за месяц читает прогоны месяца, а не весь журнал: план запроса идёт по индексу дня
-    plan = " ".join(row[3] for row in web.base.rows(
+    plan = " ".join(row[3] for row in web.core.base.rows(
         "EXPLAIN QUERY PLAN SELECT runs.id FROM runs WHERE runs.day >= ? AND runs.day <= ?", "2026-03-01", "2026-03-31"))
     assert "runs_day" in plan and "SCAN" not in plan
     book = timed(lambda: admin.get("/api/admin/report.csv", params={"start": "2026-03-01", "end": "2026-03-31"}), 4, "отчёт файлом")
@@ -123,7 +123,7 @@ def test_action_journal_reads_the_last_events_without_the_whole_journal(big):
     for query, index in (("kind <> 'run' ORDER BY id DESC LIMIT 200", "events_actions"),
                          ("actor = 'user123' ORDER BY id DESC LIMIT 200", "events_actor"),
                          ("file = 'x' ORDER BY id DESC LIMIT 200", "events_file")):
-        plan = " ".join(row[3] for row in web.base.rows(f"EXPLAIN QUERY PLAN SELECT at FROM events WHERE {query}"))
+        plan = " ".join(row[3] for row in web.core.base.rows(f"EXPLAIN QUERY PLAN SELECT at FROM events WHERE {query}"))
         assert index in plan, plan
 
 

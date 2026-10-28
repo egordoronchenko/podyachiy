@@ -225,32 +225,32 @@ def test_settings_are_checked_and_off_without_an_address(tmp_path):
 def test_service_queues_the_event_without_sums_and_provider_text(tmp_path):
     env = {"WEBHOOK_URL": URL, "WEBHOOK_SECRET": SECRET, "PUBLIC_URL": BASE}
     with running(tmp_path, extra=env) as (web, _):
-        web.hooks.transport = httpx.MockTransport(Receiver(503))
+        web.core.hooks.transport = httpx.MockTransport(Receiver(503))
         reply = 'распознавание: HTTP 402. Ответ поставщика: {"error":"balance 0.12 USD"}'
         failed = {**RECORD, "status": "error", "error": reply, "failures": MAX_FAILURES}
-        web.service._hook(watcher.QueueItem(path=RECORD["file"], reason="retry"), failed, None)
-        body = json.loads(web.base.rows("SELECT body FROM webhook_queue")[0]["body"])
-        assert body["event"] == "record.failed" and body["record"]["error"] == web.FAILED_HIDDEN
+        web.core.service._hook(watcher.QueueItem(path=RECORD["file"], reason="retry"), failed, None)
+        body = json.loads(web.core.base.rows("SELECT body FROM webhook_queue")[0]["body"])
+        assert body["event"] == "record.failed" and body["record"]["error"] == web.browse.FAILED_HIDDEN
         assert "0.12" not in json.dumps(body) and "cost" not in json.dumps(body)
         assert body["url"].startswith(BASE + "/?")
         # обработчик после записанного исхода сам ставит событие: «нет звука» у новой записи
         silent = {**RECORD, "file": "Проекты/тишина.mp4", "status": "no_audio", "error": "в файле нет звука"}
-        web.service.ledger.put(dict(silent))
-        web.service._after(watcher.QueueItem(path=silent["file"]), web.service.ledger.get(silent["file"]), None)
-        bodies = [json.loads(r["body"]) for r in web.base.rows("SELECT body FROM webhook_queue ORDER BY created")]
+        web.core.service.ledger.put(dict(silent))
+        web.core.service._after(watcher.QueueItem(path=silent["file"]), web.core.service.ledger.get(silent["file"]), None)
+        bodies = [json.loads(r["body"]) for r in web.core.base.rows("SELECT body FROM webhook_queue ORDER BY created")]
         assert [(b["event"], b["record"]["file"], b["record"]["error"]) for b in bodies][1:] == [
             ("record.failed", "Проекты/тишина.mp4", "в файле нет звука")]
         state = enter(web, "admin", ADMIN_PASSWORD).get("/api/admin/status").json()["webhook"]
         assert state["on"] and state["targets"] == ["https://erp.example.ru"] and state["waiting"] == 2
         assert "token" not in json.dumps(state)
-        assert any("webhook «запись готова» включён: https://erp.example.ru" in line for line in web.log.tail())
+        assert any("webhook «запись готова» включён: https://erp.example.ru" in line for line in web.core.log.tail())
 
 
 def test_service_without_webhook_url_sends_nothing(tmp_path):
     with running(tmp_path) as (web, _):
-        assert web.service.hook is None and not web.hooks.on
+        assert web.core.service.hook is None and not web.core.hooks.on
         state = enter(web, "admin", ADMIN_PASSWORD).get("/api/admin/status").json()["webhook"]
         assert state["on"] is False and state["targets"] == [] and state["waiting"] == 0
     with running(tmp_path / "без секрета", extra={"WEBHOOK_URL": URL}) as (web, _):
-        assert web.service.hook is None
-        assert any("webhook выключен — WEBHOOK_SECRET не задан" in line for line in web.log.tail())
+        assert web.core.service.hook is None
+        assert any("webhook выключен — WEBHOOK_SECRET не задан" in line for line in web.core.log.tail())

@@ -35,7 +35,7 @@ ADMIN_PASSWORD = "тест-админ-пароль"
 PASSWORD = "пароль-1234"
 HOME = users.HOME_ROOT
 
-# Всё, что закрыто admin_guard в app/web.py: метод, адрес, тело запроса.
+# Всё, что закрыто admin_guard в app/web: метод, адрес, тело запроса.
 # test_admin_list_matches_the_routes следит, чтобы список не отстал от кода.
 ADMIN_ONLY = [
     ("GET", "/api/admin/status", None),
@@ -181,17 +181,24 @@ def running(tmp_path, mode="corporate", extra=None, kept=True):
         # сам отказ и проверку блокировок (она запускает второй процесс) проверяют отдельные тесты.
         patch.setattr(db, "kept", kept if callable(kept) else lambda path: kept)
         patch.setattr(db, "probe", lambda path: None)
-        sys.modules.pop("app.web", None)
+        forget_web()
         # app.web при импорте подставляет почте свою функцию «название организации»; после теста
         # возвращаем прежнюю, чтобы оформление одного запуска не подписывало письма следующих тестов
         patch.setattr(mail, "organization", mail.organization)
         web = importlib.import_module("app.web")
-        patch.setattr(web, "WRONG_PASSWORD_DELAY_SEC", 0)
+        for part in (web.access, web.login):
+            patch.setattr(part, "WRONG_PASSWORD_DELAY_SEC", 0)
         try:
             with TestClient(web.app) as client:
                 yield web, client
         finally:
-            sys.modules.pop("app.web", None)
+            forget_web()
+
+
+def forget_web():
+    """app.web — пакет: забываются и его модули, иначе новый импорт взял бы их прежними, с прежним окружением."""
+    for name in [n for n in sys.modules if n == "app.web" or n.startswith("app.web.")]:
+        sys.modules.pop(name)
 
 
 @pytest.fixture
@@ -231,16 +238,19 @@ ROOT = __import__("pathlib").Path(__file__).resolve().parent.parent
 
 
 def page_source(name: str) -> str:
-    """Страница сервиса целиком: разметка (app/static/<страница>.html) и её сценарий (<страница>.js)."""
+    """Страница сервиса целиком: разметка (app/static/<страница>.html) и её сценарии (<страница>.js и, у страницы
+    из нескольких сценариев, <страница>-<раздел>.js — те, что она подключает)."""
     static = ROOT / "app" / "static"
-    return "".join((static / f"{name}{ext}").read_text(encoding="utf-8") for ext in (".html", ".js"))
+    page = (static / f"{name}.html").read_text(encoding="utf-8")
+    scripts = re.findall(rf'<script src="/static/({re.escape(name)}(?:-[\w-]+)?\.js)"></script>', page)
+    return page + "".join((static / script).read_text(encoding="utf-8") for script in scripts)
 
 
 def seed(web):
     """Шаблоны из поставки — в папку шаблонов, как при первом запуске из образа: в образе они
     лежат в prompts_default, в репозитории — в prompts."""
-    web.DEFAULT_PROMPTS = ROOT / "prompts"
-    web._seed_prompts()
+    web.lifecycle.DEFAULT_PROMPTS = web.prompt_templates.DEFAULT_PROMPTS = ROOT / "prompts"
+    web.lifecycle._seed_prompts()
 
 
 def api_routes(web):
@@ -254,7 +264,7 @@ def api_routes(web):
 def test_service_starts_and_answers_the_health_check_without_login(site):
     web, client = site
     assert client.get("/api/status").json() == {"ok": True, "version": (ROOT / "VERSION").read_text().strip()}
-    assert web.service is not None and web.service.queue == [] and web.upload_ready
+    assert web.core.service is not None and web.core.service.queue == [] and web.core.upload_ready
 
 
 def test_pages_and_static_files_are_served(site):
@@ -286,7 +296,7 @@ def test_wrong_password_is_refused_and_written_to_the_journal(site):
     assert users.COOKIE not in client.cookies
     assert client.get("/api/me").json()["login"] is None
     assert client.get("/api/browse", auth=("admin", "не тот")).status_code == 401
-    assert [e["kind"] for e in web.trail.read()] == ["login_failed"] * 3
+    assert [e["kind"] for e in web.core.trail.read()] == ["login_failed"] * 3
 
 
 def test_password_guessing_stops_before_the_password_is_checked(site, monkeypatch):
@@ -295,24 +305,24 @@ def test_password_guessing_stops_before_the_password_is_checked(site, monkeypatc
     нечем. Одни и те же пределы — у страницы входа и у логина с паролем в самом запросе (HTTP Basic)."""
     web, admin, ivanov, _ = staffed(site)
     checked = []
-    real = web.people.verify
-    monkeypatch.setattr(web.people, "verify", lambda login, password: checked.append(login) or real(login, password))
+    real = web.core.people.verify
+    monkeypatch.setattr(web.core.people, "verify", lambda login, password: checked.append(login) or real(login, password))
     guest = TestClient(web.app)
-    for n in range(web.password_fails_by_login.limit):
+    for n in range(web.core.password_fails_by_login.limit):
         attempt = (guest.post("/api/login", json={"login": "ivanov", "password": f"не тот {n}"}) if n % 2
                    else guest.get("/api/v1/whoami", auth=("Ivanov", f"не тот {n}")))
         assert attempt.status_code == 401, n
     checked.clear()
     for stopped in (guest.post("/api/login", json={"login": "ivanov", "password": PASSWORD}),
                     guest.get("/api/v1/whoami", auth=("ivanov", PASSWORD))):
-        assert stopped.status_code == 429 and stopped.json()["detail"] == web.PASSWORD_TOO_OFTEN
-    assert checked == [] and web.trail.read()[-1]["reason"] == "слишком много неудачных попыток"
+        assert stopped.status_code == 429 and stopped.json()["detail"] == web.core.PASSWORD_TOO_OFTEN
+    assert checked == [] and web.core.trail.read()[-1]["reason"] == "слишком много неудачных попыток"
     # вошедшего раньше предел не касается, другой логин с того же адреса входит
     assert ivanov.get("/api/browse").status_code == 200
     assert guest.get("/api/v1/whoami", auth=("petrov", PASSWORD)).json()["login"] == "petrov"
 
     # с одного адреса — не больше предела неудачных входов на все логины вместе
-    for n in range(web.password_fails_by_address.limit - web.password_fails_by_login.limit):
+    for n in range(web.core.password_fails_by_address.limit - web.core.password_fails_by_login.limit):
         assert guest.post("/api/login", json={"login": f"nobody{n}", "password": "не тот"}).status_code == 401
     assert guest.post("/api/login", json={"login": "petrov", "password": PASSWORD}).status_code == 429
     elsewhere = TestClient(web.app, client=("10.0.0.7", 50000))
@@ -324,11 +334,11 @@ def test_key_guessing_is_limited_by_address(site):
     не проверяется вовсе; с других адресов ключи работают."""
     web, admin, _, _ = staffed(site)
     robot, issued = keyed(web, admin)
-    for n in range(web.key_fails_by_address.limit):
+    for n in range(web.core.key_fails_by_address.limit):
         wrong = TestClient(web.app, headers={"Authorization": f"Bearer {keys.PREFIX}wrong-{n}"})
         assert wrong.get("/api/v1/whoami").status_code == 401, n
     stopped = robot.get("/api/v1/whoami")
-    assert stopped.status_code == 429 and stopped.json()["detail"] == web.KEY_TOO_OFTEN
+    assert stopped.status_code == 429 and stopped.json()["detail"] == web.core.KEY_TOO_OFTEN
     elsewhere = TestClient(web.app, client=("10.0.0.7", 50000), headers={"Authorization": f"Bearer {issued['key']}"})
     assert elsewhere.get("/api/v1/whoami").json()["login"] == "admin"
     assert admin.get("/api/browse").status_code == 200                # кука — не ключ
@@ -379,7 +389,7 @@ def test_admin_creates_a_user_who_then_logs_in(site):
     web, admin, ivanov, _ = staffed(site)
     me = ivanov.get("/api/me").json()
     assert me["login"] == "ivanov" and me["name"] == "Иванов" and not me["admin"]
-    assert me["home"] == f"{HOME}/ivanov" and (web.cfg.inbox / HOME / "ivanov").is_dir()
+    assert me["home"] == f"{HOME}/ivanov" and (web.core.cfg.inbox / HOME / "ivanov").is_dir()
     listed = admin.post("/api/admin/users").json()["users"]
     assert [u["login"] for u in listed] == ["ivanov", "petrov"] and "password" not in listed[0]
     assert listed[0]["has_password"] and listed[0]["email"] == "" and "link" not in listed[0]
@@ -392,7 +402,7 @@ def test_service_does_not_start_when_the_state_folder_is_not_mounted(tmp_path, m
     """В папке состояния база: внутри контейнера она пропала бы при его пересоздании, и все записи
     пошли бы в обработку заново. Сервис с такой папкой не запускается и называет причину."""
     with running(tmp_path) as (web, _):                     # обычный запуск: папка «подключена»
-        assert web.state_kept and (tmp_path / "state" / db.FILE).is_file()
+        assert web.core.state_kept and (tmp_path / "state" / db.FILE).is_file()
     for mode in ("corporate", "personal"):
         with pytest.raises(SystemExit, match="не подключена с хоста"):
             with running(tmp_path / mode, mode, kept=False):
@@ -404,7 +414,7 @@ def test_service_does_not_start_when_the_state_folder_is_not_mounted(tmp_path, m
 def on_disk(web) -> str:
     """Всё, что база держит на диске, одним текстом: сам файл и журнал незакрытых записей."""
     return "".join(path.read_bytes().decode("utf-8", "replace")
-                   for path in sorted(web.cfg.state_dir.glob(db.FILE + "*")))
+                   for path in sorted(web.core.cfg.state_dir.glob(db.FILE + "*")))
 
 
 def test_admin_list_matches_the_routes(site):
@@ -422,7 +432,7 @@ def test_ordinary_user_gets_403_on_everything_for_the_admin(site):
         assert call(ivanov, method, path, body, params=QUERY.get(path)).status_code == 403, f"{method} {path}"
         assert call(site[1], method, path, body, auth=("ivanov", PASSWORD),
                     params=QUERY.get(path)).status_code == 403, f"basic {path}"
-    assert sorted(web.people.users) == ["ivanov", "petrov"] and (web.cfg.inbox / "Проекты").is_dir()
+    assert sorted(web.core.people.users) == ["ivanov", "petrov"] and (web.core.cfg.inbox / "Проекты").is_dir()
 
 
 def test_service_admin_made_by_the_checkbox_passes_everywhere(site):
@@ -444,7 +454,7 @@ def test_password_change_and_user_removal_end_old_sessions(site):
     assert admin.post("/api/password", json={"old": ADMIN_PASSWORD, "new": "новый-пароль-1"}).status_code == 400
     assert admin.post("/api/admin/users/delete", json={"login": "petrov"}).status_code == 200
     assert petrov.get("/api/browse").status_code == 401
-    assert (web.cfg.inbox / HOME / "petrov").is_dir()              # личная папка остаётся на диске
+    assert (web.core.cfg.inbox / HOME / "petrov").is_dir()              # личная папка остаётся на диске
 
 
 # ---------- папки и права ----------
@@ -475,10 +485,10 @@ def test_records_are_visible_only_in_open_folders(site):
     web, admin, ivanov, petrov = staffed(site)
     admin.post("/api/folder", json={"dir": "Проекты"})
     admin.post("/api/access", json={"dir": "Проекты", "login": "ivanov", "read": "only"})
-    summary = web.cfg.outbox / "Проекты" / "вкс" / "summary"
+    summary = web.core.cfg.outbox / "Проекты" / "вкс" / "summary"
     summary.mkdir(parents=True)
     (summary / "вкс.md").write_text("# Протокол\n\nРешили.\n", encoding="utf-8")
-    web.service.ledger.put({"file": "Проекты/вкс.mp4", "status": "ok", "stem": "вкс",
+    web.core.service.ledger.put({"file": "Проекты/вкс.mp4", "status": "ok", "stem": "вкс",
                             "finished_at": "2026-10-09T12:00:00+03:00"})
     query = {"file": "Проекты/вкс.mp4"}
 
@@ -517,11 +527,11 @@ def test_user_makes_subfolders_at_home_but_not_elsewhere(site):
     admin.post("/api/folder", json={"dir": "Проекты"})
     admin.post("/api/access", json={"dir": "Проекты", "login": "ivanov", "read": "tree"})
     made = ivanov.post("/api/folder", json={"dir": f"{HOME}/ivanov/Совещания"})
-    assert made.status_code == 200 and (web.cfg.inbox / HOME / "ivanov" / "Совещания").is_dir()
+    assert made.status_code == 200 and (web.core.cfg.inbox / HOME / "ivanov" / "Совещания").is_dir()
     assert "Совещания" in dir_names(ivanov, f"{HOME}/ivanov")
     for foreign in (f"{HOME}/petrov/Чужое", "Проекты/Сметы", "Новая общая", f"{HOME}/sidorov"):
         assert ivanov.post("/api/folder", json={"dir": foreign}).status_code == 403, foreign
-        assert not (web.cfg.inbox / foreign).exists()
+        assert not (web.core.cfg.inbox / foreign).exists()
     for bad in ("", "..", "Проекты/../x", ".скрытая"):
         assert admin.post("/api/folder", json={"dir": bad}).status_code == 400, bad
 
@@ -540,7 +550,7 @@ def test_folder_admin_grants_reading_but_not_administration(site):
     assert petrov.post("/api/access", json={"dir": "Проекты", "login": "ivanov", "manage": "only"}).status_code == 403
     assert petrov.post("/api/access", json={"dir": "Проекты", "login": "ivanov",
                                             "read": "tree", "manage": "tree"}).status_code == 403
-    assert web.people.users["ivanov"]["manage"] == {} and web.people.users["ivanov"]["read"] == {"Проекты": "only"}
+    assert web.core.people.users["ivanov"]["manage"] == {} and web.core.people.users["ivanov"]["read"] == {"Проекты": "only"}
     # администрирование с подпапками: подпапку завести можно, чужую папку и корень раздать нельзя
     assert petrov.post("/api/folder", json={"dir": "Проекты/Сметы"}).status_code == 200
     for foreign in ("Снабжение", "", f"{HOME}/ivanov"):
@@ -561,14 +571,14 @@ def test_upload_lands_in_own_folder_and_is_written_to_the_journal(site):
     assert ivanov.get("/api/upload", params=file).json()["offset"] == 5       # докачка с этого места
     assert ivanov.put("/api/upload", params={**file, "offset": 0}, content=b"12345").status_code == 409
     assert ivanov.put("/api/upload", params={**file, "offset": 5}, content=b"67890").json()["done"]
-    assert (web.cfg.inbox / home / "планёрка.mp3").read_bytes() == b"1234567890"
+    assert (web.core.cfg.inbox / home / "планёрка.mp3").read_bytes() == b"1234567890"
     assert ivanov.get("/api/upload", params=file).status_code == 409           # такая запись уже есть
 
     events = admin.get("/api/admin/journal").json()["events"]
     uploads = [e for e in events if e["kind"] == "upload"]
     assert len(uploads) == 1
     assert uploads[0]["by"] == "ivanov" and uploads[0]["file"] == f"{home}/планёрка.mp3" and uploads[0]["size"] == 10
-    assert web.trail.uploaded == {f"{home}/планёрка.mp3": "ivanov"}
+    assert web.core.trail.uploaded == {f"{home}/планёрка.mp3": "ivanov"}
     assert [f["path"] for f in admin.post("/api/admin/files").json()["files"]] == [f"{home}/планёрка.mp3"]
 
 
@@ -584,8 +594,8 @@ def test_upload_into_a_closed_folder_is_refused(site):
     refused = ivanov.put("/api/upload", params={"name": "вирус.exe", "size": 5, "stamp": "1", "offset": 0,
                                                 "dir": f"{HOME}/ivanov"}, content=b"12345")
     assert refused.status_code == 400
-    assert [p for p in web.cfg.inbox.rglob("*") if p.is_file()] == []
-    assert not [e for e in web.trail.read() if e["kind"] == "upload"]
+    assert [p for p in web.core.cfg.inbox.rglob("*") if p.is_file()] == []
+    assert not [e for e in web.core.trail.read() if e["kind"] == "upload"]
 
 
 # ---------- действия с папками, отчёт ----------
@@ -596,13 +606,13 @@ def test_admin_renames_and_deletes_a_folder(site):
     admin.post("/api/access", json={"dir": "Проекты", "login": "ivanov", "read": "tree", "upload": "tree"})
     file = {"name": "вкс.mp3", "size": 5, "stamp": "1", "dir": "Проекты", "offset": 0}
     assert ivanov.put("/api/upload", params=file, content=b"12345").json()["done"]
-    web.service.ledger.put({"file": "Проекты/вкс.mp3", "status": "ok"})
+    web.core.service.ledger.put({"file": "Проекты/вкс.mp3", "status": "ok"})
 
     renamed = admin.post("/api/admin/folders/rename", json={"dir": "Проекты", "name": "Проекты отдела"})
     assert renamed.json() == {"ok": True, "path": "Проекты отдела"}
-    assert (web.cfg.inbox / "Проекты отдела" / "вкс.mp3").is_file() and not (web.cfg.inbox / "Проекты").exists()
+    assert (web.core.cfg.inbox / "Проекты отдела" / "вкс.mp3").is_file() and not (web.core.cfg.inbox / "Проекты").exists()
     assert "Проекты отдела" in dir_names(ivanov) and "Проекты" not in dir_names(ivanov)      # права переехали
-    assert web.people.users["ivanov"]["upload"] == {"Проекты отдела": "tree"}
+    assert web.core.people.users["ivanov"]["upload"] == {"Проекты отдела": "tree"}
     assert [f["file"] for f in ivanov.get("/api/browse", params={"path": "Проекты отдела"}).json()["files"]] \
         == ["Проекты отдела/вкс.mp3"]
     assert admin.post("/api/admin/folders/rename", json={"dir": "Нет такой", "name": "Имя"}).status_code == 404
@@ -611,10 +621,10 @@ def test_admin_renames_and_deletes_a_folder(site):
     assert admin.post("/api/admin/folders/delete", json={"dir": f"{HOME}/ivanov"}).status_code == 400
     deleted = admin.post("/api/admin/folders/delete", json={"dir": "Проекты отдела"}).json()
     assert deleted["ok"] and deleted["records"] == 1
-    assert not (web.cfg.inbox / "Проекты отдела").exists()
-    assert (web.cfg.inbox / deleted["trash"] / "Проекты отдела" / "вкс.mp3").is_file()
-    assert "Проекты отдела" not in dir_names(admin) and web.service.ledger.records == {}
-    assert web.people.users["ivanov"]["read"] == {} and web.people.users["ivanov"]["upload"] == {}
+    assert not (web.core.cfg.inbox / "Проекты отдела").exists()
+    assert (web.core.cfg.inbox / deleted["trash"] / "Проекты отдела" / "вкс.mp3").is_file()
+    assert "Проекты отдела" not in dir_names(admin) and web.core.service.ledger.records == {}
+    assert web.core.people.users["ivanov"]["read"] == {} and web.core.people.users["ivanov"]["upload"] == {}
 
     kinds = [e["kind"] for e in admin.get("/api/admin/journal").json()["events"]]
     assert kinds[:2] == ["folder_delete", "folder_rename"] and "folder_create" in kinds
@@ -625,7 +635,7 @@ def test_folder_actions_wait_for_the_scanner_lock(site):
     for name in ("Проекты", "Архив"):
         admin.post("/api/folder", json={"dir": name})
     answers = []
-    web.service.scan_lock.acquire()                                 # сканер посреди обхода
+    web.core.service.scan_lock.acquire()                                 # сканер посреди обхода
     try:
         calls = [threading.Thread(target=lambda p=path, b=body: answers.append(admin.post(p, json=b)))
                  for path, body in (("/api/admin/folders/rename", {"dir": "Проекты", "name": "Проекты отдела"}),
@@ -634,36 +644,36 @@ def test_folder_actions_wait_for_the_scanner_lock(site):
             t.start()
         time.sleep(0.4)
         # пока обход не кончился, папки на месте: сканер не увидит переезд наполовину
-        assert answers == [] and (web.cfg.inbox / "Проекты").is_dir() and (web.cfg.inbox / "Архив").is_dir()
+        assert answers == [] and (web.core.cfg.inbox / "Проекты").is_dir() and (web.core.cfg.inbox / "Архив").is_dir()
     finally:
-        web.service.scan_lock.release()
+        web.core.service.scan_lock.release()
     for t in calls:
         t.join(10)
     assert [a.status_code for a in answers] == [200, 200]
-    assert (web.cfg.inbox / "Проекты отдела").is_dir() and not (web.cfg.inbox / "Архив").exists()
+    assert (web.core.cfg.inbox / "Проекты отдела").is_dir() and not (web.core.cfg.inbox / "Архив").exists()
     assert admin.post("/api/admin/folders/rename", json={"dir": "Нет такой", "name": "Имя"}).status_code == 404
-    assert not web.service.scan_lock.locked()                       # отказ замок сканера не держит
+    assert not web.core.service.scan_lock.locked()                       # отказ замок сканера не держит
 
 
 def test_trash_and_stale_uploads_are_cleaned_while_the_service_runs(site):
     web, _ = site
-    old = web.cfg.inbox / folders.TRASH / "20260101-000000"
-    fresh = web.cfg.inbox / folders.TRASH / "20261009-000000"
-    part = web.cfg.inbox / upload.PARTS_DIR / "брошено.part"
+    old = web.core.cfg.inbox / folders.TRASH / "20260101-000000"
+    fresh = web.core.cfg.inbox / folders.TRASH / "20261009-000000"
+    part = web.core.cfg.inbox / upload.PARTS_DIR / "брошено.part"
     for p in (old, fresh, part.parent):
         p.mkdir(parents=True, exist_ok=True)
     part.write_bytes(b"x")
     long_ago = time.time() - (folders.TRASH_DAYS + 1) * 86400
     os.utime(old, (long_ago, long_ago))
     os.utime(part, (long_ago, long_ago))
-    web._clean()
+    web.lifecycle._clean()
     assert not old.exists() and fresh.is_dir() and not part.exists()
-    assert web.CLEAN_EVERY_SEC == 86400
+    assert web.core.CLEAN_EVERY_SEC == 86400
 
 
 def test_cost_report_is_served_and_checks_its_arguments(site):
     web, client = site
-    web.trail.write("run", "", file="Проекты/вкс.mp4", uploaded_by="ivanov", reason="new", status="ok",
+    web.core.trail.write("run", "", file="Проекты/вкс.mp4", uploaded_by="ivanov", reason="new", status="ok",
                     audio_sec=600, cost=0.25, stages=[{"stage": "speech", "model": "deepgram/nova-3", "cost": 0.25}])
     admin = enter(web, "admin", ADMIN_PASSWORD)
     for path in ("/api/admin/report", "/api/v1/costs"):
@@ -687,7 +697,7 @@ def csv_tables(text: str) -> dict[str, list[list[str]]]:
 
 def test_report_csv_is_the_whole_report_in_one_file(site):
     web, client = site
-    web.trail.write("run", "petrov", file="Снабжение/вкс.mp4", reason="manual", status="ok", audio_sec=90, cost=0.5)
+    web.core.trail.write("run", "petrov", file="Снабжение/вкс.mp4", reason="manual", status="ok", audio_sec=90, cost=0.5)
     sheet = client.get("/api/admin/report.csv", params={"bucket": "month"}, auth=("admin", ADMIN_PASSWORD))
     assert sheet.status_code == 200 and sheet.headers["content-type"].startswith("text/csv")
     assert sheet.headers["content-disposition"] == 'attachment; filename="costs.csv"'
@@ -718,15 +728,15 @@ def test_report_xlsx_holds_the_same_numbers_as_the_report(site):
     """Книга Excel — тот же отчёт, что отдаёт /api/admin/report: листы по разрезам, числа числами,
     даты датами, и суммы на листах сходятся с итогом."""
     web, client = site
-    web.trail.write("upload", "ivanov", file="Проекты/Сметы/а.mp4", size=10)
-    web.trail.run({"file": "Проекты/Сметы/а.mp4", "status": "ok", "audio_duration_sec": 3600,
+    web.core.trail.write("upload", "ivanov", file="Проекты/Сметы/а.mp4", size=10)
+    web.core.trail.run({"file": "Проекты/Сметы/а.mp4", "status": "ok", "audio_duration_sec": 3600,
                    "cost": {"RUB": 12.0, "USD": 0.05},
                    "cost_models": [{"stage": "speech", "model": "scribe", "provider": "RouterAI", "currency": "RUB", "cost": 12.0},
                                    {"stage": "summary", "model": "deepseek", "provider": "OpenRouter", "currency": "USD",
                                     "cost": 0.05}],
                    "cost_providers": [{"provider": "RouterAI", "currency": "RUB", "cost": 12.0},
                                       {"provider": "OpenRouter", "currency": "USD", "cost": 0.05}]}, "", "new")
-    web.trail.run({"file": "=вне папок.mp4", "status": "error", "audio_duration_sec": 90, "cost": {"RUB": 3.5},
+    web.core.trail.run({"file": "=вне папок.mp4", "status": "error", "audio_duration_sec": 90, "cost": {"RUB": 3.5},
                    "cost_models": [{"stage": "speech", "model": "scribe", "provider": "RouterAI", "currency": "RUB", "cost": 3.5}],
                    "cost_providers": [{"provider": "RouterAI", "currency": "RUB", "cost": 3.5}]}, "admin", "manual")
     admin = enter(web, "admin", ADMIN_PASSWORD)
@@ -811,7 +821,7 @@ def job(file, **fields):
 def test_status_and_pages_show_every_record_in_work(site, monkeypatch):
     web, admin, ivanov, petrov = staffed(site)
     mine, his = f"{HOME}/ivanov/планёрка.mp4", f"{HOME}/petrov/лекция.mp4"
-    monkeypatch.setattr(web.service, "running", [
+    monkeypatch.setattr(web.core.service, "running", [
         job(mine, step="расшифровка с разделением говорящих", chunks_done=1, chunks_total=3),
         job(his, step="протокол по шаблону «Лекция»", manual=True)])
 
@@ -833,24 +843,24 @@ def test_record_in_work_is_not_started_again_and_a_rebuild_waits_in_the_queue(si
     web, admin, _, _ = staffed(site)
     file = "Проекты/вкс.mp4"
     recorded(web, file)
-    out = web.cfg.outbox / "Проекты" / "вкс" / "transcript"
+    out = web.core.cfg.outbox / "Проекты" / "вкс" / "transcript"
     out.mkdir()
     (out / "вкс.json").write_text(json.dumps({"segments": [
         {"start": 0.0, "end": 2.0, "speaker": "S1", "text": "Добрый день."}]}), encoding="utf-8")
-    monkeypatch.setattr(web.service, "running", [job(file)])
-    monkeypatch.setattr(web.service, "queue", [])
+    monkeypatch.setattr(web.core.service, "running", [job(file)])
+    monkeypatch.setattr(web.core.service, "queue", [])
 
     assert admin.post("/api/admin/run", json={"file": file}).status_code == 409       # вручную второй раз не пустить
     signed = admin.post("/api/admin/names", json={"file": file, "parts": {"1": {"S1": "Иванов"}}, "rebuild": True})
     assert signed.status_code == 200 and signed.json()["rebuilding"]
     # пересборка встала в очередь, но пока запись в работе, её никто не берёт
-    assert [(i.path, i.reason) for i in web.service.queue] == [(file, "rebuild")]
-    assert web.service._take() is None and len(web.service.queue) == 1
+    assert [(i.path, i.reason) for i in web.core.service.queue] == [(file, "rebuild")]
+    assert web.core.service._take() is None and len(web.core.service.queue) == 1
     # на странице запись одна — «обрабатывается», а не ещё и «в очереди»
     assert [p["state"] for p in admin.get("/api/browse", params={"path": "Проекты"}).json()["pending"]] == ["running"]
-    web.service.running.clear()                                                        # прогон закончился
-    item, taken = web.service._take()
-    assert item.reason == "rebuild" and taken["file"] == file and web.service.queue == []
+    web.core.service.running.clear()                                                        # прогон закончился
+    item, taken = web.core.service._take()
+    assert item.reason == "rebuild" and taken["file"] == file and web.core.service.queue == []
 
 
 def test_repeated_rebuild_request_never_pays_twice_for_the_same_edits(site):
@@ -859,11 +869,11 @@ def test_repeated_rebuild_request_never_pays_twice_for_the_same_edits(site):
     следующая ставится, только если подписи или словарь с её начала правили, и только одна."""
     web, admin, _, _ = staffed(site)
     file = voiced(web, "Проекты/вкс.mp4")
-    take, web.service._take = web.service._take, lambda: None      # обработчик очередь не разбирает: берём сами
+    take, web.core.service._take = web.core.service._take, lambda: None      # обработчик очередь не разбирает: берём сами
     robot, _ = keyed(web, admin)
     sign = lambda **q: robot.post("/api/v1/speakers", params={"file": file, **q}).json()
     words = lambda **q: robot.put("/api/v1/dictionary", params={"file": file, **q.pop("params", {})}, **q).json()
-    queued = lambda: [(i.path, i.reason) for i in web.service.queue]
+    queued = lambda: [(i.path, i.reason) for i in web.core.service.queue]
 
     # все подписи сразу, без rebuild: сохранены, пересборки нет и в ответе о ней ни слова
     for label, name in (("S1", "Петрова Анна"), ("S2", "Иванов Иван")):
@@ -894,13 +904,13 @@ def test_repeated_rebuild_request_never_pays_twice_for_the_same_edits(site):
     assert take() is None                                           # пока идёт текущая, следующую не берут
     # текущая закончилась, началась следующая; то же от словаря: правка словаря записи после начала
     # прогона — основание для одной следующей, просьба без правки — нет
-    web.service.running.clear()
+    web.core.service.running.clear()
     assert take()[1]["file"] == file and queued() == []
     time.sleep(0.05)
     assert words(params={"rebuild": True})["rebuild"] == "already" and queued() == []
     edited = robot.put("/api/v1/dictionary", params={"file": file, "rebuild": True}, json={"terms": ["КС-2 — акт"]}).json()
     assert edited["rebuild"] == "queued" and edited["dict_newer"] and queued() == [(file, "rebuild")]
-    assert words(params={"rebuild": True})["rebuild"] == "already" and len(web.service.queue) == 1
+    assert words(params={"rebuild": True})["rebuild"] == "already" and len(web.core.service.queue) == 1
 
 
 # ---------- действия с записью ----------
@@ -909,23 +919,23 @@ def recorded(web, rel, by=None):
     """Готовая запись: исходник, результаты, строка журнала обработки и расход в журнале событий."""
     folder, _, name = rel.rpartition("/")
     stem = name.rsplit(".", 1)[0]
-    (web.cfg.inbox / folder).mkdir(parents=True, exist_ok=True)
-    (web.cfg.inbox / rel).write_bytes(b"video")
-    out = web.cfg.outbox / folder / stem
+    (web.core.cfg.inbox / folder).mkdir(parents=True, exist_ok=True)
+    (web.core.cfg.inbox / rel).write_bytes(b"video")
+    out = web.core.cfg.outbox / folder / stem
     (out / "summary").mkdir(parents=True)
     (out / "summary" / f"{stem}.md").write_text("# Протокол\n\nРешили.\n", encoding="utf-8")
     if by:
-        web.trail.write("upload", by, file=rel, size=5)
-    web.service.ledger.put({"file": rel, "status": "ok", "stem": stem, "output": str(out), "cost": 0.25,
+        web.core.trail.write("upload", by, file=rel, size=5)
+    web.core.service.ledger.put({"file": rel, "status": "ok", "stem": stem, "output": str(out), "cost": 0.25,
                             "finished_at": "2026-10-09T12:00:00+03:00"})
-    web.trail.run(web.service.ledger.get(rel), "", "new")
+    web.core.trail.run(web.core.service.ledger.get(rel), "", "new")
 
 
 def idle(web):
     """Два обхода подряд: новый файл сканер замечает на первом и ставит в очередь не раньше второго."""
-    web.service.scan_once()
-    web.service.scan_once()
-    return web.service.queue == [] and web.service.pending == {}
+    web.core.service.scan_once()
+    web.core.service.scan_once()
+    return web.core.service.queue == [] and web.core.service.pending == {}
 
 
 def test_owner_renames_moves_and_deletes_a_record_without_reprocessing(site):
@@ -940,7 +950,7 @@ def test_owner_renames_moves_and_deletes_a_record_without_reprocessing(site):
     renamed = ivanov.post("/api/record/rename", json={"file": old, "name": "Планёрка"})
     new = f"{home}/Планёрка.mp4"
     assert renamed.json() == {"ok": True, "file": new}
-    assert (web.cfg.inbox / new).is_file() and not (web.cfg.inbox / old).exists()
+    assert (web.core.cfg.inbox / new).is_file() and not (web.core.cfg.inbox / old).exists()
     assert "Решили." in ivanov.get("/api/result", params={"file": new}).json()["text"]
     assert ivanov.get("/api/result", params={"file": old}).status_code == 404
     assert idle(web)                                                    # сканер не принял её за новую
@@ -951,13 +961,13 @@ def test_owner_renames_moves_and_deletes_a_record_without_reprocessing(site):
     assert "Решили." in ivanov.get("/api/v1/record", params={"file": last}).json()["protocol"]
     assert [f["file"] for f in ivanov.get("/api/browse", params={"path": f"{home}/Архив"}).json()["files"]] == [last]
     assert idle(web)
-    assert web.service.ledger.get(last)["runs"] == 1 and web.trail.uploaded == {last: "ivanov"}
+    assert web.core.service.ledger.get(last)["runs"] == 1 and web.core.trail.uploaded == {last: "ivanov"}
 
     deleted = ivanov.post("/api/record/delete", json={"file": last}).json()
     assert deleted["ok"] and deleted["keep_days"] == 30
-    assert (web.cfg.inbox / deleted["trash"] / "Планёрка.mp4").is_file()
-    assert (web.cfg.outbox / deleted["trash"] / "Планёрка" / "summary" / "Планёрка.md").is_file()
-    assert web.service.ledger.records == {} and not (web.cfg.inbox / last).exists()
+    assert (web.core.cfg.inbox / deleted["trash"] / "Планёрка.mp4").is_file()
+    assert (web.core.cfg.outbox / deleted["trash"] / "Планёрка" / "summary" / "Планёрка.md").is_file()
+    assert web.core.service.ledger.records == {} and not (web.core.cfg.inbox / last).exists()
     assert ivanov.get("/api/result", params={"file": last}).status_code == 404
     assert idle(web)
 
@@ -975,8 +985,8 @@ def test_owner_renames_moves_and_deletes_a_record_without_reprocessing(site):
 def test_scanner_notices_the_same_file_when_the_ledger_row_is_missing(site):
     """Обратная проверка к idle(): файл без строки в журнале обработки сканер берёт на заметку."""
     web, _ = site
-    (web.cfg.inbox / "новая.mp4").write_bytes(b"video")
-    assert not idle(web) and list(web.service.pending) == ["новая.mp4"]
+    (web.core.cfg.inbox / "новая.mp4").write_bytes(b"video")
+    assert not idle(web) and list(web.core.service.pending) == ["новая.mp4"]
 
 
 def test_record_actions_follow_the_rights(site):
@@ -1006,7 +1016,7 @@ def test_record_actions_follow_the_rights(site):
         assert ivanov.post("/api/record/rename", json={"file": file, "name": name}).status_code == 400, name
     recorded(web, "Проекты/смета.mp4")
     assert ivanov.post("/api/record/rename", json={"file": file, "name": "смета"}).status_code == 409
-    assert (web.cfg.inbox / file).is_file() and not [e for e in web.trail.read() if e["kind"].startswith("record_")]
+    assert (web.core.cfg.inbox / file).is_file() and not [e for e in web.core.trail.read() if e["kind"].startswith("record_")]
 
     moved = ivanov.post("/api/record/move", json={"file": file, "dir": f"{HOME}/ivanov"})
     assert moved.json()["file"] == f"{HOME}/ivanov/вкс.mp4"
@@ -1020,30 +1030,30 @@ def test_record_in_the_queue_or_in_work_is_not_touched(site, monkeypatch):
     actions = (("/api/record/rename", {"file": file, "name": "Итоги"}),
                ("/api/record/move", {"file": file, "dir": ""}),
                ("/api/record/delete", {"file": file}))
-    monkeypatch.setattr(web.service, "running", [job(file)])
+    monkeypatch.setattr(web.core.service, "running", [job(file)])
     for path, body in actions:
         assert admin.post(path, json=body).status_code == 409, path
-    monkeypatch.setattr(web.service, "running", [])
-    monkeypatch.setitem(web.service.pending, file, object())       # сканер ещё следит за файлом
+    monkeypatch.setattr(web.core.service, "running", [])
+    monkeypatch.setitem(web.core.service.pending, file, object())       # сканер ещё следит за файлом
     for path, body in actions:
         assert admin.post(path, json=body).status_code == 409, path
-    monkeypatch.delitem(web.service.pending, file)
-    assert (web.cfg.inbox / file).is_file() and web.service.ledger.get(file)
+    monkeypatch.delitem(web.core.service.pending, file)
+    assert (web.core.cfg.inbox / file).is_file() and web.core.service.ledger.get(file)
 
-    monkeypatch.setattr(web, "upload_ready", False)                 # входная папка только для чтения
+    monkeypatch.setattr(web.core, "upload_ready", False)                 # входная папка только для чтения
     for path, body in actions:
         assert admin.post(path, json=body).status_code == 503, path
     assert not admin.get("/api/result", params={"file": file}).json()["can_act"]
-    assert not web.service.scan_lock.locked()                       # отказ замок сканера не держит
+    assert not web.core.service.scan_lock.locked()                       # отказ замок сканера не держит
 
 
 def test_user_is_deleted_whatever_the_case_of_the_login_and_unknown_one_is_404(site):
     web, admin, _, petrov = staffed(site)
     assert admin.post("/api/admin/users/delete", json={"login": "nobody"}).status_code == 404
-    assert not [e for e in web.trail.read() if e["kind"] == "user_delete"]
+    assert not [e for e in web.core.trail.read() if e["kind"] == "user_delete"]
     assert admin.post("/api/admin/users/delete", json={"login": " Petrov "}).status_code == 200
-    assert sorted(web.people.users) == ["ivanov"] and petrov.get("/api/browse").status_code == 401
-    assert [e["login"] for e in web.trail.read() if e["kind"] == "user_delete"] == ["petrov"]
+    assert sorted(web.core.people.users) == ["ivanov"] and petrov.get("/api/browse").status_code == 401
+    assert [e["login"] for e in web.core.trail.read() if e["kind"] == "user_delete"] == ["petrov"]
 
 
 # ---------- личный режим ----------
@@ -1057,7 +1067,7 @@ def test_personal_mode_needs_no_login(tmp_path):
         assert client.post("/api/folder", json={"dir": "Совещания"}).status_code == 200
         done = client.put("/api/upload", params={"name": "запись.mp3", "size": 3, "stamp": "1", "offset": 0, "dir": "Совещания"},
                           content=b"123")
-        assert done.json()["done"] and (web.cfg.inbox / "Совещания" / "запись.mp3").is_file()
+        assert done.json()["done"] and (web.core.cfg.inbox / "Совещания" / "запись.mp3").is_file()
         assert not client.get("/api/browse", params={"path": "Совещания"}).json()["manage"]
 
 
@@ -1074,15 +1084,15 @@ def test_personal_mode_serves_only_its_own_addresses_and_pages(tmp_path):
         for host in ("evil.example", "evil.example:8080", "localhost.evil.example", "meetings.example.test.evil.example",
                      "192.0.2.10.nip.example"):
             refused = client.get("/", headers={"host": host})
-            assert refused.status_code == 400 and refused.json()["detail"] == web.FOREIGN_HOST, host
+            assert refused.status_code == 400 and refused.json()["detail"] == web.server.FOREIGN_HOST, host
 
         for origin in ("https://evil.example", "null", "http://localhost:8081"):
             for method, path, kw in (("POST", "/api/folder", {"json": {"dir": "Чужая"}}),
                                      ("POST", "/api/v1/speakers", {"params": {"file": "Совещания/запись.mp3", "rebuild": "true"}}),
                                      ("PUT", "/api/v1/upload", {"params": {"name": "чужая.mp3"}, "content": b"123"})):
                 refused = client.request(method, path, headers={"host": "localhost:8080", "origin": origin}, **kw)
-                assert refused.status_code == 403 and refused.json()["detail"] == web.FOREIGN_PAGE, (origin, path)
-        assert not (web.cfg.inbox / "Чужая").exists() and not (web.cfg.inbox / "чужая.mp3").exists()
+                assert refused.status_code == 403 and refused.json()["detail"] == web.server.FOREIGN_PAGE, (origin, path)
+        assert not (web.core.cfg.inbox / "Чужая").exists() and not (web.core.cfg.inbox / "чужая.mp3").exists()
         # чтение чужой странице и так не достаётся: браузер не отдаст ей ответ без CORS
         assert client.get("/api/browse", headers={"host": "localhost:8080", "origin": "https://evil.example"}).status_code == 200
 
@@ -1112,7 +1122,7 @@ def test_fresh_install_works_in_both_modes_and_nothing_asks_for_payment(tmp_path
                     and admin.request(m, p).status_code == 402}
         robot, _ = keyed(web, ivanov)
         sent = robot.put("/api/v1/upload", params={"dir": home, "name": "новая.mp3"}, content=b"123")
-        assert sent.status_code == 200 and (web.cfg.inbox / home / "новая.mp3").read_bytes() == b"123"
+        assert sent.status_code == 200 and (web.core.cfg.inbox / home / "новая.mp3").read_bytes() == b"123"
         assert ivanov.get("/api/browse", params={"path": home}).json()["upload"]["enabled"] is True
         who = robot.get("/api/v1/whoami").json()
         assert who["upload"] is True and "license" not in who and "license" not in ivanov.get("/api/me").json()
@@ -1161,13 +1171,13 @@ def office(tmp_path, monkeypatch):
     """Сервис с включённой почтой: модуль, клиент без входа, вошедший администратор и «почта»."""
     with running(tmp_path, extra=MAIL_ENV) as (web, client):
         post = Post()
-        monkeypatch.setattr(web.mail, "send", post.send)
-        monkeypatch.setattr(web.mail, "send_each", post.send_each)
+        monkeypatch.setattr(web.core.mail, "send", post.send)
+        monkeypatch.setattr(web.core.mail, "send_each", post.send_each)
         yield web, client, enter(web, "admin", ADMIN_PASSWORD), post
 
 
 def kinds(web):
-    return [e["kind"] for e in web.trail.read()]
+    return [e["kind"] for e in web.core.trail.read()]
 
 
 def test_request_to_login_chain(office):
@@ -1181,7 +1191,7 @@ def test_request_to_login_chain(office):
     assert notice.to == ["boss@example.test", "it@example.test"]
     assert notice.subject == "заявка на доступ — sidorov" and "http://podyachiy.test/admin#users" in notice.text
     assert "Сидоров <b>Пётр</b>" in notice.text and "&lt;b&gt;Пётр&lt;/b&gt;" in notice.html and "<b>Пётр" not in notice.html
-    assert not web.people.users                                      # заявка ещё никого не завела
+    assert not web.core.people.users                                      # заявка ещё никого не завела
 
     # 2. администратор видит счётчик и саму заявку
     assert admin.get("/api/me").json()["requests"] == 1 and guest.get("/api/me").json()["requests"] == 0
@@ -1201,8 +1211,8 @@ def test_request_to_login_chain(office):
     user, = approved["users"]
     assert (user["login"], user["name"], user["email"], user["has_password"], user["admin"]) == (
         "sidorov.p", "Сидоров Пётр", "sidorov@example.test", False, False)
-    assert user["read"] == {} and (web.cfg.inbox / HOME / "sidorov.p").is_dir()      # только личная папка
-    saved = web.claims.all()
+    assert user["read"] == {} and (web.core.cfg.inbox / HOME / "sidorov.p").is_dir()      # только личная папка
+    saved = web.core.claims.all()
     assert saved[0]["status"] == "approved" and saved[0]["decided_by"] == "admin" and saved[0]["login"] == "sidorov.p"
 
     # 4. человеку пришло письмо с логином и ссылкой, пароля в нём нет — его ещё не существует
@@ -1236,12 +1246,12 @@ def test_request_to_login_chain(office):
 
     assert [k for k in kinds(web) if k not in ("login", "login_failed")] == [
         "request_new", "request_approve", "link_sent", "password_link"]
-    events = {e["kind"]: e for e in web.trail.read()}
+    events = {e["kind"]: e for e in web.core.trail.read()}
     assert events["request_new"]["by"] == "" and events["request_new"]["login"] == "sidorov"
     assert events["link_sent"]["by"] == "admin" and events["link_sent"]["why"] == "invite"
     assert events["password_link"]["by"] == "sidorov.p"
     # ни строка ссылки, ни пароль не осели ни в одном файле сервиса
-    for path in list(web.cfg.state_dir.rglob("*")) + list(web.cfg.outbox.rglob("*")):
+    for path in list(web.core.cfg.state_dir.rglob("*")) + list(web.core.cfg.outbox.rglob("*")):
         if path.is_file() and path.name != "session.key":
             content = path.read_text(encoding="utf-8", errors="replace")
             assert token not in content and "пароль-из-письма" not in content, path.name
@@ -1253,8 +1263,8 @@ def test_expired_link_is_refused(office):
     claim, = admin.get("/api/admin/requests").json()["requests"]
     admin.post("/api/admin/requests/approve", json={"id": claim["id"], "login": "sidorov", "name": "Сидоров"})
     token = post.token()
-    assert web.people.users["sidorov"]["link"]["expires"] - time.time() == pytest.approx(48 * 3600, abs=60)
-    with web.base.write() as con:                                                  # 48 часов прошли
+    assert web.core.people.users["sidorov"]["link"]["expires"] - time.time() == pytest.approx(48 * 3600, abs=60)
+    with web.core.base.write() as con:                                                  # 48 часов прошли
         con.execute("UPDATE users SET link_expires = ? WHERE login = 'sidorov'", (int(time.time()) - 1,))
     assert guest.post("/api/set-password/check", json={"token": token}).status_code == 404
     late = guest.post("/api/set-password", json={"token": token, "password": "пароль-из-письма"})
@@ -1270,7 +1280,7 @@ def test_expired_link_is_refused(office):
     assert post.sent[-1].subject == "доступ открыт" and post.token() != token
     assert guest.post("/api/set-password", json={"token": post.token(), "password": "пароль-из-письма"}).status_code == 200
     assert enter(web, "sidorov", "пароль-из-письма")
-    assert [e["why"] for e in web.trail.read() if e["kind"] == "link_sent"] == ["invite", "admin"]
+    assert [e["why"] for e in web.core.trail.read() if e["kind"] == "link_sent"] == ["invite", "admin"]
     # у кого пароль уже есть, тому по кнопке администратора уходит письмо «новый пароль», а не «доступ открыт»
     assert admin.post("/api/admin/users/link", json={"login": "sidorov"}).status_code == 200
     assert post.sent[-1].subject == "новый пароль" and enter(web, "sidorov", "пароль-из-письма")
@@ -1289,7 +1299,7 @@ def test_forgotten_password_is_reset_by_the_link(office):
     # ответ один и тот же, есть пользователь или нет; письмо уходит только тому, у кого есть почта
     for typed in ("nobody", "nobody@example.test", "admin", "petrov"):
         assert guest.post("/api/forgot", json={"login": typed}).json() == {"ok": True}, typed
-    assert post.sent == [] and "link" not in web.people.users["petrov"]
+    assert post.sent == [] and "link" not in web.core.people.users["petrov"]
     assert guest.post("/api/forgot", json={"login": " "}).status_code == 400
 
     assert guest.post("/api/forgot", json={"login": " Ivanov "}).json() == {"ok": True}
@@ -1307,7 +1317,7 @@ def test_forgotten_password_is_reset_by_the_link(office):
     assert ivanov.get("/api/browse").status_code == 401                             # старые входы закрыты
     assert enter(web, "ivanov", "новый-пароль-5678")
 
-    journal = [(e["kind"], e.get("login"), e.get("why")) for e in web.trail.read()
+    journal = [(e["kind"], e.get("login"), e.get("why")) for e in web.core.trail.read()
                if e["kind"] in ("reset_request", "link_sent", "password_link")]
     assert journal == [("reset_request", "nobody", None), ("reset_request", "nobody@example.test", None),
                        ("reset_request", "admin", None), ("reset_request", "petrov", None),
@@ -1325,7 +1335,7 @@ def test_open_forms_are_rate_limited(office):
     assert sixth.status_code == 429 and "через час" in sixth.json()["detail"]
     assert len(admin.get("/api/admin/requests").json()["requests"]) == 5 and len(post.sent) == 5
     # отказы по содержанию принятыми не считаются, но и им есть предел — 30 отправок в час
-    web.claim_accepted._hits.clear()
+    web.core.claim_accepted._hits.clear()
     for n in range(24):
         assert guest.post("/api/request", json={"name": "", "email": "x@example.test", "login": "x1"}).status_code == 400
     assert guest.post("/api/request", json={"name": "", "email": "x@example.test", "login": "x1"}).status_code == 429
@@ -1361,7 +1371,7 @@ def test_request_form_refuses_bad_and_repeated_data_and_names_the_field(office, 
     assert guest.post("/api/request", json=CLAIM).status_code == 200
     assert "уже подана" in refused(409, None)
     assert "уже подана" in refused(409, None, login="another")
-    monkeypatch.setattr(web.signup, "PENDING_MAX", 1)
+    monkeypatch.setattr(web.core.signup, "PENDING_MAX", 1)
     assert "слишком много заявок" in refused(503, None, login="petrov", email="petrov@example.test")
     assert len(post.sent) == 1 and admin.get("/api/me").json()["requests"] == 1
 
@@ -1382,13 +1392,13 @@ def test_rejected_request_gets_no_letter_and_is_marked(office):
     claim, = admin.get("/api/admin/requests").json()["requests"]
     rejected = admin.post("/api/admin/requests/reject", json={"id": claim["id"]})
     assert rejected.json() == {"ok": True, "requests": []}
-    assert len(post.sent) == 1 and not web.people.users              # ушло только уведомление администраторам
-    saved = web.claims.all()
+    assert len(post.sent) == 1 and not web.core.people.users              # ушло только уведомление администраторам
+    saved = web.core.claims.all()
     assert saved[0]["status"] == "rejected" and saved[0]["decided_by"] == "admin"
     assert admin.post("/api/admin/requests/reject", json={"id": claim["id"]}).status_code == 404
     assert admin.post("/api/admin/requests/approve",
                       json={"id": claim["id"], "login": "sidorov", "name": "Сидоров"}).status_code == 404
-    assert [e for e in web.trail.read() if e["kind"] == "request_reject"][0]["login"] == "sidorov"
+    assert [e for e in web.core.trail.read() if e["kind"] == "request_reject"][0]["login"] == "sidorov"
     assert guest.post("/api/request", json=CLAIM).status_code == 200  # подать заново можно
 
 
@@ -1403,7 +1413,7 @@ def test_trial_letter_and_smtp_error_shown_as_it_is(office):
     assert chief.get("/api/admin/requests").json()["mail"]["probe_to"] == ["chief@example.test"]
     assert chief.post("/api/admin/mail/test").json()["to"] == ["chief@example.test"]
 
-    post.broken = web.mail.MailError("SMTPAuthenticationError: (535, b'5.7.8 Username and Password not accepted')")
+    post.broken = web.core.mail.MailError("SMTPAuthenticationError: (535, b'5.7.8 Username and Password not accepted')")
     failed = admin.post("/api/admin/mail/test")
     assert failed.status_code == 502
     assert failed.json()["detail"] == "SMTPAuthenticationError: (535, b'5.7.8 Username and Password not accepted')"
@@ -1411,12 +1421,12 @@ def test_trial_letter_and_smtp_error_shown_as_it_is(office):
     # почта сломалась в момент одобрения: пользователь заведён, об ошибке сказано, а ссылку получает
     # администратор — как без почты: иначе её не получить, пока почта не починена
     guest.post("/api/request", json=CLAIM)
-    assert web.trail.read()[-1]["kind"] == "mail_failed" and web.trail.read()[-1]["what"] == "notice"
-    assert web.trail.read()[-1]["login"] == "sidorov" and "535" in web.trail.read()[-1]["error"]
+    assert web.core.trail.read()[-1]["kind"] == "mail_failed" and web.core.trail.read()[-1]["what"] == "notice"
+    assert web.core.trail.read()[-1]["login"] == "sidorov" and "535" in web.core.trail.read()[-1]["error"]
     claim, = admin.get("/api/admin/requests").json()["requests"]
     approved = admin.post("/api/admin/requests/approve", json={"id": claim["id"], "login": "sidorov", "name": "Сидоров"})
     assert approved.status_code == 200 and "535" in approved.json()["mail_error"]
-    assert "sidorov" in web.people.users and approved.json()["requests"] == []
+    assert "sidorov" in web.core.people.users and approved.json()["requests"] == []
     assert guest.post("/api/set-password/check", json={"token": approved.json()["link"]["token"]}).status_code == 200
     again = admin.post("/api/admin/users/link", json={"login": "sidorov"})
     assert again.status_code == 200 and "535" in again.json()["mail_error"] and again.json()["email"] == "sidorov@example.test"
@@ -1426,7 +1436,7 @@ def test_trial_letter_and_smtp_error_shown_as_it_is(office):
     assert guest.post("/api/set-password/check", json={"token": again.json()["link"]["token"]}).status_code == 200
     assert "link_sent" not in kinds(web) and kinds(web).count("link_shown") == 2
     # каждое не ушедшее письмо — в журнале действий, с ответом сервера
-    failed = [e for e in web.trail.read() if e["kind"] == "mail_failed" and e["what"] == "link"]
+    failed = [e for e in web.core.trail.read() if e["kind"] == "mail_failed" and e["what"] == "link"]
     assert [(e["by"], e["login"], e["why"]) for e in failed] == [("admin", "sidorov", "invite"), ("admin", "sidorov", "admin")]
     assert all("535" in e["error"] for e in failed)
     # ключу с управлением ссылка не отдаётся и при сбое почты
@@ -1438,7 +1448,7 @@ def test_trial_letter_and_smtp_error_shown_as_it_is(office):
     # «Забыл пароль»: человеку ответ тот же, а сбой письма записан
     admin.post("/api/admin/users/save", json={"login": "ivanov", "password": PASSWORD, "email": "ivanov@example.test"})
     assert guest.post("/api/forgot", json={"login": "ivanov"}).json() == {"ok": True}
-    event = web.trail.read()[-1]
+    event = web.core.trail.read()[-1]
     assert (event["kind"], event["what"], event["by"], event["login"], event["why"]) == ("mail_failed", "link", "", "ivanov", "reset")
     post.broken = None
     assert admin.post("/api/admin/users/link", json={"login": "sidorov"}).json() == {
@@ -1457,13 +1467,13 @@ def test_user_email_is_edited_by_the_admin_and_must_be_unique(office):
     web, guest, admin, post = office
     admin.post("/api/admin/users/save", json={"login": "ivanov", "password": PASSWORD, "email": "ivanov@example.test"})
     assert admin.post("/api/admin/users/save", json={"login": "ivanov", "name": "Иванов"}).status_code == 200
-    assert web.people.users["ivanov"]["email"] == "ivanov@example.test"          # почту не называли — осталась
+    assert web.core.people.users["ivanov"]["email"] == "ivanov@example.test"          # почту не называли — осталась
     assert admin.post("/api/admin/users/save", json={"login": "ivanov", "email": "не почта"}).status_code == 400
     clash = admin.post("/api/admin/users/save", json={"login": "petrov", "password": PASSWORD,
                                                       "email": "Ivanov@example.test"})
-    assert clash.status_code == 400 and "petrov" not in web.people.users
+    assert clash.status_code == 400 and "petrov" not in web.core.people.users
     assert admin.post("/api/admin/users/save", json={"login": "ivanov", "email": ""}).status_code == 200
-    assert web.people.users["ivanov"]["email"] == ""
+    assert web.core.people.users["ivanov"]["email"] == ""
 
 
 def test_without_smtp_the_mail_features_are_off(site):
@@ -1479,7 +1489,7 @@ def test_without_smtp_the_mail_features_are_off(site):
     assert admin.post("/api/admin/requests/approve", json={"id": "x", "login": "sidorov", "name": "Сидоров"}).status_code == 404
     state = admin.get("/api/admin/requests").json()
     assert state["requests"] == [] and state["mail"]["on"] is False and state["mail"]["why_off"] is None
-    assert web.claims.all() == [] and kinds(web) == ["login"]
+    assert web.core.claims.all() == [] and kinds(web) == ["login"]
     # страница задания пароля отдаётся и без почты: уже высланные ссылки остаются в силе
     assert guest.get("/set-password").status_code == 200
     assert guest.post("/api/set-password/check", json={"token": "мусор"}).status_code == 404
@@ -1491,16 +1501,16 @@ def test_half_configured_mail_stays_off_and_says_why(tmp_path):
         assert guest.get("/api/me").json()["mail"] is False
         assert guest.post("/api/request", json=CLAIM).status_code == 200          # заявке почта не нужна
         why = guest.get("/api/admin/requests", auth=("admin", ADMIN_PASSWORD)).json()["mail"]["why_off"]
-        assert "PUBLIC_URL" in why and any("почта выключена" in line and "PUBLIC_URL" in line for line in web.log.lines)
+        assert "PUBLIC_URL" in why and any("почта выключена" in line and "PUBLIC_URL" in line for line in web.core.log.lines)
 
 
 def test_missing_ca_file_turns_the_mail_off_and_says_why(tmp_path):
     gone = str(tmp_path / "smtp-ca.pem")
     with running(tmp_path, extra={**MAIL_ENV, "SMTP_SECURITY": "starttls", "SMTP_CA_FILE": gone}) as (web, guest):
-        assert web.cfg.smtp_ca_file == gone and guest.get("/api/me").json()["mail"] is False
+        assert web.core.cfg.smtp_ca_file == gone and guest.get("/api/me").json()["mail"] is False
         state = guest.get("/api/admin/requests", auth=("admin", ADMIN_PASSWORD)).json()["mail"]
         assert state["on"] is False and "SMTP_CA_FILE" in state["why_off"] and "такого файла" in state["why_off"]
-        assert any("почта выключена" in line and "SMTP_CA_FILE" in line for line in web.log.lines)
+        assert any("почта выключена" in line and "SMTP_CA_FILE" in line for line in web.core.log.lines)
     (tmp_path / "smtp-ca.pem").write_text("-----BEGIN CERTIFICATE-----\n", encoding="utf-8")
     with running(tmp_path, extra={**MAIL_ENV, "SMTP_SECURITY": "starttls", "SMTP_CA_FILE": gone}) as (web, guest):
         assert guest.get("/api/me").json()["mail"] is True            # файл на месте — почта включена
@@ -1510,12 +1520,12 @@ def test_mail_password_in_the_clear_is_warned_about_at_start_and_in_the_mail_blo
     with running(tmp_path, extra={**MAIL_ENV, "SMTP_USER": "robot", "SMTP_PASSWORD": "secret", "MAIL_DOMAINS": "example.test"}) as (web, guest):
         warning, = guest.get("/api/admin/requests", auth=("admin", ADMIN_PASSWORD)).json()["mail"]["warnings"]
         assert "SMTP_SECURITY=none" in warning and "открытым текстом" in warning and "secret" not in warning
-        assert any("ВНИМАНИЕ" in line and "открытым текстом" in line for line in web.log.lines)
+        assert any("ВНИМАНИЕ" in line and "открытым текстом" in line for line in web.core.log.lines)
     (tmp_path / "tls").mkdir()
     with running(tmp_path / "tls", extra={**MAIL_ENV, "SMTP_USER": "robot", "SMTP_SECURITY": "starttls",
                                           "MAIL_DOMAINS": "example.test"}) as (web, guest):
         assert guest.get("/api/admin/requests", auth=("admin", ADMIN_PASSWORD)).json()["mail"]["warnings"] == []
-        assert not any("открытым текстом" in line for line in web.log.lines)
+        assert not any("открытым текстом" in line for line in web.core.log.lines)
 
 
 def test_pages_say_what_the_mail_did():
@@ -1554,7 +1564,7 @@ def keyed(web, client, name="Cursor", days=0, manage=False):
 
 def key_file(web):
     """Ключи, как они лежат в базе, — прочитанные с диска другим соединением."""
-    return [dict(row) for row in db.Database(web.cfg.state_dir).rows("SELECT * FROM keys ORDER BY n")]
+    return [dict(row) for row in db.Database(web.core.cfg.state_dir).rows("SELECT * FROM keys ORDER BY n")]
 
 
 def test_person_issues_a_key_and_the_client_works_with_his_rights(site):
@@ -1598,14 +1608,14 @@ def test_person_issues_a_key_and_the_client_works_with_his_rights(site):
         "ok": True, "keys": [], "can_manage": False, "days": days}
     assert robot.get("/api/v1/whoami").status_code == 401
 
-    events = [e for e in web.trail.read() if e["kind"] in ("key_issue", "key_revoke", "folder_create")]
+    events = [e for e in web.core.trail.read() if e["kind"] in ("key_issue", "key_revoke", "folder_create")]
     assert [(e["kind"], e["by"], e.get("key")) for e in events] == [
         ("folder_create", "admin", None), ("key_issue", "ivanov", "Cursor на ноутбуке"),
         ("folder_create", "ivanov", "Cursor на ноутбуке"), ("key_issue", "ivanov", "по умолчанию"),
         ("key_revoke", "ivanov", "по умолчанию"), ("key_revoke", "ivanov", "Cursor на ноутбуке")]
     assert (events[2]["via"], events[2]["key_kind"]) == ("key", "plain") and "via" not in events[0]
     assert "via" not in events[1] and events[1]["key_kind"] == "plain"       # выпуск — сам человек, не ключ
-    assert token not in on_disk(web) and token not in str(web.trail.read())
+    assert token not in on_disk(web) and token not in str(web.core.trail.read())
 
 
 def test_builtin_admin_issues_a_key_for_his_own_client(site):
@@ -1619,7 +1629,7 @@ def test_builtin_admin_issues_a_key_for_his_own_client(site):
     assert robot.get("/api/v1/tree").status_code == 200 and robot.get("/api/v1/costs").status_code == 403
     assert robot.get("/api/admin/status").status_code == 403                 # обычный ключ сервисом не управляет
     assert [(k["owner"], k["name"]) for k in key_file(web)] == [("admin", "Claude Code")]
-    assert "admin" not in web.people.users
+    assert "admin" not in web.core.people.users
     assert admin.post("/api/keys/revoke", json={"id": issued["issued"]["id"]}).status_code == 200
     assert robot.get("/api/v1/whoami").status_code == 401
 
@@ -1628,7 +1638,7 @@ def test_key_dies_with_its_term_and_with_the_user(site):
     web, admin, ivanov, petrov = staffed(site)
     robot, issued = keyed(web, ivanov, days=90)
     other, _ = keyed(web, petrov)
-    with web.base.write() as con:                                        # 90 дней прошли
+    with web.core.base.write() as con:                                        # 90 дней прошли
         con.execute("UPDATE keys SET expires = ? WHERE owner = 'ivanov'", (int(time.time()) - 1,))
     assert robot.get("/api/v1/tree").status_code == 401
     assert admin.post("/api/admin/users/delete", json={"login": "petrov"}).status_code == 200
@@ -1649,8 +1659,8 @@ def test_keys_kept_in_the_users_file_move_on_start_and_keep_working(tmp_path):
         who = client.get("/api/v1/whoami", headers={"Authorization": f"Bearer {token}"})
         assert who.status_code == 200 and (who.json()["login"], who.json()["key"]) == ("ivanov", "Cursor")
         assert [(k["id"], k["owner"], k["kind"]) for k in key_file(web)] == [("0a1b2c3d", "ivanov", "plain")]
-        assert not (web.cfg.state_dir / "users.json").exists()                  # прежний файл убран в «до-базы-…»
-        assert len(list(web.cfg.state_dir.glob("до-базы-*/users.json"))) == 1
+        assert not (web.core.cfg.state_dir / "users.json").exists()                  # прежний файл убран в «до-базы-…»
+        assert len(list(web.core.cfg.state_dir.glob("до-базы-*/users.json"))) == 1
         assert [k["name"] for k in enter(web, "ivanov").get("/api/keys").json()["keys"]] == ["Cursor"]
     with running(tmp_path) as (web, client):                # и после следующего запуска — один ключ, не два
         assert len(key_file(web)) == 1
@@ -1665,9 +1675,9 @@ def refusals(web, robot):
             continue
         answer = robot.request(method, path)
         detail = answer.json().get("detail") if answer.status_code == 403 else None
-        if detail == web.BY_KEY_ONLY_READS:
+        if detail == web.access.BY_KEY_ONLY_READS:
             plain.add((method, path))
-        elif detail == web.PAGE_ONLY:
+        elif detail == web.access.PAGE_ONLY:
             page.add((method, path))
         else:
             assert answer.status_code != 403, f"{method} {path}"         # администратору отказать больше не в чем
@@ -1691,7 +1701,7 @@ def test_key_levels_match_the_routes(site):
         assert owner.get("/api/admin/status").status_code == 200
         # расходы для внешних систем — тоже управление: обычному ключу закрыты, с управлением — открыты
         assert robot.get("/api/v1/costs").status_code == 403 and steward.get("/api/v1/costs").status_code == 200
-    assert sorted(web.people.users) == ["ivanov", "petrov"] and len(key_file(web)) == 4
+    assert sorted(web.core.people.users) == ["ivanov", "petrov"] and len(key_file(web)) == 4
 
 
 def test_manage_key_is_issued_only_to_service_admins_and_for_ninety_days(site):
@@ -1704,7 +1714,7 @@ def test_manage_key_is_issued_only_to_service_admins_and_for_ninety_days(site):
     _, issued = keyed(web, admin, "управление", 90, manage=True)
     assert issued["issued"]["kind"] == "manage"
     assert issued["issued"]["expires"] - time.time() == pytest.approx(90 * 86400, abs=60)
-    event = [e for e in web.trail.read() if e["kind"] == "key_issue"][-1]
+    event = [e for e in web.core.trail.read() if e["kind"] == "key_issue"][-1]
     assert (event["by"], event["key"], event["key_kind"]) == ("admin", "управление", "manage")
     assert key_file(web) and not ivanov.get("/api/keys").json()["keys"]
 
@@ -1718,23 +1728,23 @@ def test_manage_key_runs_the_service_but_leaves_passwords_keys_and_deletion_to_t
 
     # заводит пользователя (без пароля: его задают ссылкой со страницы), даёт право на папку, меняет имя
     new = {"login": "sidorov", "name": "Сидоров"}
-    assert plain.post("/api/admin/users/save", json=new).status_code == 403 and "sidorov" not in web.people.users
+    assert plain.post("/api/admin/users/save", json=new).status_code == 403 and "sidorov" not in web.core.people.users
     assert steward.post("/api/admin/users/save", json=new).status_code == 200
-    assert web.people.users["sidorov"]["name"] == "Сидоров" and web.people.users["sidorov"]["password"] == ""
+    assert web.core.people.users["sidorov"]["name"] == "Сидоров" and web.core.people.users["sidorov"]["password"] == ""
     grant = {"dir": "Проекты", "login": "sidorov", "read": "tree", "manage": "only"}
-    assert plain.post("/api/access", json=grant).json()["detail"] == web.BY_KEY_ONLY_READS
+    assert plain.post("/api/access", json=grant).json()["detail"] == web.access.BY_KEY_ONLY_READS
     assert steward.post("/api/access", json=grant).status_code == 200
-    assert web.people.users["sidorov"]["read"] == {"Проекты": "tree"}
+    assert web.core.people.users["sidorov"]["read"] == {"Проекты": "tree"}
     assert [u["login"] for u in steward.get("/api/access", params={"dir": "Проекты"}).json()["users"]] == [
         "ivanov", "petrov", "sidorov"]
     assert steward.post("/api/admin/users/save", json={"login": "sidorov", "name": "Сидоров С. С."}).status_code == 200
-    assert web.people.users["sidorov"]["name"] == "Сидоров С. С."
+    assert web.core.people.users["sidorov"]["name"] == "Сидоров С. С."
     assert steward.post("/api/admin/folders/rename", json={"dir": "Проекты", "name": "Стройка"}).status_code == 200
     assert steward.get("/api/admin/report").status_code == 200 and steward.get("/api/admin/keys").status_code == 200
     assert steward.post("/api/admin/speech-model", json={"model": "deepgram/nova-3"}).status_code == 200
 
     # а это — только на странице: пароль, ссылка на пароль, ключи, удаление записи и папки
-    was = web.people.users["sidorov"]["password"]
+    was = web.core.people.users["sidorov"]["password"]
     for path, body in (("/api/admin/users/save", {"login": "sidorov", "name": "Сидоров", "password": "новый-пароль-1"}),
                        ("/api/admin/users/link", {"login": "sidorov"}),
                        ("/api/keys", {"name": "ещё один"}),
@@ -1743,12 +1753,12 @@ def test_manage_key_runs_the_service_but_leaves_passwords_keys_and_deletion_to_t
                        ("/api/admin/folders/delete", {"dir": "Стройка"}),
                        ("/api/record/send", {"file": "Стройка/вкс.mp4", "to": "a@example.test"})):
         refused = steward.post(path, json=body)
-        assert refused.status_code == 403 and refused.json()["detail"] == web.PAGE_ONLY, path
-    assert web.people.users["sidorov"]["password"] == was and "link" not in web.people.users["sidorov"]
-    assert (web.cfg.inbox / "Стройка/вкс.mp4").is_file() and len(key_file(web)) == 2
+        assert refused.status_code == 403 and refused.json()["detail"] == web.access.PAGE_ONLY, path
+    assert web.core.people.users["sidorov"]["password"] == was and "link" not in web.core.people.users["sidorov"]
+    assert (web.core.cfg.inbox / "Стройка/вкс.mp4").is_file() and len(key_file(web)) == 2
 
     # в журнале у каждого действия ключом — пометка, имя ключа и его вид
-    events = [e for e in web.trail.read() if e.get("via") == "key"]
+    events = [e for e in web.core.trail.read() if e.get("via") == "key"]
     assert [e["kind"] for e in events] == ["user_create", "access", "user_change", "folder_rename", "speech_model"]
     assert {(e["by"], e["key"], e["key_kind"]) for e in events} == {("admin", "Claude Code", "manage")}
     # разжалованный администратор с ключом «с управлением» сервисом уже не управляет
@@ -1765,7 +1775,7 @@ def test_manage_key_approves_a_request_but_gets_no_password_link(site):
     claim, = steward.get("/api/admin/requests").json()["requests"]
     done = steward.post("/api/admin/requests/approve", json={"id": claim["id"], "login": "sidorov", "name": "Сидоров"})
     assert done.status_code == 200 and done.json()["link"] is None and done.json()["link_on_page"] is True
-    assert "sidorov" in web.people.users and "link" not in web.people.users["sidorov"]
+    assert "sidorov" in web.core.people.users and "link" not in web.core.people.users["sidorov"]
     shown = admin.post("/api/admin/users/link", json={"login": "sidorov"})         # ссылку выпускает человек
     assert shown.status_code == 200 and shown.json()["link"]["token"]
 
@@ -1787,20 +1797,20 @@ def test_manage_key_opens_no_way_onto_the_page(site):
                  {"login": "petrov", "email": ""},
                  {"login": "ivanov", "password": "новый-пароль-1"}):
         refused = steward.post("/api/admin/users/save", json=body)
-        assert refused.status_code == 403 and refused.json()["detail"] == web.PAGE_ONLY, body
-    assert "sidorov" not in web.people.users and not web.people.users["ivanov"]["admin"]
-    assert web.people.users["petrov"]["admin"] and web.people.users["petrov"]["email"] == "petrov@example.test"
+        assert refused.status_code == 403 and refused.json()["detail"] == web.access.PAGE_ONLY, body
+    assert "sidorov" not in web.core.people.users and not web.core.people.users["ivanov"]["admin"]
+    assert web.core.people.users["petrov"]["admin"] and web.core.people.users["petrov"]["email"] == "petrov@example.test"
 
     # заводит без пароля; то, чего не меняет, передать можно
     made = steward.post("/api/admin/users/save", json={"login": "sidorov", "name": "Сидоров", "admin": False,
                                                         "home_upload": True})
     assert made.status_code == 200
-    sidorov = web.people.users["sidorov"]
+    sidorov = web.core.people.users["sidorov"]
     assert (sidorov["password"], sidorov["admin"], sidorov["email"], sidorov["home_upload"]) == ("", False, "", True)
     assert TestClient(web.app).post("/api/login", json={"login": "sidorov", "password": ""}).status_code == 401
     same = {"login": "petrov", "name": "Петров П.", "admin": True, "email": " Petrov@Example.test "}
     assert steward.post("/api/admin/users/save", json=same).status_code == 200
-    assert web.people.users["petrov"]["name"] == "Петров П." and web.people.users["petrov"]["email"] == "petrov@example.test"
+    assert web.core.people.users["petrov"]["name"] == "Петров П." and web.core.people.users["petrov"]["email"] == "petrov@example.test"
     shown = admin.post("/api/admin/users/link", json={"login": "sidorov"})
     assert shown.status_code == 200 and shown.json()["link"]["token"]
 
@@ -1810,7 +1820,7 @@ def test_admin_sees_all_keys_and_revokes_any(site):
     robot, issued = keyed(web, ivanov, "Cursor", 90)
     keyed(web, petrov, "Codex")
     steward, _ = keyed(web, admin, "управление", 7, manage=True)
-    with web.base.write() as con:
+    with web.core.base.write() as con:
         con.execute("UPDATE keys SET created = created - ? WHERE owner = 'petrov'", (200 * 86400,))    # давно лежит без дела
         con.execute("UPDATE keys SET expires = ? WHERE owner = 'ivanov'", (int(time.time()) - 5,))     # срок вышел
     assert ivanov.get("/api/admin/keys").status_code == 403
@@ -1825,12 +1835,12 @@ def test_admin_sees_all_keys_and_revokes_any(site):
 
     codex = listed["keys"][2]["id"]
     assert ivanov.post("/api/admin/keys/revoke", json={"id": codex}).status_code == 403
-    assert steward.post("/api/admin/keys/revoke", json={"id": codex}).json()["detail"] == web.PAGE_ONLY
+    assert steward.post("/api/admin/keys/revoke", json={"id": codex}).json()["detail"] == web.access.PAGE_ONLY
     gone = admin.post("/api/admin/keys/revoke", json={"id": codex})
     assert gone.status_code == 200 and [k["name"] for k in gone.json()["keys"]] == ["управление", "Cursor"]
     assert admin.post("/api/admin/keys/revoke", json={"id": codex}).status_code == 404
     assert petrov.get("/api/keys").json()["keys"] == []
-    event = [e for e in web.trail.read() if e["kind"] == "key_revoke"][-1]
+    event = [e for e in web.core.trail.read() if e["kind"] == "key_revoke"][-1]
     assert (event["by"], event["key"], event["owner"], event["key_kind"]) == ("admin", "Codex", "petrov", "plain")
     assert "via" not in event
 
@@ -1843,15 +1853,15 @@ def test_ordinary_key_gets_no_costs_and_changes_nothing(site):
     robot, _ = keyed(web, ivanov)
     for path in COSTS:                                # администратор папки — не администратор сервиса
         refused = robot.get(path)
-        assert refused.status_code == 403 and refused.json()["detail"] == web.NO_COSTS, path
+        assert refused.status_code == 403 and refused.json()["detail"] == web.access.NO_COSTS, path
     for path, body in (("/api/record/delete", {"file": "Проекты/вкс.mp4"}),
                        ("/api/access", {"dir": "Проекты", "login": "petrov", "read": "tree"}),
                        ("/api/password", {"old": PASSWORD, "new": "новый-пароль-1"}),
                        ("/api/keys", {"name": "второй"})):
         refused = robot.post(path, json=body)
-        assert refused.status_code == 403 and refused.json()["detail"] == web.BY_KEY_ONLY_READS, path
-    assert (web.cfg.inbox / "Проекты/вкс.mp4").is_file() and web.people.users["petrov"]["read"] == {}
-    assert enter(web, "ivanov") and len(key_file(web)) == 1 and web.service.queue == []
+        assert refused.status_code == 403 and refused.json()["detail"] == web.access.BY_KEY_ONLY_READS, path
+    assert (web.core.cfg.inbox / "Проекты/вкс.mp4").is_file() and web.core.people.users["petrov"]["read"] == {}
+    assert enter(web, "ivanov") and len(key_file(web)) == 1 and web.core.service.queue == []
 
 
 def test_key_renames_and_moves_a_record_but_does_not_delete(site):
@@ -1871,7 +1881,7 @@ def test_key_renames_and_moves_a_record_but_does_not_delete(site):
     assert renamed.status_code == 200 and renamed.json() == {"ok": True, "file": "Проекты/Итоги.mp4"}
     moved = robot.post("/api/v1/move", params={"file": "Проекты/Итоги.mp4", "dir": "Проекты/Архив"})
     assert moved.status_code == 200 and moved.json()["file"] == "Проекты/Архив/Итоги.mp4"
-    assert (web.cfg.inbox / "Проекты/Архив/Итоги.mp4").is_file() and web.service.queue == []
+    assert (web.core.cfg.inbox / "Проекты/Архив/Итоги.mp4").is_file() and web.core.service.queue == []
     # адреса страницы ключу тоже открыты: логика одна
     back = robot.post("/api/record/move", json={"file": "Проекты/Архив/Итоги.mp4", "dir": "Проекты"})
     assert back.status_code == 200 and back.json()["file"] == "Проекты/Итоги.mp4"
@@ -1884,16 +1894,16 @@ def test_key_renames_and_moves_a_record_but_does_not_delete(site):
     assert site[1].post("/api/v1/rename", params={"file": "Проекты/Итоги.mp4", "name": "x"}).status_code == 401
 
     refused = robot.post("/api/record/delete", json={"file": "Проекты/Итоги.mp4"})
-    assert refused.status_code == 403 and refused.json()["detail"] == web.BY_KEY_ONLY_READS
-    assert (web.cfg.inbox / "Проекты/Итоги.mp4").is_file()
+    assert refused.status_code == 403 and refused.json()["detail"] == web.access.BY_KEY_ONLY_READS
+    assert (web.core.cfg.inbox / "Проекты/Итоги.mp4").is_file()
 
-    events = [e for e in web.trail.read() if e["kind"] in ("record_rename", "record_move")]
+    events = [e for e in web.core.trail.read() if e["kind"] in ("record_rename", "record_move")]
     assert [(e["kind"], e["by"], e["via"], e["key"]) for e in events] == [
         ("record_rename", "ivanov", "key", "Cursor"), ("record_move", "ivanov", "key", "Cursor"),
         ("record_move", "ivanov", "key", "Cursor")]
     # сам человек со страницы — без пометки
     ivanov.post("/api/record/rename", json={"file": "Проекты/Итоги.mp4", "name": "Решения"})
-    assert "via" not in [e for e in web.trail.read() if e["kind"] == "record_rename"][-1]
+    assert "via" not in [e for e in web.core.trail.read() if e["kind"] == "record_rename"][-1]
 
 
 # ---------- /api/v1 для ИИ-клиентов ----------
@@ -1928,12 +1938,12 @@ def filled(site):
         recorded(web, rel)
         folder, _, name = rel.rpartition("/")
         stem = name.rsplit(".", 1)[0]
-        out = web.cfg.outbox / folder / stem
+        out = web.core.cfg.outbox / folder / stem
         (out / "summary" / f"{stem}.md").write_text(TASKS_MD.replace("Иванов Иван", "Петров Пётр")
                                                     if "petrov" in rel else TASKS_MD, encoding="utf-8")
         (out / "transcript").mkdir()
         (out / "transcript" / f"{stem}.txt").write_text("[00:00:01] S1: Про бюджет склада и дебиторку.\n", encoding="utf-8")
-        web.service.ledger.put({**web.service.ledger.get(rel), "title": title, "audio_duration_sec": 600,
+        web.core.service.ledger.put({**web.core.service.ledger.get(rel), "title": title, "audio_duration_sec": 600,
                                 "record_date": day, "finished_at": f"{day}T12:00:00+03:00"})
     return web, admin, ivanov, petrov
 
@@ -1982,17 +1992,17 @@ def test_tree_shows_only_open_folders_with_their_records(site):
 def test_tree_and_status_follow_a_record_through_processing(site, monkeypatch):
     web, admin, ivanov, petrov = filled(site)
     new, rebuilt, waiting = "Проекты/новая.mp4", "Проекты/вкс.mp4", f"{HOME}/ivanov/ждёт.mp3"
-    (web.cfg.inbox / new).write_bytes(b"video")
+    (web.core.cfg.inbox / new).write_bytes(b"video")
     fresh = ivanov.get("/api/v1/status", params={"file": new}).json()
     assert fresh == {"file": new, "state": "uploaded", "done": False, "text": fresh["text"]} and "принят" in fresh["text"]
 
-    web.service.scan_once()                                         # сканер заметил файл и ждёт, пока он утихнет
+    web.core.service.scan_once()                                         # сканер заметил файл и ждёт, пока он утихнет
     seen = ivanov.get("/api/v1/status", params={"file": new}).json()
     assert seen["state"] == "waiting" and seen["needed_sec"] == 3600 and not seen["done"]
-    web.service.pending.clear()
-    monkeypatch.setattr(web.service, "queue", [])
-    web.service.enqueue_manual(waiting, None, False, "ivanov", "manual")
-    monkeypatch.setattr(web.service, "running", [
+    web.core.service.pending.clear()
+    monkeypatch.setattr(web.core.service, "queue", [])
+    web.core.service.enqueue_manual(waiting, None, False, "ivanov", "manual")
+    monkeypatch.setattr(web.core.service, "running", [
         job(new, step="расшифровка", chunks_done=1, chunks_total=3), job(rebuilt, step="протокол")])
 
     going = ivanov.get("/api/v1/status", params={"file": new}).json()
@@ -2007,12 +2017,12 @@ def test_tree_and_status_follow_a_record_through_processing(site, monkeypatch):
     # пересборка готовой записи: в дереве она одна, с названием и новым состоянием
     assert ivanov.get("/api/v1/tree", params={"dir": "Проекты", "depth": 0}).json()["records"][1]["title"] == "Планёрка"
 
-    web.service.running.clear()
+    web.core.service.running.clear()
     ready = ivanov.get("/api/v1/status", params={"file": rebuilt}).json()
     assert ready["state"] == "ready" and ready["done"] and ready["finished_at"] == "2026-10-09T12:00:00+03:00"
-    web.service.ledger.put({"file": new, "status": "error", "error": "нет связи", "finished_at": "2026-10-10T12:00:00+03:00"})
+    web.core.service.ledger.put({"file": new, "status": "error", "error": "нет связи", "finished_at": "2026-10-10T12:00:00+03:00"})
     failed = ivanov.get("/api/v1/status", params={"file": new}).json()
-    assert failed["state"] == "error" and failed["error"] == web.FAILED_HIDDEN and failed["done"]
+    assert failed["state"] == "error" and failed["error"] == web.browse.FAILED_HIDDEN and failed["done"]
     assert admin.get("/api/v1/status", params={"file": new}).json()["error"] == "нет связи"
 
     for path in (new, "Проекты/нет.mp4", "Снабжение/итоги.mp4", "../x.mp4"):
@@ -2030,8 +2040,8 @@ def test_dots_in_a_path_lead_nowhere_outside_the_open_folder(site):
     «Проектов» по «Проекты/..» видел бы имена закрытых папок, а дальше — каталоги самого контейнера,
     а по ходу обработки узнавал бы, лежит ли файл в чужой папке."""
     web, admin, ivanov, _ = filled(site)
-    (web.cfg.inbox / "Снабжение" / "Тайное").mkdir()
-    (web.cfg.inbox / "Снабжение" / "новая.mp4").write_bytes(b"video")
+    (web.core.cfg.inbox / "Снабжение" / "Тайное").mkdir()
+    (web.core.cfg.inbox / "Снабжение" / "новая.mp4").write_bytes(b"video")
     for bad in ("Проекты/..", "Проекты/../Снабжение", "Проекты/../../..", "..", "Проекты/./Сметы"):
         refused = ivanov.get("/api/browse", params={"path": bad})
         assert refused.status_code == 400 and "Снабжение" not in refused.text and "Тайное" not in refused.text, bad
@@ -2056,10 +2066,10 @@ def test_dots_in_a_folder_path_change_nothing_anywhere(site):
             given = client.post("/api/access", json={"dir": bad, "login": "petrov", "read": "tree"})
             assert given.status_code == 400, bad
             assert client.get("/api/access", params={"dir": bad}).status_code == 400, bad
-    assert (web.cfg.inbox / HOME / "ivanov").is_dir() and (web.cfg.outbox / "Снабжение" / "итоги").is_dir()
-    assert not list(web.cfg.inbox.parent.glob("Другое")) and not (web.cfg.inbox / "Другое").exists()
-    assert web.people.users["petrov"]["read"] == {} and petrov.get("/api/browse", params={"path": "Снабжение"}).json()["files"] == []
-    assert sorted(web.service.ledger.records) == sorted(["Проекты/Сметы/Архив/смета.mp4", "Проекты/вкс.mp4",
+    assert (web.core.cfg.inbox / HOME / "ivanov").is_dir() and (web.core.cfg.outbox / "Снабжение" / "итоги").is_dir()
+    assert not list(web.core.cfg.inbox.parent.glob("Другое")) and not (web.core.cfg.inbox / "Другое").exists()
+    assert web.core.people.users["petrov"]["read"] == {} and petrov.get("/api/browse", params={"path": "Снабжение"}).json()["files"] == []
+    assert sorted(web.core.service.ledger.records) == sorted(["Проекты/Сметы/Архив/смета.mp4", "Проекты/вкс.mp4",
                                                          f"{HOME}/petrov/личное.mp4", "Снабжение/итоги.mp4"])
 
 
@@ -2074,8 +2084,8 @@ def test_provider_reply_in_a_failure_is_shown_only_to_who_sees_costs(site):
     silent = "в дорожке нет звука (пиковый уровень -91 дБ)"
     for name, status, error in (("сбой.mp4", "error", reply), ("без протокола.mp4", "no_summary", reply),
                                 ("тишина.mp4", "no_audio", silent)):
-        (web.cfg.inbox / "Проекты" / name).write_bytes(b"video")
-        web.service.ledger.put({"file": f"Проекты/{name}", "status": status, "error": error,
+        (web.core.cfg.inbox / "Проекты" / name).write_bytes(b"video")
+        web.core.service.ledger.put({"file": f"Проекты/{name}", "status": status, "error": error,
                                 "finished_at": "2026-10-10T12:00:00+03:00"})
     plain, _ = keyed(web, admin, "обычный")
     steward, _ = keyed(web, admin, "с управлением", 30, manage=True)
@@ -2096,7 +2106,7 @@ def test_provider_reply_in_a_failure_is_shown_only_to_who_sees_costs(site):
     for client in (ivanov, reader, plain):
         seen = errors(client)
         assert seen["тишина.mp4"] == silent and "balance" not in str(seen) and "402" not in str(seen)
-        assert seen["сбой.mp4"] == web.FAILED_HIDDEN and seen["без протокола.mp4"] == web.NO_SUMMARY_HIDDEN
+        assert seen["сбой.mp4"] == web.browse.FAILED_HIDDEN and seen["без протокола.mp4"] == web.browse.NO_SUMMARY_HIDDEN
 
 
 def test_record_gives_protocol_tasks_links_and_the_html_file(site):
@@ -2126,7 +2136,7 @@ def test_record_gives_protocol_tasks_links_and_the_html_file(site):
     for path in ("/api/v1/record", "/api/v1/record.html"):
         assert robot.get(path, params={"file": "Снабжение/итоги.mp4"}).status_code == 404, path
         assert robot.get(path, params={"file": f"{HOME}/petrov/личное.mp4"}).status_code == 404, path
-    web.service.ledger.put({"file": "Проекты/пусто.mp4", "status": "no_audio", "stem": "пусто"})
+    web.core.service.ledger.put({"file": "Проекты/пусто.mp4", "status": "no_audio", "stem": "пусто"})
     empty = robot.get("/api/v1/record", params={"file": "Проекты/пусто.mp4"}).json()
     assert empty["state"] == "no_audio" and empty["protocol"] is None and empty["tasks"] == [] and empty["links"]["html"] is None
     assert robot.get("/api/v1/record.html", params={"file": "Проекты/пусто.mp4"}).status_code == 404
@@ -2138,7 +2148,7 @@ def test_protocol_is_exported_to_docx_and_pdf_by_the_same_rights(site):
     web, admin, ivanov, petrov = filled(site)
     robot, _ = keyed(web, ivanov)
     query = {"file": "Проекты/вкс.mp4"}
-    before = sorted(str(p) for p in web.cfg.outbox.rglob("*") if "_state" not in p.parts and "_logs" not in p.parts)
+    before = sorted(str(p) for p in web.core.cfg.outbox.rglob("*") if "_state" not in p.parts and "_logs" not in p.parts)
 
     word = ivanov.get("/api/export", params={**query, "format": "docx"})
     assert word.status_code == 200
@@ -2169,7 +2179,7 @@ def test_protocol_is_exported_to_docx_and_pdf_by_the_same_rights(site):
     assert ivanov.get("/api/export", params={**query, "format": "odt"}).status_code == 400
     assert ivanov.get("/api/export", params=query).status_code == 422
     # чужая запись неотличима от несуществующей; у записи без протокола выгружать нечего
-    web.service.ledger.put({"file": "Проекты/пусто.mp4", "status": "no_audio", "stem": "пусто"})
+    web.core.service.ledger.put({"file": "Проекты/пусто.mp4", "status": "no_audio", "stem": "пусто"})
     for file in ("Снабжение/итоги.mp4", f"{HOME}/petrov/личное.mp4", "Проекты/нет.mp4", "Проекты/пусто.mp4"):
         for path, extra in (("/api/export", {"format": "docx"}), ("/api/export", {"format": "pdf"}),
                             ("/api/v1/record.docx", {}), ("/api/v1/record.pdf", {})):
@@ -2177,7 +2187,7 @@ def test_protocol_is_exported_to_docx_and_pdf_by_the_same_rights(site):
     assert petrov.get("/api/export", params={**query, "format": "pdf"}).status_code == 404
     assert site[1].get("/api/export", params={**query, "format": "pdf"}).status_code == 401
     # файлы собираются в памяти: в выходной папке ничего не появилось
-    assert before == sorted(str(p) for p in web.cfg.outbox.rglob("*") if "_state" not in p.parts and "_logs" not in p.parts)
+    assert before == sorted(str(p) for p in web.core.cfg.outbox.rglob("*") if "_state" not in p.parts and "_logs" not in p.parts)
 
 
 def test_exported_file_links_to_the_service_when_its_address_is_set(tmp_path):
@@ -2247,9 +2257,9 @@ def test_tasks_are_collected_by_folder_person_and_date(site):
 
 
 def set_protocol(web, rel, text):
-    record = web.service.ledger.get(rel)
+    record = web.core.service.ledger.get(rel)
     folder, _, name = rel.rpartition("/")
-    path = web.cfg.outbox / folder / record["stem"] / "summary" / f"{record['stem']}.md"
+    path = web.core.cfg.outbox / folder / record["stem"] / "summary" / f"{record['stem']}.md"
     path.write_text(text, encoding="utf-8")
     return path
 
@@ -2303,17 +2313,17 @@ def test_tasks_registry_reads_files_once_and_stays_fresh_after_changes(site):
     admin.post("/api/access", json={"dir": "Проекты", "login": "ivanov", "manage": "tree"})
     ivanov = enter(web, "ivanov")
     files = lambda client=ivanov: sorted({t["file"] for t in client.get("/api/v1/tasks").json()["tasks"]})
-    assert files(admin) and web.task_cache.reads == 4
+    assert files(admin) and web.core.task_cache.reads == 4
     assert files() == ["Проекты/Сметы/Архив/смета.mp4", "Проекты/вкс.mp4"]
     ivanov.get("/api/v1/tasks.csv")
-    assert web.task_cache.reads == 4                                    # ни один файл заново не читали
+    assert web.core.task_cache.reads == 4                                    # ни один файл заново не читали
 
     # протокол пересобрали — файл записан заново
     path = set_protocol(web, "Проекты/вкс.mp4", TASKS_MD.replace("Согласовать смету", "Подписать договор") + " \n")
     stat = path.stat()
     os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 2_000_000_000))
     fresh = ivanov.get("/api/v1/tasks", params={"dir": "Проекты", "q": "договор"}).json()["tasks"]
-    assert [t["task"] for t in fresh] == ["Подписать договор"] and web.task_cache.reads == 5
+    assert [t["task"] for t in fresh] == ["Подписать договор"] and web.core.task_cache.reads == 5
     assert ivanov.get("/api/v1/tasks", params={"q": "Согласовать", "since": "2026-10-01"}).json()["tasks"] == []
 
     renamed = ivanov.post("/api/record/rename", json={"file": "Проекты/вкс.mp4", "name": "Итоги"}).json()["file"]
@@ -2330,14 +2340,14 @@ def test_tasks_registry_reads_files_once_and_stays_fresh_after_changes(site):
     assert admin.post("/api/admin/folders/delete", json={"dir": "Проекты/Расчёты"}).status_code == 200
     assert files() == [] and "Снабжение/итоги.mp4" in files(admin)
     # в памяти остались только протоколы записей, которые есть в журнале обработки
-    assert len(web.task_cache) == len(web.service.ledger.records) == 2
+    assert len(web.core.task_cache) == len(web.core.service.ledger.records) == 2
 
 
 def test_block_of_previous_tasks_does_not_double_the_registry(site):
     """Раздел «Поручения прошлого совещания» в протоколе — не поручения этой записи."""
     web, admin, ivanov, _ = filled(site)
     from app import external, registry
-    block = registry.block(web.service.ledger.get("Проекты/Сметы/Архив/смета.mp4"), marks.merged(external.tasks(TASKS_MD), {}))
+    block = registry.block(web.core.service.ledger.get("Проекты/Сметы/Архив/смета.mp4"), marks.merged(external.tasks(TASKS_MD), {}))
     assert block.count("\n- **") == 2
     set_protocol(web, "Проекты/вкс.mp4", TASKS_MD + "\n" + block)
     assert len(ivanov.get("/api/v1/tasks").json()["tasks"]) == 4          # по два на запись, как и было
@@ -2363,7 +2373,7 @@ def test_folders_lists_where_the_person_may_upload(site, monkeypatch):
     assert answer["upload"]["enabled"] and answer["upload"]["max_bytes"] == 4 * 2 ** 30 and "mp4" in answer["upload"]["extensions"]
     assert petrov.get("/api/v1/folders").json()["folders"] == [f"{HOME}/petrov"]
     assert "Снабжение" in admin.get("/api/v1/folders").json()["folders"] and "" not in admin.get("/api/v1/folders").json()["folders"]
-    monkeypatch.setattr(web, "upload_ready", False)
+    monkeypatch.setattr(web.core, "upload_ready", False)
     assert ivanov.get("/api/v1/folders").json()["folders"] == [] and not ivanov.get("/api/v1/folders").json()["upload"]["enabled"]
 
 
@@ -2375,9 +2385,9 @@ def test_streamed_upload_needs_a_folder_and_follows_the_rights(site):
     assert done.status_code == 200, done.text
     assert done.json()["file"] == "Проекты/Сметы/новая запись.mp3" and done.json()["size"] == len(body)
     assert done.json()["state"] == "uploaded"
-    assert (web.cfg.inbox / "Проекты/Сметы/новая запись.mp3").read_bytes() == body
+    assert (web.core.cfg.inbox / "Проекты/Сметы/новая запись.mp3").read_bytes() == body
     assert robot.get(done.json()["status"]).json()["state"] == "uploaded"          # адрес опроса из ответа рабочий
-    assert not list((web.cfg.inbox / upload.PARTS_DIR).glob("*.part"))
+    assert not list((web.core.cfg.inbox / upload.PARTS_DIR).glob("*.part"))
 
     # без папки — отказ со списком папок, куда можно
     for params in ({"name": "запись.mp3"}, {"dir": "", "name": "запись.mp3"}, {"dir": " / ", "name": "запись.mp3"},
@@ -2394,24 +2404,24 @@ def test_streamed_upload_needs_a_folder_and_follows_the_rights(site):
         assert answer.status_code == code, name
     assert robot.put("/api/v1/upload", params={"dir": "Проекты", "name": "пусто.mp3"}, content=b"").status_code == 400
     assert site[1].put("/api/v1/upload", params={"dir": "Проекты", "name": "без входа.mp3"}, content=b"123").status_code == 401
-    files = sorted(p.name for p in web.cfg.inbox.rglob("*.mp3"))
-    assert files == ["новая запись.mp3"] and not list((web.cfg.inbox / upload.PARTS_DIR).glob("*.part"))
+    files = sorted(p.name for p in web.core.cfg.inbox.rglob("*.mp3"))
+    assert files == ["новая запись.mp3"] and not list((web.core.cfg.inbox / upload.PARTS_DIR).glob("*.part"))
 
     # в журнале — кто, каким ключом; сканер берёт запись на заметку, а недогрузку не видит
-    event, = [e for e in web.trail.read() if e["kind"] == "upload"]
+    event, = [e for e in web.core.trail.read() if e["kind"] == "upload"]
     assert (event["by"], event["file"], event["size"], event["via"], event["key"]) == (
         "ivanov", "Проекты/Сметы/новая запись.mp3", len(body), "key", "Codex")
-    web.service.scan_once()
-    assert list(web.service.pending) == ["Проекты/Сметы/новая запись.mp3"]
+    web.core.service.scan_once()
+    assert list(web.core.service.pending) == ["Проекты/Сметы/новая запись.mp3"]
     # с логином и паролем загрузка та же, но без пометки ключа
     assert ivanov.put("/api/v1/upload", params={"dir": f"{HOME}/ivanov", "name": "сам.mp3"}, content=b"123").status_code == 200
-    assert "via" not in [e for e in web.trail.read() if e["kind"] == "upload"][-1]
+    assert "via" not in [e for e in web.core.trail.read() if e["kind"] == "upload"][-1]
 
 
 def test_streamed_upload_is_cut_at_the_size_limit(site, monkeypatch):
     web, admin, ivanov, _ = staffed(site)
     home = f"{HOME}/ivanov"
-    monkeypatch.setattr(web, "cfg", dataclasses.replace(web.cfg, upload_max_bytes=1000))
+    monkeypatch.setattr(web.api_v1, "cfg", dataclasses.replace(web.core.cfg, upload_max_bytes=1000))
     big = ivanov.put("/api/v1/upload", params={"dir": home, "name": "длинная.mp3"}, content=b"x" * 1001)
     assert big.status_code == 413 and "предела" in big.json()["detail"]
 
@@ -2420,8 +2430,8 @@ def test_streamed_upload_is_cut_at_the_size_limit(site, monkeypatch):
             yield b"x" * 400
     assert ivanov.put("/api/v1/upload", params={"dir": home, "name": "поток.mp3"}, content=pieces()).status_code == 413
     assert ivanov.put("/api/v1/upload", params={"dir": home, "name": "в меру.mp3"}, content=b"x" * 1000).status_code == 200
-    assert sorted(p.name for p in (web.cfg.inbox / home).iterdir()) == ["в меру.mp3"]
-    assert not list((web.cfg.inbox / upload.PARTS_DIR).glob("*.part"))
+    assert sorted(p.name for p in (web.core.cfg.inbox / home).iterdir()) == ["в меру.mp3"]
+    assert not list((web.core.cfg.inbox / upload.PARTS_DIR).glob("*.part"))
 
 
 def test_api_description_is_markdown_for_the_model(site):
@@ -2518,7 +2528,7 @@ def test_personal_mode_serves_the_api_and_the_skill_without_keys(tmp_path):
         assert client.get("/api/v1").status_code == 200 and "без ключа и пароля" in client.get("/api/v1").text
         for method, path in (("GET", "/api/keys"), ("POST", "/api/keys"), ("POST", "/api/keys/revoke")):
             off = client.request(method, path, json={"name": "ключ", "id": "нет"})
-            assert off.status_code == 404 and off.json()["detail"] == web.NO_KEYS_HERE, path
+            assert off.status_code == 404 and off.json()["detail"] == web.access_keys.NO_KEYS_HERE, path
         assert key_file(web) == []
 
         install, skill = client.get("/skill").text, client.get("/skill/SKILL.md").text
@@ -2538,10 +2548,10 @@ def test_skill_has_one_version_and_tells_what_is_new(site):
     """Версия навыка записана в одном месте — верхнем разделе CHANGELOG.md; её отдают SKILL.md,
     whoami и список изменений, по которым клиент обновляет себя сам."""
     web, client = site
-    changes = (web.SKILL / "CHANGELOG.md").read_text(encoding="utf-8")
+    changes = (web.core.SKILL / "CHANGELOG.md").read_text(encoding="utf-8")
     version = int(re.search(r"^## (\d+)", changes, flags=re.M).group(1))
-    assert version >= 4 and web._skill_version() == version
-    assert [v for v, _ in web._skill_changes()] == list(range(version, 0, -1))      # по убыванию, без пропусков
+    assert version >= 4 and web.api_v1._skill_version() == version
+    assert [v for v, _ in web.api_v1._skill_changes()] == list(range(version, 0, -1))      # по убыванию, без пропусков
 
     skill = client.get("/skill/SKILL.md").text
     assert f'version: "{version}"' in skill and f"Версия этого навыка — **{version}**" in skill
@@ -2593,7 +2603,7 @@ def voiced(web, rel):
     recorded(web, rel)
     folder, _, name = rel.rpartition("/")
     stem = name.rsplit(".", 1)[0]
-    out = web.cfg.outbox / folder / stem / "transcript"
+    out = web.core.cfg.outbox / folder / stem / "transcript"
     out.mkdir(parents=True)
     long = "это довольно длинная реплика про бюджет склада и сроки поставки"
     segments = [{"start": 5, "end": 9, "speaker": "S1", "text": "Коллеги, добрый день, начинаем планёрку, Иван Петрович, вам слово."},
@@ -2604,7 +2614,7 @@ def voiced(web, rel):
                  {"start": 5400 + 10, "end": 5400 + 12, "speaker": "S3", "text": "Угу."}]
     (out / f"{stem}.json").write_text(json.dumps({"segments": segments, "cuts": [5400]}), encoding="utf-8")
     (out / f"{stem}.triage.json").write_text(json.dumps({
-        "type": "meeting", "templates": sorted(web.templates.TEMPLATES),
+        "type": "meeting", "templates": sorted(web.lifecycle.templates.TEMPLATES),
         "speakers": [{"label": "S1", "name": "Анна", "role": "ведущая"}, {"label": "S2", "name": None, "role": ""}]}),
         encoding="utf-8")
     return rel
@@ -2641,9 +2651,9 @@ def test_speakers_are_read_with_samples_and_signed_through_the_api(site):
     assert signed.status_code == 200 and signed.json()["ok"]
     assert signed.json()["parts"][0]["speakers"][1]["name"] == "Иванов Иван Петрович"
     assert signed.json()["parts"][1]["speakers"][0]["name"] == ""                # S2 второй части — другой человек
-    assert signed.json()["names_newer"] in (True, False) and web.service.queue == []   # без rebuild протокол не трогается
+    assert signed.json()["names_newer"] in (True, False) and web.core.service.queue == []   # без rebuild протокол не трогается
     assert robot.post("/api/v1/speakers", params={"file": file, "line": "21.00", "name": "Петрова Анна"}).status_code == 200
-    saved = json.loads((web.cfg.outbox / "Проекты/планёрка/transcript/планёрка.names.json").read_text(encoding="utf-8"))
+    saved = json.loads((web.core.cfg.outbox / "Проекты/планёрка/transcript/планёрка.names.json").read_text(encoding="utf-8"))
     assert saved == {"parts": {"1": {"S2": "Иванов Иван Петрович"}}, "lines": {"21.00": "Петрова Анна"}}
     assert "[Иванов Иван Петрович]" in robot.get("/api/v1/record", params={"file": file, "transcript": True}).json()["transcript"]
     # страница видит те же подписи — логика одна
@@ -2651,12 +2661,12 @@ def test_speakers_are_read_with_samples_and_signed_through_the_api(site):
         == "Иванов Иван Петрович"
     cleared = robot.post("/api/v1/speakers", params={"file": file, "line": "21.00", "name": ""})
     assert cleared.status_code == 200 and json.loads(
-        (web.cfg.outbox / "Проекты/планёрка/transcript/планёрка.names.json").read_text(encoding="utf-8"))["lines"] == {}
+        (web.core.cfg.outbox / "Проекты/планёрка/transcript/планёрка.names.json").read_text(encoding="utf-8"))["lines"] == {}
 
     # пересборка — отдельным запросом; сервер подтверждения человека не проверяет (это правило навыка)
     rebuilt = robot.post("/api/v1/speakers", params={"file": file, "rebuild": True})
     assert rebuilt.status_code == 200 and rebuilt.json()["rebuilding"] is True
-    item, = web.service.queue
+    item, = web.core.service.queue
     assert (item.path, item.force, item.reason) == (file, False, "rebuild")
 
     # плохие запросы и права
@@ -2675,7 +2685,7 @@ def test_speakers_are_read_with_samples_and_signed_through_the_api(site):
     recorded(web, "Проекты/без голосов.mp4")
     assert robot.get("/api/v1/speakers", params={"file": "Проекты/без голосов.mp4"}).status_code == 409
 
-    events = [e for e in web.trail.read() if e["kind"] == "names"]
+    events = [e for e in web.core.trail.read() if e["kind"] == "names"]
     assert len(events) == 3 and {(e["by"], e["via"], e["key"], e["key_kind"]) for e in events} == {
         ("ivanov", "key", "Cursor", "plain")}
     # и страница ключу теперь открыта тем же правом — отдельного запрета на подписи нет
@@ -2685,7 +2695,7 @@ def test_speakers_are_read_with_samples_and_signed_through_the_api(site):
 def segments_text(web, file):
     folder, _, name = file.rpartition("/")
     stem = name.rsplit(".", 1)[0]
-    data = json.loads((web.cfg.outbox / folder / stem / "transcript" / f"{stem}.json").read_text(encoding="utf-8"))
+    data = json.loads((web.core.cfg.outbox / folder / stem / "transcript" / f"{stem}.json").read_text(encoding="utf-8"))
     return [seg["text"] for seg in data["segments"]]
 
 
@@ -2705,7 +2715,7 @@ def test_owner_marks_a_task_done_and_the_reader_only_sees_it(site):
     assert petrov.post("/api/record/task", json=body).status_code == 404
     assert ivanov.post("/api/record/task", json={**body, "file": "Снабжение/итоги.mp4"}).status_code == 404
     assert site[1].post("/api/record/task", json=body).status_code == 401
-    assert web.noted.everything() == {}
+    assert web.core.noted.everything() == {}
     assert all(not t["can_mark"] for t in ivanov.get("/api/v1/tasks").json()["tasks"])
 
     done = admin.post("/api/record/task", json={**body, "comment": "  подписано \n 10.10 "})
@@ -2713,8 +2723,8 @@ def test_owner_marks_a_task_done_and_the_reader_only_sees_it(site):
     task = done.json()["task"]
     assert task["done"] and not task["open"] and task["done_by"] == "admin" and task["comment"] == "подписано 10.10"
     assert task["status"] is None and task["key"] == SMETA                      # слова протокола — отдельно
-    assert list(web.noted.load("Проекты/вкс.mp4")) == [SMETA] and not list(web.cfg.outbox.rglob("*.tasks.json"))
-    protocol = web.cfg.outbox / "Проекты/вкс/summary/вкс.md"
+    assert list(web.core.noted.load("Проекты/вкс.mp4")) == [SMETA] and not list(web.core.cfg.outbox.rglob("*.tasks.json"))
+    protocol = web.core.cfg.outbox / "Проекты/вкс/summary/вкс.md"
     assert protocol.read_text(encoding="utf-8") == TASKS_MD                     # протокол на диске не переписан
 
     seen = ivanov.get("/api/v1/tasks", params={"dir": "Проекты", "since": "2026-10-01"}).json()
@@ -2757,7 +2767,7 @@ def test_owner_marks_a_task_done_and_the_reader_only_sees_it(site):
     assert not back["done"] and back["open"] and back["done_by"] is None
     assert admin.post("/api/record/task", json={**body, "done": False}).status_code == 200      # повтор ничего не меняет
     assert ivanov.get("/api/v1/tasks", params={"open": "true"}).json()["open"] == 4
-    events = [e for e in web.trail.read() if e["kind"].startswith("task_")]
+    events = [e for e in web.core.trail.read() if e["kind"].startswith("task_")]
     assert [(e["kind"], e["by"], e["file"], e["task"], e["owner"]) for e in events] == [
         ("task_done", "admin", file, "Согласовать смету", "Иванов Иван"),
         ("task_reopen", "admin", file, "Согласовать смету", "Иванов Иван")]
@@ -2766,7 +2776,7 @@ def test_owner_marks_a_task_done_and_the_reader_only_sees_it(site):
     assert admin.post("/api/record/task", json={**body, "key": "нет такого"}).status_code == 404
     assert admin.post("/api/record/task", json={**body, "comment": "я" * 301}).status_code == 400
     assert admin.post("/api/record/task", json={**body, "comment": "я" * 300}).status_code == 200
-    web.service.ledger.put({"file": "Проекты/пусто.mp4", "status": "no_audio", "stem": "пусто"})
+    web.core.service.ledger.put({"file": "Проекты/пусто.mp4", "status": "no_audio", "stem": "пусто"})
     assert admin.post("/api/record/task", json={**body, "file": "Проекты/пусто.mp4"}).status_code == 404
 
 
@@ -2793,7 +2803,7 @@ def test_folder_admin_and_home_owner_mark_tasks_and_the_key_is_noted_in_the_jour
     assert petrov.post("/api/record/task", json=own).json()["task"]["done_by"] == "petrov"
     assert ivanov.post("/api/record/task", json=own).status_code == 404
 
-    events = [(e["kind"], e["by"], e.get("via"), e.get("key")) for e in web.trail.read() if e["kind"].startswith("task_")]
+    events = [(e["kind"], e["by"], e.get("via"), e.get("key")) for e in web.core.trail.read() if e["kind"].startswith("task_")]
     assert events == [("task_done", "ivanov", "key", "Cursor"), ("task_reopen", "ivanov", "key", "Cursor"),
                       ("task_done", "petrov", None, None)]
 
@@ -2804,15 +2814,15 @@ def test_marks_stay_with_the_record_and_the_registry_sees_them_at_once(site):
     state = lambda: {(t["file"], t["task"]): t["done"]
                      for t in admin.get("/api/v1/tasks", params={"dir": "Проекты"}).json()["tasks"]}
     assert not any(state().values())
-    reads = web.task_cache.reads
+    reads = web.core.task_cache.reads
     assert admin.post("/api/record/task", json={"file": "Проекты/вкс.mp4", "key": SMETA, "done": True}).status_code == 200
-    assert state()[("Проекты/вкс.mp4", "Согласовать смету")] is True and web.task_cache.reads == reads + 1
-    assert state() and web.task_cache.reads == reads + 1                    # дальше — из памяти
+    assert state()[("Проекты/вкс.mp4", "Согласовать смету")] is True and web.core.task_cache.reads == reads + 1
+    assert state() and web.core.task_cache.reads == reads + 1                    # дальше — из памяти
 
     renamed = admin.post("/api/record/rename", json={"file": "Проекты/вкс.mp4", "name": "Итоги"}).json()["file"]
     assert state()[(renamed, "Согласовать смету")] is True
     moved = admin.post("/api/record/move", json={"file": renamed, "dir": "Проекты/Сметы"}).json()["file"]
-    assert state()[(moved, "Согласовать смету")] is True and list(web.noted.everything()) == [moved]
+    assert state()[(moved, "Согласовать смету")] is True and list(web.core.noted.everything()) == [moved]
     assert admin.post("/api/admin/folders/rename", json={"dir": "Проекты/Сметы", "name": "Расчёты"}).status_code == 200
     assert state() == {("Проекты/Расчёты/Итоги.mp4", "Согласовать смету"): True,
                        ("Проекты/Расчёты/Итоги.mp4", "Проверить остатки"): False,
@@ -2824,17 +2834,17 @@ def test_marks_stay_with_the_record_and_the_registry_sees_them_at_once(site):
     os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 2_000_000_000))
     assert state()[("Проекты/Расчёты/Итоги.mp4", "Согласование сметы")] is True
 
-    held = web.noted.load("Проекты/Расчёты/Итоги.mp4")
+    held = web.core.noted.load("Проекты/Расчёты/Итоги.mp4")
     gone = admin.post("/api/record/delete", json={"file": "Проекты/Расчёты/Итоги.mp4"}).json()
     # из базы отметки ушли вместе с записью; в корзине они записаны — на случай возврата руками
-    note = json.loads((web.cfg.outbox / gone["trash"] / "удалено.json").read_text(encoding="utf-8"))
-    assert held and note["marks"] == {"Проекты/Расчёты/Итоги.mp4": held} and web.noted.everything() == {}
+    note = json.loads((web.core.cfg.outbox / gone["trash"] / "удалено.json").read_text(encoding="utf-8"))
+    assert held and note["marks"] == {"Проекты/Расчёты/Итоги.mp4": held} and web.core.noted.everything() == {}
 
 
 def test_personal_mode_marks_tasks_without_login(tmp_path):
     with running(tmp_path, mode="personal") as (web, client):
         recorded(web, "вкс.mp4")
-        (web.cfg.outbox / "вкс/summary/вкс.md").write_text(TASKS_MD, encoding="utf-8")
+        (web.core.cfg.outbox / "вкс/summary/вкс.md").write_text(TASKS_MD, encoding="utf-8")
         row = client.get("/api/v1/tasks").json()["tasks"][0]
         assert row["can_mark"] is True
         done = client.post("/api/record/task", json={"file": "вкс.mp4", "key": row["key"], "done": True}).json()["task"]
@@ -2857,20 +2867,20 @@ def test_admin_picks_the_speech_model_on_the_page_and_can_return_to_env(site):
 
     saved = admin.post("/api/admin/speech-model", json={"model": SCRIBE}).json()
     assert saved["current"] == SCRIBE and saved["chosen"]["by"] == "admin" and saved["env"] == NOVA
-    assert web.service.speech_model() == SCRIBE and web.cfg.model == NOVA       # обработчик берёт уже новую
-    assert settings.Store(db.Database(web.cfg.state_dir)).speech_model()["value"] == SCRIBE     # с диска
+    assert web.core.service.speech_model() == SCRIBE and web.core.cfg.model == NOVA       # обработчик берёт уже новую
+    assert settings.Store(db.Database(web.core.cfg.state_dir)).speech_model()["value"] == SCRIBE     # с диска
     assert admin.get("/api/admin/status").json()["config"]["speech_model"] == SCRIBE
-    event = web.trail.read()[-1]
+    event = web.core.trail.read()[-1]
     assert (event["kind"], event["by"], event["model"], event["was"]) == ("speech_model", "admin", SCRIBE, NOVA)
 
     assert admin.post("/api/admin/speech-model", json={"model": "x-ai/grok-stt-1.0"}).status_code == 400
-    assert web.service.speech_model() == SCRIBE
+    assert web.core.service.speech_model() == SCRIBE
     back = admin.post("/api/admin/speech-model", json={"model": None}).json()
-    assert back["current"] == NOVA and back["chosen"] is None and web.trail.read()[-1]["source"] == "env"
+    assert back["current"] == NOVA and back["chosen"] is None and web.core.trail.read()[-1]["source"] == "env"
 
     # только администратор сервиса: ни пользователь, ни ключ (даже ключ администратора) модель не меняют
     assert ivanov.post("/api/admin/speech-model", json={"model": MAI}).status_code == 403
-    assert web.service.speech_model() == NOVA
+    assert web.core.service.speech_model() == NOVA
 
 
 def test_choice_made_on_the_page_survives_a_restart(tmp_path):
@@ -2879,23 +2889,23 @@ def test_choice_made_on_the_page_survives_a_restart(tmp_path):
                            auth=("admin", ADMIN_PASSWORD)).status_code == 200
     with running(tmp_path) as (web, client):
         speech = client.get("/api/admin/status", auth=("admin", ADMIN_PASSWORD)).json()["speech"]
-        assert speech["current"] == MAI and speech["env"] == NOVA and web.service.speech_model() == MAI
+        assert speech["current"] == MAI and speech["env"] == NOVA and web.core.service.speech_model() == MAI
 
 
 def test_manual_run_takes_a_model_only_together_with_overwrite(site):
     web, client = site
-    (web.cfg.inbox / "запись.mp4").write_bytes(b"video")
+    (web.core.cfg.inbox / "запись.mp4").write_bytes(b"video")
     run = lambda **body: client.post("/api/admin/run", json={"file": "запись.mp4", **body},
                                      auth=("admin", ADMIN_PASSWORD))
     refused = run(model=MAI)
     assert refused.status_code == 400 and "перезапис" in refused.json()["detail"]      # без перезаписи модель ни к чему
     assert run(model="x-ai/grok-stt-1.0", force=True).status_code == 400
-    assert web.service.queue == []
+    assert web.core.service.queue == []
     assert run(model=MAI, force=True).status_code == 200
-    item = web.service.queue[0]
+    item = web.core.service.queue[0]
     assert (item.path, item.force, item.manual, item.model, item.by) == ("запись.mp4", True, True, MAI, "admin")
-    web.service.queue.clear()
-    assert run(force=True).status_code == 200 and web.service.queue[0].model == ""     # «как в настройках»
+    web.core.service.queue.clear()
+    assert run(force=True).status_code == 200 and web.core.service.queue[0].model == ""     # «как в настройках»
 
 
 def test_rebuild_after_signing_names_never_asks_for_recognition(site):
@@ -2903,14 +2913,14 @@ def test_rebuild_after_signing_names_never_asks_for_recognition(site):
     web, admin, ivanov, _ = staffed(site)
     rel = f"{HOME}/ivanov/планёрка.mp4"
     recorded(web, rel, by="ivanov")
-    out = web.cfg.outbox / HOME / "ivanov" / "планёрка" / "transcript"
+    out = web.core.cfg.outbox / HOME / "ivanov" / "планёрка" / "transcript"
     out.mkdir(parents=True)
     (out / "планёрка.json").write_text(json.dumps({"model": NOVA, "segments": [
         {"start": 1, "end": 2, "speaker": "S1", "text": "Добрый день."}]}), encoding="utf-8")
     admin.post("/api/admin/speech-model", json={"model": SCRIBE})
     signed = ivanov.post("/api/admin/names", json={"file": rel, "parts": {"1": {"S1": "Иванов И. И."}}, "rebuild": True})
     assert signed.status_code == 200
-    item = web.service.queue[0]
+    item = web.core.service.queue[0]
     assert (item.path, item.force, item.model, item.reason) == (rel, False, "", "rebuild")
 
 
@@ -2924,14 +2934,14 @@ def test_status_shows_the_providers_without_their_keys(tmp_path):
         assert shown["backup"]["title"] == "OpenRouter" and shown["backup"]["currency"] == "USD"
         assert shown["text"] is None and shown["last_switch"] is None and shown["resting_sec"] == 0
         assert "secret" not in answer.text
-        assert any("основной поставщик: RouterAI, стоимость в RUB; запасной: OpenRouter" in line for line in web.log.tail_from(0)[1])
+        assert any("основной поставщик: RouterAI, стоимость в RUB; запасной: OpenRouter" in line for line in web.core.log.tail_from(0)[1])
 
 
 def test_status_without_a_backup_and_spending_in_two_currencies(site):
     web, client = site
     status = lambda: client.get("/api/admin/status", auth=("admin", ADMIN_PASSWORD)).json()
     assert status()["providers"]["backup"] is None and status()["totals"]["cost"] == {}
-    web.service.ledger.put({"file": "а.mp4", "status": "ok", "cost": {"RUB": 12.0, "USD": 0.05},
+    web.core.service.ledger.put({"file": "а.mp4", "status": "ok", "cost": {"RUB": 12.0, "USD": 0.05},
                             "speech_model": SCRIBE, "finished_at": "2026-10-09T12:00:00+03:00",
                             "cost_models": [{"stage": "speech", "model": SCRIBE, "provider": "RouterAI",
                                              "currency": "RUB", "cost": 12.0},
@@ -2939,7 +2949,7 @@ def test_status_without_a_backup_and_spending_in_two_currencies(site):
                                              "currency": "USD", "cost": 0.05}],
                             "cost_providers": [{"provider": "RouterAI", "currency": "RUB", "cost": 12.0},
                                                {"provider": "OpenRouter", "currency": "USD", "cost": 0.05}]})
-    web.trail.run(web.service.ledger.get("а.mp4"), "admin", "manual")
+    web.core.trail.run(web.core.service.ledger.get("а.mp4"), "admin", "manual")
     body = status()
     assert body["totals"]["cost"] == {"RUB": 12.0, "USD": 0.05}
     assert body["history"][0]["cost"] == {"RUB": 12.0, "USD": 0.05} and body["history"][0]["speech_model"] == SCRIBE
@@ -2973,7 +2983,7 @@ def desk(office):
         admin.post("/api/access", json={"dir": "Проекты", "login": login, "read": "tree"})
     recorded(web, MEETING, by="petrov")
     set_protocol(web, MEETING, TASKS_MD)
-    web.service.ledger.put({**web.service.ledger.get(MEETING), "title": "Планёрка: итоги/план", "audio_duration_sec": 600,
+    web.core.service.ledger.put({**web.core.service.ledger.get(MEETING), "title": "Планёрка: итоги/план", "audio_duration_sec": 600,
                             "record_date": "2026-10-09"})
     return web, admin, enter(web, "ivanov"), enter(web, "petrov"), post
 
@@ -3012,12 +3022,12 @@ def test_owner_sends_the_protocol_with_a_pdf_and_the_journal_keeps_the_addresses
     assert kind == "application/pdf" and name == "Планёрка итоги план.pdf"
     assert "Согласовать смету" in PdfReader(io.BytesIO(data)).pages[0].extract_text()
 
-    event = web.trail.read()[-1]
+    event = web.core.trail.read()[-1]
     assert (event["kind"], event["by"], event["file"], event["format"], event["note"], event["refused"]) == (
         "protocol_sent", "ivanov", MEETING, "pdf", True, [])
     assert event["to"] == ["petrov@example.test", "guest@partner.test"]         # адреса — полностью
     assert kinds(web).count("protocol_sent") == 1                               # писем два, действие в журнале одно
-    assert any("протокол отправлен на почту" in line and "guest@partner.test" in line for line in web.log.tail_from(0)[1])
+    assert any("протокол отправлен на почту" in line and "guest@partner.test" in line for line in web.core.log.tail_from(0)[1])
 
 
 def test_protocol_goes_as_docx_or_as_a_link_only(office):
@@ -3032,7 +3042,7 @@ def test_protocol_goes_as_docx_or_as_a_link_only(office):
     assert send(ivanov, format="none").status_code == 200
     assert post.sent[-1].attachments == [] and "по ссылке ниже" in post.sent[-1].text
     assert "Приписка" not in post.sent[-1].text
-    assert [e["format"] for e in web.trail.read() if e["kind"] == "protocol_sent"] == ["docx", "none"]
+    assert [e["format"] for e in web.core.trail.read() if e["kind"] == "protocol_sent"] == ["docx", "none"]
     # администратор из .env — хозяин любой папки; почты у него нет, и «Ответить» в письме не подставлен
     assert send(admin).status_code == 200 and post.sent[-1].reply_to == ""
     assert "Отправитель: Администратор." in post.sent[-1].text
@@ -3053,8 +3063,8 @@ def test_only_the_owner_of_the_folder_sends_the_protocol(office):
     assert send(office[1]).status_code == 401
     robot, _ = keyed(web, ivanov)
     by_key = send(robot)
-    assert by_key.status_code == 403 and by_key.json()["detail"] == web.BY_KEY_ONLY_READS
-    assert "отправку протокола на почту" in web.BY_KEY_ONLY_READS
+    assert by_key.status_code == 403 and by_key.json()["detail"] == web.access.BY_KEY_ONLY_READS
+    assert "отправку протокола на почту" in web.access.BY_KEY_ONLY_READS
     assert robot.get("/api/record/recipients", params={"file": MEETING}).status_code == 403
     assert robot.get("/api/result", params={"file": MEETING}).json()["can_send"] is False
     # в личной папке хозяин — сам человек
@@ -3079,10 +3089,10 @@ def test_bad_requests_to_send_are_refused_before_any_letter(office, monkeypatch)
     assert long.status_code == 400 and long.headers["x-field"] == "note"
     assert send(ivanov, note="я" * 1000, format="none").status_code == 200 and post.sent.pop()
     # у записи без протокола отправлять нечего
-    web.service.ledger.put({"file": "Проекты/пусто.mp4", "status": "no_audio", "stem": "пусто"})
+    web.core.service.ledger.put({"file": "Проекты/пусто.mp4", "status": "no_audio", "stem": "пусто"})
     assert send(ivanov, file="Проекты/пусто.mp4").status_code == 404
     # вложение больше предела — отказ с советом отправить ссылкой
-    monkeypatch.setattr(web.mail, "ATTACH_MAX_BYTES", 1000)
+    monkeypatch.setattr(web.core.mail, "ATTACH_MAX_BYTES", 1000)
     big = send(ivanov)
     assert big.status_code == 413 and "без вложения" in big.json()["detail"]
     assert send(ivanov, format="none").status_code == 200 and post.sent.pop()
@@ -3091,8 +3101,8 @@ def test_bad_requests_to_send_are_refused_before_any_letter(office, monkeypatch)
 
 def test_sending_is_limited_per_person_per_hour(office, monkeypatch):
     web, admin, ivanov, petrov, post = desk(office)
-    assert web.SENDS_PER_HOUR == 10
-    monkeypatch.setattr(web, "protocol_sends", signup.Throttle(2))
+    assert web.core.SENDS_PER_HOUR == 10
+    monkeypatch.setattr(web.letters, "protocol_sends", signup.Throttle(2))
     assert [send(ivanov, format="none").status_code for _ in range(3)] == [200, 200, 429]
     assert "за час" in send(ivanov, format="none").json()["detail"] and len(post.sent) == 2
     # отказ по адресам в предел не засчитывается, и предел у каждого свой
@@ -3112,10 +3122,10 @@ def test_smtp_error_is_told_in_plain_words_and_refused_addresses_are_named(offic
     assert failed.status_code == 502
     assert failed.json()["detail"] == "почтовый сервер не отвечает — сообщите администратору сервиса"
     assert "x-field" not in failed.headers
-    event = web.trail.read()[-1]
+    event = web.core.trail.read()[-1]
     assert (event["kind"], event["what"], event["by"], event["to"]) == ("mail_failed", "protocol", "ivanov", ["petrov@example.test"])
     assert "gaierror" in event["error"] and "protocol_sent" not in kinds(web)
-    assert any("не отправлен" in line and "gaierror" in line for line in web.log.tail_from(0)[1])
+    assert any("не отправлен" in line and "gaierror" in line for line in web.core.log.tail_from(0)[1])
     post.broken = mail.MailError("SMTPAuthenticationError: (535, b'5.7.8 bad password')")
     assert send(ivanov).json()["detail"] == "почтовый сервер не принял письмо — сообщите администратору сервиса"
     # сервер отказал всем адресам: каждый адрес с ответом сервера, как при частичной неудаче, — под полем адресов
@@ -3132,19 +3142,19 @@ def test_smtp_error_is_told_in_plain_words_and_refused_addresses_are_named(offic
     assert partly == {"ok": True, "to": ["petrov@example.test", "ivanov@example.test"],
                       "refused": [{"email": "guest@partner.test", "why": "550 5.1.1 no such user"}]}
     assert [m.to for m in post.sent] == [["petrov@example.test"], ["ivanov@example.test"]]
-    event = web.trail.read()[-1]
+    event = web.core.trail.read()[-1]
     assert (event["kind"], event["refused"]) == ("protocol_sent", ["guest@partner.test"])
     assert event["to"] == ["petrov@example.test", "guest@partner.test", "ivanov@example.test"]
     assert kinds(web).count("protocol_sent") == 1
-    assert any("не ушло: guest@partner.test (550 5.1.1 no such user)" in line for line in web.log.tail_from(0)[1])
+    assert any("не ушло: guest@partner.test (550 5.1.1 no such user)" in line for line in web.core.log.tail_from(0)[1])
 
 
 def test_mail_domains_limit_the_recipients(tmp_path, monkeypatch):
     with running(tmp_path, extra={**MAIL_ENV, "MAIL_DOMAINS": "Example.test, @corp.example"}) as (web, client):
         post = Post()
-        monkeypatch.setattr(web.mail, "send", post.send)
-        monkeypatch.setattr(web.mail, "send_each", post.send_each)
-        assert web.cfg.mail_domains == ("example.test", "corp.example")
+        monkeypatch.setattr(web.core.mail, "send", post.send)
+        monkeypatch.setattr(web.core.mail, "send_each", post.send_each)
+        assert web.core.cfg.mail_domains == ("example.test", "corp.example")
         admin = enter(web, "admin", ADMIN_PASSWORD)
         web_, admin, ivanov, petrov, post = desk((web, client, admin, post))
         admin.post("/api/admin/users/save", json={"login": "sidorov", "name": "Сидоров", "email": "sidorov@partner.test"})
@@ -3158,7 +3168,7 @@ def test_mail_domains_limit_the_recipients(tmp_path, monkeypatch):
         assert post.sent == []
         assert send(ivanov, to="petrov@example.test, boss@CORP.example").status_code == 200
         assert [m.to for m in post.sent] == [["petrov@example.test"], ["boss@corp.example"]]
-        assert any("только на адреса доменов: example.test, corp.example" in line for line in web.log.tail_from(0)[1])
+        assert any("только на адреса доменов: example.test, corp.example" in line for line in web.core.log.tail_from(0)[1])
 
 
 def test_without_mail_nothing_is_sent_and_the_button_is_hidden(site):
@@ -3169,8 +3179,8 @@ def test_without_mail_nothing_is_sent_and_the_button_is_hidden(site):
     assert ivanov.post("/api/record/send", json={"file": file, "to": "a@example.test"}).status_code == 503
     assert ivanov.get("/api/record/recipients", params={"file": file}).status_code == 503
     # и письмо о готовности без почты никуда не идёт
-    web.people.put("ivanov", "Иванов", email="ivanov@example.test")
-    assert web._tell(web.service.ledger.get(file), "ready", "ivanov") is None
+    web.core.people.put("ivanov", "Иванов", email="ivanov@example.test")
+    assert web.letters._tell(web.core.service.ledger.get(file), "ready", "ivanov") is None
     shown = ivanov.get("/api/me").json()
     assert shown["mail"] is False and shown["email"] == "ivanov@example.test" and shown["notify_ready"] is True
 
@@ -3183,15 +3193,15 @@ def test_person_switches_ready_letters_off_and_on(office):
     assert petrov.post("/api/notify", json={"ready": False}).json() == {"ok": True, "notify_ready": False,
                                                                         "notify_due": False}
     assert petrov.get("/api/me").json()["notify_ready"] is False
-    assert web.trail.read()[-1]["kind"] == "notify" and web.trail.read()[-1]["ready"] is False
-    record = web.service.ledger.get(MEETING)
-    assert web._tell(record, "ready", "petrov") is None and post.sent == []
+    assert web.core.trail.read()[-1]["kind"] == "notify" and web.core.trail.read()[-1]["ready"] is False
+    record = web.core.service.ledger.get(MEETING)
+    assert web.letters._tell(record, "ready", "petrov") is None and post.sent == []
     # правка учётной записи администратором выбор человека не сбрасывает; перезапуск — тоже
     admin.post("/api/admin/users/save", json={"login": "petrov", "name": "Петров П. П."})
-    assert web.people.users["petrov"]["notify_ready"] is False
-    assert users.Users(db.Database(web.cfg.state_dir)).users["petrov"]["notify_ready"] is False
+    assert web.core.people.users["petrov"]["notify_ready"] is False
+    assert users.Users(db.Database(web.core.cfg.state_dir)).users["petrov"]["notify_ready"] is False
     petrov.post("/api/notify", json={"ready": True})
-    web._tell(record, "ready", "petrov").join(5)
+    web.letters._tell(record, "ready", "petrov").join(5)
     assert [m.to for m in post.sent] == [["petrov@example.test"]]
     # у администратора из .env учётной записи нет — настраивать нечего; ключом настройку не меняют
     assert admin.post("/api/notify", json={"ready": False}).status_code == 400
@@ -3215,35 +3225,35 @@ def test_users_file_from_before_the_letters_gets_them_switched_on(tmp_path):
 
 def test_ready_letter_goes_only_to_a_person_with_mail_who_wants_it(office):
     web, admin, ivanov, petrov, post = desk(office)
-    record = web.service.ledger.get(MEETING)
+    record = web.core.service.ledger.get(MEETING)
     # без почты, без учётной записи (admin из .env, удалённый пользователь, пустой автор) — письма нет
     for login in ("sidorov", "admin", "nobody", ""):
-        assert web._tell(record, "ready", login) is None, login
-    web._tell(record, "ready", "petrov").join(5)
+        assert web.letters._tell(record, "ready", login) is None, login
+    web.letters._tell(record, "ready", "petrov").join(5)
     letter, = post.sent
     assert letter.to == ["petrov@example.test"] and letter.subject == "запись готова — Планёрка: итоги/план"
     assert "Здравствуйте, Петров Пётр!" in letter.text and "Длительность: 10 мин" in letter.text
     assert "Поручений в протоколе: 2" in letter.text and "- Обсудили бюджет склада." in letter.text
     assert "http://podyachiy.test/?path=%D0%9F%D1%80%D0%BE%D0%B5%D0%BA%D1%82%D1%8B&open=" in letter.text
     assert letter.attachments == []
-    event = web.trail.read()[-1]
+    event = web.core.trail.read()[-1]
     assert (event["kind"], event["by"], event["file"], event["to"], event["outcome"]) == (
         "ready_mail", "", MEETING, "petrov", "ready")
 
     # сбой: человеческим языком, без текста ошибки из журнала обработки
     broken = {"file": "Проекты/сбой.mp4", "status": "error", "failures": 3, "stem": "сбой",
               "error": "Traceback: httpx.ReadTimeout at 0x7f", "finished_at": "2026-10-09T12:00:00+03:00"}
-    web._tell(broken, "failed", "petrov").join(5)
+    web.letters._tell(broken, "failed", "petrov").join(5)
     assert post.sent[-1].subject == "запись не обработана — сбой.mp4"
     assert "Автоматических попыток больше не будет" in post.sent[-1].text and "Traceback" not in post.sent[-1].text
     assert "ReadTimeout" not in post.sent[-1].html
-    web._tell({**broken, "failures": 1}, "failed", "petrov").join(5)        # ручной запуск, автоматика ещё повторит
+    web.letters._tell({**broken, "failures": 1}, "failed", "petrov").join(5)        # ручной запуск, автоматика ещё повторит
     assert "попробует ещё раз сам" in post.sent[-1].text
     # тому, кто запустил запись сам, не пишут «обратитесь к администратору»: причина — в разделе «Обработка»
-    web._tell(broken, "failed", "petrov", True).join(5)
+    web.letters._tell(broken, "failed", "petrov", True).join(5)
     assert "в разделе «Обработка»" in post.sent[-1].text and "Обратитесь к администратору" not in post.sent[-1].text
     assert "запустите запись ещё раз" in post.sent[-1].text
-    web._tell({"file": "Проекты/тихо.mp4", "status": "no_audio", "stem": "тихо"}, "failed", "petrov").join(5)
+    web.letters._tell({"file": "Проекты/тихо.mp4", "status": "no_audio", "stem": "тихо"}, "failed", "petrov").join(5)
     assert post.sent[-1].subject == "в записи нет звука — тихо.mp4"
     assert "http://podyachiy.test/?path=%D0%9F%D1%80%D0%BE%D0%B5%D0%BA%D1%82%D1%8B\n" in post.sent[-1].text
 
@@ -3251,13 +3261,13 @@ def test_ready_letter_goes_only_to_a_person_with_mail_who_wants_it(office):
 def test_broken_mail_leaves_the_record_ready_and_is_written_down(office):
     web, admin, ivanov, petrov, post = desk(office)
     post.broken = mail.MailError("ConnectionRefusedError: [Errno 111] Connection refused")
-    web._tell(web.service.ledger.get(MEETING), "ready", "petrov").join(5)
-    assert post.sent == [] and web.service.ledger.get(MEETING)["status"] == "ok"
-    event = web.trail.read()[-1]
+    web.letters._tell(web.core.service.ledger.get(MEETING), "ready", "petrov").join(5)
+    assert post.sent == [] and web.core.service.ledger.get(MEETING)["status"] == "ok"
+    event = web.core.trail.read()[-1]
     assert (event["kind"], event["what"], event["file"], event["to"]) == ("mail_failed", "ready", MEETING, "petrov")
     assert "Connection refused" in event["error"]
     assert any("письмо о записи" in line and "не ушло" in line and "Connection refused" in line
-               for line in web.log.tail_from(0)[1])
+               for line in web.core.log.tail_from(0)[1])
     assert petrov.get("/api/result", params={"file": MEETING}).status_code == 200
 
 
@@ -3270,12 +3280,12 @@ def test_worker_tells_the_author_once_and_slow_mail_does_not_hold_it(office, mon
     def slow_send(*args, **kw):
         release.wait(10)
         return sent(*args, **kw)
-    monkeypatch.setattr(web.mail, "send", slow_send)
+    monkeypatch.setattr(web.core.mail, "send", slow_send)
 
     async def process(cfg, rel, stem, template, force, manual, log, on_progress=None, neighbours=None, words=None, marked=None, series=False):
         return {"file": rel, "stem": stem, "status": "ok", "cost": {}, "title": "Новая планёрка",
                 "finished_at": "2026-10-10T12:00:00+03:00"}
-    monkeypatch.setattr(web.pipeline, "process", process)
+    monkeypatch.setattr(web.common.pipeline, "process", process)
 
     def wait(done):
         deadline = time.time() + 10
@@ -3284,29 +3294,29 @@ def test_worker_tells_the_author_once_and_slow_mail_does_not_hold_it(office, mon
             time.sleep(0.05)
 
     for name in ("новая.mp4", "вторая.mp4"):
-        (web.cfg.inbox / "Проекты" / name).write_bytes(b"video")
-        web.trail.write("upload", "petrov", file=f"Проекты/{name}", size=5)
-        web.service.queue.append(watcher.QueueItem(path=f"Проекты/{name}"))
+        (web.core.cfg.inbox / "Проекты" / name).write_bytes(b"video")
+        web.core.trail.write("upload", "petrov", file=f"Проекты/{name}", size=5)
+        web.core.service.queue.append(watcher.QueueItem(path=f"Проекты/{name}"))
     # обе записи обработаны, хотя первое письмо всё ещё висит на почтовом сервере
-    wait(lambda: all(web.service.ledger.get(f"Проекты/{n}") for n in ("новая.mp4", "вторая.mp4")) and not web.service.running)
-    assert post.sent == [] and web.service.ledger.get("Проекты/новая.mp4")["announced"] == "ready"
+    wait(lambda: all(web.core.service.ledger.get(f"Проекты/{n}") for n in ("новая.mp4", "вторая.mp4")) and not web.core.service.running)
+    assert post.sent == [] and web.core.service.ledger.get("Проекты/новая.mp4")["announced"] == "ready"
     release.set()
     wait(lambda: len(post.sent) == 2)
     assert {m.subject for m in post.sent} == {"запись готова — Новая планёрка"}
     assert all(m.to == ["petrov@example.test"] for m in post.sent)
 
     # хозяин папки пересобирает протокол — письма нет ни ему, ни автору
-    web.service.enqueue_manual("Проекты/новая.mp4", None, False, "ivanov", "rebuild")
-    wait(lambda: web.service.ledger.get("Проекты/новая.mp4")["runs"] == 2 and not web.service.running)
+    web.core.service.enqueue_manual("Проекты/новая.mp4", None, False, "ivanov", "rebuild")
+    wait(lambda: web.core.service.ledger.get("Проекты/новая.mp4")["runs"] == 2 and not web.core.service.running)
     # администратор запускает вручную — письмо было бы ему, но у admin из .env почты нет
-    web.service.enqueue_manual("Проекты/новая.mp4", None, False, "admin", "manual")
-    wait(lambda: web.service.ledger.get("Проекты/новая.mp4")["runs"] == 3 and not web.service.running)
+    web.core.service.enqueue_manual("Проекты/новая.mp4", None, False, "admin", "manual")
+    wait(lambda: web.core.service.ledger.get("Проекты/новая.mp4")["runs"] == 3 and not web.core.service.running)
     # вручную запускает администратор сервиса с почтой — письмо ему
     admin.post("/api/admin/users/save", json={"login": "orlova", "name": "Орлова", "admin": True})
-    web.service.enqueue_manual("Проекты/новая.mp4", None, False, "orlova", "manual")
+    web.core.service.enqueue_manual("Проекты/новая.mp4", None, False, "orlova", "manual")
     wait(lambda: len(post.sent) == 3)
     assert post.sent[-1].to == ["orlova@example.test"]
-    told = lambda: [e["to"] for e in web.trail.read() if e["kind"] == "ready_mail"]
+    told = lambda: [e["to"] for e in web.core.trail.read() if e["kind"] == "ready_mail"]
     wait(lambda: len(told()) == 3)                  # строка в журнал действий пишется следом за отправкой, в её же потоке
     assert told() == ["petrov", "petrov", "orlova"]
 
@@ -3316,9 +3326,9 @@ def test_worker_tells_the_author_once_and_slow_mail_does_not_hold_it(office, mon
 def test_request_to_login_chain_without_mail(site, monkeypatch):
     """Почты в сервисе нет: заявка → список у администратора → одобрение → ссылка в ответе → пароль → вход."""
     web, guest = site
-    monkeypatch.setattr(web.mail, "send", lambda *a, **kw: pytest.fail("без почты писем быть не должно"))
+    monkeypatch.setattr(web.core.mail, "send", lambda *a, **kw: pytest.fail("без почты писем быть не должно"))
     admin = enter(web, "admin", ADMIN_PASSWORD)
-    assert guest.get("/api/me").json()["signup"] is True and web.cfg.public_url == ""
+    assert guest.get("/api/me").json()["signup"] is True and web.core.cfg.public_url == ""
 
     # почта в заявке необязательна, но если указана — проверяется
     assert guest.post("/api/request", json={**CLAIM, "email": "не почта"}).headers["x-field"] == "email"
@@ -3355,8 +3365,8 @@ def test_request_to_login_chain_without_mail(site, monkeypatch):
     assert again.post("/api/admin/users/link", json={"login": "sidorov"}).status_code == 403      # себе ссылку не выпустить
     assert kinds(web) == ["login", "request_new", "request_new", "request_approve", "link_shown", "password_link", "login",
                           "link_shown", "link_shown", "password_link", "login"]
-    assert [e["why"] for e in web.trail.read() if e["kind"] == "link_shown"] == ["invite", "admin", "admin"]
-    assert link["token"] not in "\n".join(web.log.lines) and second not in "\n".join(web.log.lines)
+    assert [e["why"] for e in web.core.trail.read() if e["kind"] == "link_shown"] == ["invite", "admin", "admin"]
+    assert link["token"] not in "\n".join(web.core.log.lines) and second not in "\n".join(web.core.log.lines)
 
 
 def test_with_mail_the_request_still_needs_an_address(office):
@@ -3379,12 +3389,12 @@ def test_owner_sets_a_due_date_and_the_reader_only_sees_it(site):
     assert ivanov.post("/api/v1/task", params={"file": file, "key": SMETA, "due": late}).status_code == 403
     assert petrov.post("/api/record/task", json=body).status_code == 404
     assert site[1].post("/api/record/task", json=body).status_code == 401
-    assert web.noted.everything() == {}
+    assert web.core.noted.everything() == {}
     for bad in ("завтра", "20.10.2026", "2026-13-01", "2026-1-5"):
         assert admin.post("/api/record/task", json={**body, "due": bad}).status_code == 400, bad
     assert admin.post("/api/record/task", json={"file": file, "key": SMETA}).status_code == 400    # ни done, ни due
 
-    protocol = pipeline.protocol_path(web.cfg, file, web.service.ledger.get(file))
+    protocol = pipeline.protocol_path(web.core.cfg, file, web.core.service.ledger.get(file))
     before = protocol.read_bytes()
     task = admin.post("/api/record/task", json=body).json()["task"]
     assert (task["due"], task["due_text"], task["due_by"], task["due_date"], task["overdue"], task["done"], task["open"]) == (
@@ -3421,7 +3431,7 @@ def test_owner_sets_a_due_date_and_the_reader_only_sees_it(site):
     back = admin.post("/api/record/task", json={**body, "due": ""}).json()["task"]
     assert (back["due"], back["due_text"], back["due_date"], back["due_by"], back["done"]) == (None, "до пятницы", "2026-10-16", None, True)
     assert admin.post("/api/record/task", json={**body, "due": ""}).status_code == 200            # повтор ничего не меняет
-    events = [e for e in web.trail.read() if e["kind"] == "task_due"]
+    events = [e for e in web.core.trail.read() if e["kind"] == "task_due"]
     assert [(e["by"], e["file"], e["task"], e["owner"], e["was"], e["now"]) for e in events] == [
         ("admin", file, "Согласовать смету", "Иванов Иван", "до пятницы", late),
         ("admin", file, "Согласовать смету", "Иванов Иван", late, soon),
@@ -3436,7 +3446,7 @@ def test_key_of_the_folder_owner_sets_a_due_date_and_it_moves_with_the_record(si
     key = marks.key("Петров Пётр", "Согласовать смету")
     set_ = robot.post("/api/v1/task", params={"file": file, "key": key, "due": soon})
     assert set_.status_code == 200 and set_.json()["task"]["due"] == soon and set_.json()["task"]["done"] is False
-    event = [e for e in web.trail.read() if e["kind"] == "task_due"][-1]
+    event = [e for e in web.core.trail.read() if e["kind"] == "task_due"][-1]
     assert event["by"] == "petrov" and event["via"] == "key"
     # срок лежит рядом с протоколом и переезжает вместе с записью
     moved = petrov.post("/api/record/rename", json={"file": file, "name": "итоги недели"}).json()["file"]
@@ -3485,7 +3495,7 @@ def test_reader_sees_everything_in_the_folder_but_the_page_refuses_his_upload(si
         assert "администратору" in asked.json()["detail"]
         assert ivanov.put("/api/upload", params={**chunk, "offset": 0}, content=b"12345").status_code == 403, folder
         assert ivanov.delete("/api/upload", params=chunk).status_code == 403, folder
-    assert not list(web.cfg.inbox.rglob("запись.mp3")) and not [e for e in web.trail.read() if e["kind"] == "upload"]
+    assert not list(web.core.cfg.inbox.rglob("запись.mp3")) and not [e for e in web.core.trail.read() if e["kind"] == "upload"]
 
 
 def test_reader_with_upload_and_the_folder_admin_upload_on_the_page(site):
@@ -3496,7 +3506,7 @@ def test_reader_with_upload_and_the_folder_admin_upload_on_the_page(site):
         assert inside["enabled"] is True and inside["anywhere"] is True and inside["denied"] == "", name
         sent = client.put("/api/upload", params={"name": name, "size": 5, "stamp": "1", "dir": folder, "offset": 0}, content=b"12345")
         assert sent.status_code == 200 and sent.json()["done"], name
-    assert [(e["by"], e["file"]) for e in web.trail.read() if e["kind"] == "upload"] == [
+    assert [(e["by"], e["file"]) for e in web.core.trail.read() if e["kind"] == "upload"] == [
         ("petrov", "Проекты/от петрова.mp3"), ("petrov", "Проекты/Сметы/смета.mp3"),
         ("sidorov", "Проекты/Сметы/от сидорова.mp3"), ("admin", "Снабжение/админ.mp3")]
     # право загрузки — на свою папку: в закрытую по-прежнему нельзя
@@ -3516,11 +3526,11 @@ def test_upload_right_follows_its_scope_and_is_taken_back(site):
                                                            "offset": 0}, content=b"12345").status_code
     assert put("Проекты") == 200 and put("Проекты/Сметы") == 403           # «только эта папка» — без подпапок
     below = ivanov.get("/api/browse", params={"path": "Проекты/Сметы"}).json()["upload"]
-    assert (below["enabled"], below["anywhere"], below["denied"]) == (False, True, web.NO_UPLOAD)
+    assert (below["enabled"], below["anywhere"], below["denied"]) == (False, True, web.access.NO_UPLOAD)
     # из общего списка читателю с загрузкой, но без личной, говорят открыть папку
     flat = ivanov.get("/api/browse", params={"flat": True}).json()
     assert flat["upload"]["enabled"] is False and flat["home_upload"] is False
-    assert flat["upload"]["denied"] == web.UPLOAD_ELSEWHERE
+    assert flat["upload"]["denied"] == web.access.UPLOAD_ELSEWHERE
     admin.post("/api/access", json={"dir": "Проекты", "login": "ivanov", "upload": "tree"})
     assert put("Проекты/Сметы") == 200                                     # наследуется на подпапки
     admin.post("/api/access", json={"dir": "Проекты", "login": "ivanov", "upload": "none"})
@@ -3558,11 +3568,11 @@ def test_home_folder_takes_uploads_only_when_the_admin_allowed(site):
     home = f"{HOME}/ivanov"
     chunk = {"name": "личная.mp3", "size": 5, "stamp": "1", "dir": home}
     refused = ivanov.get("/api/upload", params=chunk)
-    assert refused.status_code == 403 and refused.json()["detail"] == web.NO_HOME_UPLOAD
+    assert refused.status_code == 403 and refused.json()["detail"] == web.access.NO_HOME_UPLOAD
     assert ivanov.put("/api/upload", params={**chunk, "offset": 0}, content=b"12345").status_code == 403
     inside = ivanov.get("/api/browse", params={"path": home}).json()
     assert inside["upload"]["enabled"] is False and inside["mkdir"] is True        # папка его, подпапки заводит
-    assert ivanov.get("/api/browse", params={"flat": True}).json()["upload"]["denied"] == web.NO_UPLOAD_AT_ALL
+    assert ivanov.get("/api/browse", params={"flat": True}).json()["upload"]["denied"] == web.access.NO_UPLOAD_AT_ALL
     personal = {p["login"]: p["upload"] for p in admin.get("/api/admin/folders").json()["personal"]}
     assert personal == {"ivanov": False, "petrov": False, "sidorov": False}
 
@@ -3573,10 +3583,10 @@ def test_home_folder_takes_uploads_only_when_the_admin_allowed(site):
     assert ivanov.put("/api/upload", params={**chunk, "offset": 0}, content=b"12345").json()["done"]
     # правка без признака право не трогает; снятие закрывает загрузку снова
     admin.post("/api/admin/users/save", json={"login": "ivanov", "name": "Иванов И."})
-    assert web.people.users["ivanov"]["home_upload"] is True
+    assert web.core.people.users["ivanov"]["home_upload"] is True
     admin.post("/api/admin/users/save", json={"login": "ivanov", "name": "Иванов И.", "home_upload": False})
     assert ivanov.get("/api/upload", params={**chunk, "name": "вторая.mp3"}).status_code == 403
-    changes = [e for e in web.trail.read() if e["kind"] == "user_change" and e["login"] == "ivanov"]
+    changes = [e for e in web.core.trail.read() if e["kind"] == "user_change" and e["login"] == "ivanov"]
     assert [e.get("home_upload") for e in changes] == [True, None, False]          # выдача и снятие — в журнале
     # администратору папки «Проекты» личная загрузка тоже нужна отдельно
     assert sidorov.get("/api/upload", params={**chunk, "dir": f"{HOME}/sidorov"}).status_code == 403
@@ -3590,15 +3600,15 @@ def test_rebuild_is_paid_and_needs_the_upload_right(site):
     seen = ivanov.get("/api/result", params={"file": own, "kind": "summary"}).json()
     assert (seen["can_edit"], seen["can_rebuild"]) == (True, False)
     refused = ivanov.post("/api/admin/names", json={"file": own, **names, "rebuild": True})
-    assert refused.status_code == 403 and refused.json()["detail"] == web.NO_REBUILD
-    assert not (web.cfg.outbox / HOME / "ivanov/личная/transcript/личная.names.json").exists()     # не наполовину
+    assert refused.status_code == 403 and refused.json()["detail"] == web.access.NO_REBUILD
+    assert not (web.core.cfg.outbox / HOME / "ivanov/личная/transcript/личная.names.json").exists()     # не наполовину
     assert ivanov.post("/api/admin/names", json={"file": own, **names}).status_code == 200         # подпись бесплатна
     assert ivanov.post("/api/admin/names", json={"file": own, "rebuild": True}).status_code == 403
-    assert web.service.queue == []
+    assert web.core.service.queue == []
     # читатель и читатель с загрузкой в общей папке не хозяева: прежний отказ
     for client in (ivanov, petrov):
         assert client.post("/api/admin/names", json={"file": shared, "rebuild": True}).status_code == 403
-    assert web.service.queue == []
+    assert web.core.service.queue == []
     # администратор папки пересобирает: администрирование включает загрузку
     assert sidorov.get("/api/result", params={"file": shared, "kind": "summary"}).json()["can_rebuild"] is True
     assert sidorov.post("/api/admin/names", json={"file": shared, "rebuild": True}).json()["rebuilding"] is True
@@ -3606,7 +3616,7 @@ def test_rebuild_is_paid_and_needs_the_upload_right(site):
     admin.post("/api/admin/users/save", json={"login": "ivanov", "name": "Иванов", "home_upload": True})
     assert ivanov.get("/api/result", params={"file": own, "kind": "summary"}).json()["can_rebuild"] is True
     assert ivanov.post("/api/admin/names", json={"file": own, "rebuild": True}).status_code == 200
-    assert sorted((i.path, i.reason) for i in web.service.queue) == [(own, "rebuild"), (shared, "rebuild")]
+    assert sorted((i.path, i.reason) for i in web.core.service.queue) == [(own, "rebuild"), (shared, "rebuild")]
     # ручной запуск и перераспознавание — только администратору сервиса, как и было
     for client in (ivanov, petrov, sidorov):
         assert client.post("/api/admin/run", json={"file": shared, "force": True}).status_code == 403
@@ -3632,16 +3642,16 @@ def test_key_uploads_and_rebuilds_only_within_its_owners_upload_right(site):
     assert reader.get("/api/v1/search", params={"q": "бюджет"}).status_code == 200
 
     refused = reader.put("/api/v1/upload", params={"dir": "Проекты", "name": "запись.mp3"}, content=b"123")
-    assert refused.status_code == 403 and refused.json()["detail"] == web.NO_UPLOAD
+    assert refused.status_code == 403 and refused.json()["detail"] == web.access.NO_UPLOAD
     assert reader.put("/api/v1/upload", params={"dir": f"{HOME}/ivanov", "name": "запись.mp3"},
-                      content=b"123").json()["detail"] == web.NO_HOME_UPLOAD
+                      content=b"123").json()["detail"] == web.access.NO_HOME_UPLOAD
     nowhere = reader.put("/api/v1/upload", params={"name": "запись.mp3"}, content=b"123")
     assert nowhere.status_code == 400 and "право загрузки выдаёт" in nowhere.json()["detail"]
-    assert not list(web.cfg.inbox.rglob("запись.mp3"))
+    assert not list(web.core.cfg.inbox.rglob("запись.mp3"))
     assert loader.put("/api/v1/upload", params={"dir": "Проекты/Сметы", "name": "запись.mp3"}, content=b"123").status_code == 200
     assert lead.put("/api/v1/upload", params={"dir": "Проекты", "name": "запись.mp3"}, content=b"123").status_code == 200
     assert loader.put("/api/v1/upload", params={"dir": "Снабжение", "name": "запись.mp3"}, content=b"123").status_code == 404
-    assert [(e["by"], e["key"]) for e in web.trail.read() if e["kind"] == "upload"] == [
+    assert [(e["by"], e["key"]) for e in web.core.trail.read() if e["kind"] == "upload"] == [
         ("petrov", "с загрузкой"), ("sidorov", "администратор папки")]
 
     # пересборка ключом: читателю и читателю с загрузкой — нет, администратору папки — да
@@ -3651,9 +3661,9 @@ def test_key_uploads_and_rebuilds_only_within_its_owners_upload_right(site):
     assert lead.get("/api/v1/speakers", params={"file": shared}).json()["can_rebuild"] is True
     own = voiced(web, f"{HOME}/ivanov/личная.mp4")
     denied = reader.post("/api/v1/speakers", params={"file": own, "rebuild": True})
-    assert denied.status_code == 403 and denied.json()["detail"] == web.NO_REBUILD
+    assert denied.status_code == 403 and denied.json()["detail"] == web.access.NO_REBUILD
     assert reader.post("/api/v1/speakers", params={"file": own, "part": 1, "label": "S1", "name": "Анна"}).status_code == 200
-    assert web.service.queue == []
+    assert web.core.service.queue == []
     assert lead.post("/api/v1/speakers", params={"file": shared, "rebuild": True}).json()["rebuilding"] is True
     # право выдали владельцу — тот же ключ начал загружать, без перевыпуска
     admin.post("/api/access", json={"dir": "Проекты", "login": "ivanov", "upload": "only"})
@@ -3690,8 +3700,8 @@ def test_claim_is_approved_with_or_without_home_upload(office):
         claim = next(c for c in admin.get("/api/admin/requests").json()["requests"] if c["login"] == login)
         body = {"id": claim["id"], "login": login, "name": login.title(), **({"home_upload": True} if allow else {})}
         assert admin.post("/api/admin/requests/approve", json=body).status_code == 200
-        assert web.people.users[login]["home_upload"] is allow and web.people.access(login).uploader is allow
-    seen = [e.get("home_upload") for e in web.trail.read() if e["kind"] == "request_approve"]
+        assert web.core.people.users[login]["home_upload"] is allow and web.core.people.access(login).uploader is allow
+    seen = [e.get("home_upload") for e in web.core.trail.read() if e["kind"] == "request_approve"]
     assert seen == [None, True]
 
 
@@ -3714,7 +3724,7 @@ def checker(monkeypatch, states=None):
 
 def wait_log(web, word):
     for _ in range(200):
-        lines = [line for line in web.log.tail_from(0)[1] if word in line]
+        lines = [line for line in web.core.log.tail_from(0)[1] if word in line]
         if lines:
             return lines
         time.sleep(0.02)
@@ -3775,7 +3785,7 @@ def test_personal_mode_uploads_to_the_root_by_request_like_the_button(tmp_path):
     with running(tmp_path / "personal", mode="personal") as (web, client):
         sent = client.put("/api/v1/upload", params={"name": "планёрка.mp3"}, content=b"123")
         assert sent.status_code == 200 and sent.json()["file"] == "планёрка.mp3"
-        assert (web.cfg.inbox / "планёрка.mp3").read_bytes() == b"123"
+        assert (web.core.cfg.inbox / "планёрка.mp3").read_bytes() == b"123"
         # то же самое делает кнопка на странице
         page = client.put("/api/upload", params={"name": "с кнопки.mp3", "size": 3, "stamp": "1", "offset": 0}, content=b"123")
         assert page.json()["done"] and page.json()["file"] == "с кнопки.mp3"
@@ -3790,7 +3800,7 @@ def test_personal_mode_uploads_to_the_root_by_request_like_the_button(tmp_path):
         admin = enter(web, "admin", ADMIN_PASSWORD)
         refused = admin.put("/api/v1/upload", params={"name": "планёрка.mp3"}, content=b"123")
         assert refused.status_code == 400 and "нужны папка и имя файла" in refused.json()["detail"]
-        assert not (web.cfg.inbox / "планёрка.mp3").exists()
+        assert not (web.core.cfg.inbox / "планёрка.mp3").exists()
         assert "`dir` и `name` обязательны" in admin.get("/api/v1").text
 
 
@@ -3881,15 +3891,15 @@ def test_folder_admin_edits_the_dictionary_and_a_reader_only_reads_it(site):
                                      {"term": "СКУД", "meaning": ""}]
     assert saved.json()["changed_by"] == "Сидоров" and saved.json()["changed_at"]
     # лежит в базе — вместе с правами
-    assert [(r["scope"], r["path"]) for r in web.base.rows("SELECT scope, path FROM dictionaries")] == [("folders", "Проекты")]
+    assert [(r["scope"], r["path"]) for r in web.core.base.rows("SELECT scope, path FROM dictionaries")] == [("folders", "Проекты")]
 
     # читатель и читатель с загрузкой видят тот же список, но не правят
     for client in (ivanov, petrov):
         seen = client.get("/api/dictionary", params={"path": "Проекты"}).json()
         assert seen["people"][0] == ERSHOVA and seen["can_edit"] is False
         refused = client.post("/api/dictionary", json={"path": "Проекты", "people": "Чужой Человек"})
-        assert refused.status_code == 403 and refused.json()["detail"] == web.NO_DICT_EDIT
-    assert web.words.get("folders", "Проекты")["people"][0] == ERSHOVA
+        assert refused.status_code == 403 and refused.json()["detail"] == web.dictionaries.NO_DICT_EDIT
+    assert web.core.words.get("folders", "Проекты")["people"][0] == ERSHOVA
 
     # подпапка получает словарь папки выше; свой раздел меняется отдельно от другого
     sidorov.post("/api/dictionary", json={"path": "Проекты/Сметы", "terms": "кс-2 — акт\nТСД"})
@@ -3897,10 +3907,10 @@ def test_folder_admin_edits_the_dictionary_and_a_reader_only_reads_it(site):
     assert sub["people"] == [] and [t["term"] for t in sub["terms"]] == ["кс-2", "ТСД"]
     assert [(p["name"], p["path"]) for p in sub["inherited"]["people"]] == [
         ("Ершова Лидия Марковна", "Проекты"), ("Громов Пётр Андреевич", "Проекты")]
-    assert web.words.effective("Проекты/Сметы/смета.mp3")["terms"][0] == {
+    assert web.core.words.effective("Проекты/Сметы/смета.mp3")["terms"][0] == {
         "term": "кс-2", "meaning": "акт", "scope": "folder", "path": "Проекты/Сметы"}           # ближний победил
     sidorov.post("/api/dictionary", json={"path": "Проекты/Сметы", "people": []})                # сокращения не тронуты
-    assert len(web.words.get("folders", "Проекты/Сметы")["terms"]) == 2
+    assert len(web.core.words.get("folders", "Проекты/Сметы")["terms"]) == 2
 
     # чужая и несуществующая папки неотличимы; путь с «..» и служебная папка — 400, как везде; у корня словаря нет
     stranger = enter(web, "ivanov")
@@ -3914,14 +3924,14 @@ def test_folder_admin_edits_the_dictionary_and_a_reader_only_reads_it(site):
     assert admin.post("/api/dictionary", json={"path": "Проекты", "rebuild": True}).status_code == 400
     too_many = admin.post("/api/dictionary", json={"path": "Проекты", "people": [f"Человек {n}" for n in range(201)]})
     assert too_many.status_code == 400 and "не больше 200 строк" in too_many.json()["detail"]
-    assert len(web.words.get("folders", "Проекты")["people"]) == 2                               # отказ ничего не стёр
+    assert len(web.core.words.get("folders", "Проекты")["people"]) == 2                               # отказ ничего не стёр
     assert site[1].get("/api/dictionary", params={"path": "Проекты"}).status_code == 401
 
     # журнал действий: кто, где, сколько строк — без самих имён
-    events = [e for e in web.trail.read() if e["kind"] == "dictionary"]
+    events = [e for e in web.core.trail.read() if e["kind"] == "dictionary"]
     assert [(e["by"], e["folder"], e["people"], e["terms"]) for e in events] == [
         ("sidorov", "Проекты", 2, 2), ("sidorov", "Проекты/Сметы", 0, 2), ("sidorov", "Проекты/Сметы", 0, 2)]
-    assert "Ершова" not in str(web.trail.read())                # в журнале действий — только счёт строк словаря
+    assert "Ершова" not in str(web.core.trail.read())                # в журнале действий — только счёт строк словаря
 
 
 def test_record_dictionary_adds_to_the_folder_and_suggests_names_to_the_speakers_panel(site):
@@ -3934,7 +3944,7 @@ def test_record_dictionary_adds_to_the_folder_and_suggests_names_to_the_speakers
     assert [p["name"] for p in own.json()["inherited"]["people"]] == ["Ершова Лидия Марковна", "Громов Пётр Андреевич"]
     assert own.json()["processed"] is True and own.json()["can_rebuild"] is True
     # в обработку идёт словарь записи поверх словаря папки
-    words = web.service.words(PLAN)
+    words = web.core.service.words(PLAN)
     assert [(p["name"], p["role"]) for p in words["people"]] == [
         ("Юдина Анна Сергеевна", "ведёт планёрку"), ("ершова лидия марковна", "докладчик"),
         ("Громов Пётр Андреевич", "начальник склада")]
@@ -3954,16 +3964,16 @@ def test_record_dictionary_adds_to_the_folder_and_suggests_names_to_the_speakers
     # словарь переезжает вместе с записью и с папкой, а с удалённой записью уходит
     moved = sidorov.post("/api/record/move", json={"file": PLAN, "dir": "Проекты/Сметы"}).json()["file"]
     renamed = sidorov.post("/api/record/rename", json={"file": moved, "name": "смета"}).json()["file"]
-    assert renamed == "Проекты/Сметы/смета.mp4" and web.words.get("records", PLAN)["people"] == []
+    assert renamed == "Проекты/Сметы/смета.mp4" and web.core.words.get("records", PLAN)["people"] == []
     assert len(sidorov.get("/api/dictionary", params={"file": renamed}).json()["people"]) == 2
     assert admin.post("/api/admin/folders/rename", json={"dir": "Проекты", "name": "Стройка"}).status_code == 200
     after = admin.get("/api/dictionary", params={"file": "Стройка/Сметы/смета.mp4"}).json()
     assert len(after["people"]) == 2 and [p["path"] for p in after["inherited"]["people"]] == ["Стройка", "Стройка"]
     assert admin.get("/api/dictionary", params={"path": "Проекты"}).status_code == 404
     assert admin.post("/api/record/delete", json={"file": "Стройка/Сметы/смета.mp4"}).status_code == 200
-    assert web.words.get("records", "Стройка/Сметы/смета.mp4")["people"] == []
+    assert web.core.words.get("records", "Стройка/Сметы/смета.mp4")["people"] == []
     assert admin.post("/api/admin/folders/delete", json={"dir": "Стройка"}).status_code == 200
-    assert web.base.rows("SELECT * FROM dictionaries") == []
+    assert web.core.base.rows("SELECT * FROM dictionaries") == []
 
 
 def test_rebuild_with_the_new_dictionary_is_paid_and_never_recognizes_again(site):
@@ -3971,10 +3981,10 @@ def test_rebuild_with_the_new_dictionary_is_paid_and_never_recognizes_again(site
     own = voiced(web, f"{HOME}/ivanov/личная.mp4")
     # хозяин личной папки без права загрузки: словарь правит, но не пересобирает — и не наполовину
     refused = ivanov.post("/api/dictionary", json={"file": own, "people": "Юдина Анна", "rebuild": True})
-    assert refused.status_code == 403 and refused.json()["detail"] == web.NO_REBUILD
-    assert web.words.get("records", own)["people"] == [] and web.service.queue == []
+    assert refused.status_code == 403 and refused.json()["detail"] == web.access.NO_REBUILD
+    assert web.core.words.get("records", own)["people"] == [] and web.core.service.queue == []
     kept = ivanov.post("/api/dictionary", json={"file": own, "people": "Юдина Анна"})
-    assert kept.status_code == 200 and kept.json()["can_rebuild"] is False and web.service.queue == []
+    assert kept.status_code == 200 and kept.json()["can_rebuild"] is False and web.core.service.queue == []
     # протокол собран раньше словаря — страница говорит, что он с ним расходится
     assert kept.json()["dict_newer"] is True
     assert ivanov.get("/api/result", params={"file": own, "kind": "summary"}).json()["dict_newer"] is True
@@ -3983,19 +3993,19 @@ def test_rebuild_with_the_new_dictionary_is_paid_and_never_recognizes_again(site
     # администратор папки сохраняет и пересобирает одним запросом; распознавание заново не заказывается
     done = sidorov.post("/api/dictionary", json={"file": PLAN, "terms": "КС-2", "rebuild": True})
     assert done.status_code == 200 and done.json()["rebuilding"] is True
-    item, = web.service.queue
+    item, = web.core.service.queue
     assert (item.path, item.force, item.model, item.reason, item.by) == (PLAN, False, "", "rebuild", "sidorov")
     # пересборка без правки — тоже можно: словарь папки меняют отдельно
-    web.service.queue.clear()
+    web.core.service.queue.clear()
     assert sidorov.post("/api/dictionary", json={"file": PLAN, "rebuild": True}).status_code == 200
-    assert [i.path for i in web.service.queue] == [PLAN]
-    assert len([e for e in web.trail.read() if e["kind"] == "dictionary" and e.get("file") == PLAN]) == 1
+    assert [i.path for i in web.core.service.queue] == [PLAN]
+    assert len([e for e in web.core.trail.read() if e["kind"] == "dictionary" and e.get("file") == PLAN]) == 1
 
     # только что загруженная запись: словарь можно вписать до обработки, пересобирать ещё нечего
-    (web.cfg.inbox / "Проекты" / "новая.mp3").write_bytes(b"x")
+    (web.core.cfg.inbox / "Проекты" / "новая.mp3").write_bytes(b"x")
     fresh = sidorov.post("/api/dictionary", json={"file": "Проекты/новая.mp3", "people": "Громов Пётр"})
     assert fresh.status_code == 200 and fresh.json()["processed"] is False and fresh.json()["can_rebuild"] is False
-    assert web.service.words("Проекты/новая.mp3")["people"][0]["name"] == "Громов Пётр"
+    assert web.core.service.words("Проекты/новая.mp3")["people"][0]["name"] == "Громов Пётр"
     assert sidorov.post("/api/dictionary", json={"file": "Проекты/новая.mp3", "rebuild": True}).status_code == 409
     for file in ("Проекты/нет такой.mp3", "Проекты/../Проекты/новая.mp3", "Проекты//новая.mp3", "Проекты/заметка.txt"):
         assert sidorov.post("/api/dictionary", json={"file": file, "people": "Кто-то"}).status_code == 404, file
@@ -4029,7 +4039,7 @@ def test_dictionary_is_read_and_written_through_the_api_with_the_owners_rights(s
     record = robot.get("/api/v1/dictionary", params={"file": PLAN}).json()
     assert record["scope"] == "record" and record["can_rebuild"] is True and record["inherited"]["people"][0]["path"] == "Проекты"
     rebuilt = robot.put("/api/v1/dictionary", params={"file": PLAN, "rebuild": True})
-    assert rebuilt.status_code == 200 and rebuilt.json()["rebuilding"] is True and web.service.queue[0].force is False
+    assert rebuilt.status_code == 200 and rebuilt.json()["rebuilding"] is True and web.core.service.queue[0].force is False
     assert reader.put("/api/v1/dictionary", params={"file": PLAN, "rebuild": True}).status_code == 403
     for params in ({}, {"dir": "Проекты", "file": PLAN}):
         assert robot.put("/api/v1/dictionary", params=params, json=body).status_code == 400
@@ -4037,7 +4047,7 @@ def test_dictionary_is_read_and_written_through_the_api_with_the_owners_rights(s
     assert robot.put("/api/v1/dictionary", params={"dir": "Проекты"}).status_code == 400             # менять нечего
 
     # в журнале действий видно, что правил ключ
-    events = [e for e in web.trail.read() if e["kind"] == "dictionary"]
+    events = [e for e in web.core.trail.read() if e["kind"] == "dictionary"]
     assert len(events) == 4 and {(e["by"], e["via"], e["key"], e["key_kind"]) for e in events} == {
         ("sidorov", "key", "Cursor", "plain")}
     # навык знает про словарь и требует согласия на пересборку
@@ -4048,12 +4058,12 @@ def test_dictionary_is_read_and_written_through_the_api_with_the_owners_rights(s
 
 def test_personal_mode_has_dictionaries_without_any_rights(tmp_path):
     with running(tmp_path, mode="personal") as (web, client):
-        (web.cfg.inbox / "Планёрки").mkdir()
+        (web.core.cfg.inbox / "Планёрки").mkdir()
         saved = client.post("/api/dictionary", json={"path": "Планёрки", "people": PEOPLE_TEXT})
         assert saved.status_code == 200 and saved.json()["can_edit"] is True and saved.json()["changed_by"] == ""
         recorded(web, "Планёрки/вкс.mp4")
         own = client.put("/api/v1/dictionary", params={"file": "Планёрки/вкс.mp4", "rebuild": True}, json={"terms": ["КС-2"]})
-        assert own.status_code == 200 and own.json()["can_rebuild"] is True and web.service.queue[0].reason == "rebuild"
+        assert own.status_code == 200 and own.json()["can_rebuild"] is True and web.core.service.queue[0].reason == "rebuild"
         assert client.get("/api/browse", params={"path": "Планёрки"}).json()["owns"] is True
 
 
@@ -4066,7 +4076,7 @@ def test_saving_a_user_changes_only_what_the_request_names(site):
     made = admin.post("/api/admin/users/save", json={"login": "sidorov", "name": "Сидоров Пётр", "password": PASSWORD,
                                                      "admin": True, "email": "sidorov@example.test", "home_upload": True})
     assert made.status_code == 200
-    kept = lambda: {k: web.people.users["sidorov"][k] for k in ("name", "admin", "email", "home_upload")}
+    kept = lambda: {k: web.core.people.users["sidorov"][k] for k in ("name", "admin", "email", "home_upload")}
     full = {"name": "Сидоров Пётр", "admin": True, "email": "sidorov@example.test", "home_upload": True}
     assert kept() == full
     assert admin.post("/api/admin/users/save", json={"login": "sidorov"}).status_code == 200
@@ -4079,7 +4089,7 @@ def test_saving_a_user_changes_only_what_the_request_names(site):
     assert kept() == {"name": "Сидоров П. А.", "admin": False, "email": "", "home_upload": False}
     # у нового умолчания прежние: ФИО — логин, не администратор, без почты и без загрузки
     assert admin.post("/api/admin/users/save", json={"login": "novikov", "password": PASSWORD}).status_code == 200
-    fresh = web.people.users["novikov"]
+    fresh = web.core.people.users["novikov"]
     assert (fresh["name"], fresh["admin"], fresh["email"], fresh["home_upload"]) == ("novikov", False, "", False)
 
 
@@ -4100,7 +4110,7 @@ def test_refused_parameters_are_named_in_russian_like_any_other_refusal(site):
             (admin.post("/api/access"), "нет тела запроса: ожидается JSON")):
         assert answer.status_code == 422 and answer.json() == {"detail": text}, answer.text
     broken = admin.post("/api/access", content=b"{not json", headers={"Content-Type": "application/json"})
-    assert broken.status_code == 422 and broken.json()["detail"] == web.BODY_NOT_PARSED
+    assert broken.status_code == 422 and broken.json()["detail"] == web.server.BODY_NOT_PARSED
 
 
 def test_folder_is_dir_and_record_is_file_in_every_request_and_old_names_are_not_taken(site):
@@ -4126,7 +4136,7 @@ def test_folder_is_dir_and_record_is_file_in_every_request_and_old_names_are_not
             (admin.post("/api/admin/folders/delete", json={"path": "Стройка"}), "не указано поле dir"),
             (admin.post("/api/admin/run", json={"path": f"{home}/Архив/вкс.mp4"}), "не указано поле file")):
         assert answer.status_code == 422 and answer.json() == {"detail": text}, answer.text
-    assert (web.cfg.inbox / "Стройка").is_dir() and not (web.cfg.inbox / home / "Ещё").exists()
+    assert (web.core.cfg.inbox / "Стройка").is_dir() and not (web.core.cfg.inbox / home / "Ещё").exists()
 
 
 def test_unknown_or_closed_folder_is_404_everywhere_and_an_empty_one_is_an_empty_answer(site):
@@ -4166,14 +4176,15 @@ def test_unknown_or_closed_folder_is_404_everywhere_and_an_empty_one_is_an_empty
 def test_admin_status_holds_no_disk_paths(site, tmp_path):
     web, client = site
     recorded(web, "Проекты/вкс.mp4")
-    assert web.service.ledger.get("Проекты/вкс.mp4")["output"].startswith(str(tmp_path))
+    assert web.core.service.ledger.get("Проекты/вкс.mp4")["output"].startswith(str(tmp_path))
     summary = client.get("/api/admin/status", auth=("admin", ADMIN_PASSWORD))
     body = summary.json()
     assert "inbox" not in body["config"] and "outbox" not in body["config"]
     assert body["history"][0]["file"] == "Проекты/вкс.mp4" and "output" not in body["history"][0]
     # журнал работы в этой проверке не участвует: в нём сервис сам пишет, куда разложил шаблоны
     assert str(tmp_path) not in json.dumps({k: v for k, v in body.items() if k != "log"}, ensure_ascii=False)
-    page = client.get("/admin").text + client.get("/static/admin.js").text
+    page = client.get("/admin").text
+    page += "".join(client.get(src).text for src in re.findall(r'<script src="(/static/admin[\w-]*\.js)"', page))
     assert "c.inbox" not in page and "c.outbox" not in page
 
 
@@ -4192,7 +4203,7 @@ def test_costs_are_for_the_service_admin_only(site):
     admin.post("/api/access", json={"dir": "Проекты", "login": "petrov", "read": "tree"})
     for by, file, cost in (("ivanov", f"{HOME}/ivanov/вкс.mp4", 0.25), ("admin", "Проекты/итоги.mp4", 0.5),
                            ("petrov", f"{HOME}/petrov/личное.mp4", 1.0)):
-        web.trail.write("run", "", file=file, uploaded_by=by, reason="new", status="ok", audio_sec=600, cost=cost)
+        web.core.trail.write("run", "", file=file, uploaded_by=by, reason="new", status="ok", audio_sec=600, cost=cost)
 
     def basic(login, password=PASSWORD):
         client = TestClient(web.app)
@@ -4216,12 +4227,12 @@ def test_costs_are_for_the_service_admin_only(site):
     others = {"администратор папки": ivanov, "администратор папки логином и паролем": basic("ivanov"),
               "ключ администратора папки": keyed(web, ivanov)[0],
               "читатель": petrov, "читатель логином и паролем": basic("petrov"), "ключ читателя": keyed(web, petrov)[0]}
-    for group, detail in ((by_key, web.BY_KEY_ONLY_READS), (others, web.NO_COSTS)):
+    for group, detail in ((by_key, web.access.BY_KEY_ONLY_READS), (others, web.access.NO_COSTS)):
         for who, client in group.items():
             for path in COSTS:
                 refused = client.get(path, params={"bucket": "month"})
                 assert refused.status_code == 403 and refused.json() == {"detail": detail}, f"{who}: {path}"
-    assert web.NO_COSTS == "расходы видит только администратор сервиса"
+    assert web.access.NO_COSTS == "расходы видит только администратор сервиса"
     assert TestClient(web.app).get("/api/v1/costs").status_code == 401
     # ключа «с управлением» не-администратору не выпустить: другого пути к расходам у него нет
     assert ivanov.post("/api/keys", json={"name": "с управлением", "days": 30, "manage": True}).status_code == 403
@@ -4231,7 +4242,7 @@ def test_costs_are_for_the_service_admin_only(site):
 def test_costs_are_open_in_personal_mode(tmp_path):
     """Личный режим: входа нет, владелец один — расходы открыты, как и всё остальное."""
     with running(tmp_path, mode="personal") as (web, client):
-        web.trail.write("run", "", file="вкс.mp4", reason="new", status="ok", audio_sec=600, cost=0.25)
+        web.core.trail.write("run", "", file="вкс.mp4", reason="new", status="ok", audio_sec=600, cost=0.25)
         for path in COSTS:
             assert client.get(path).status_code == 200, path
         report = client.get("/api/v1/costs").json()
@@ -4265,14 +4276,14 @@ def test_nobody_but_the_service_admin_sees_what_a_record_cost(site):
     admin.post("/api/access", json={"dir": "Проекты", "login": "petrov", "read": "tree"})
     file = "Проекты/вкс.mp4"
     voiced(web, file)
-    web.service.ledger.put({**web.service.ledger.get(file), "title": "Итоги квартала", "speech_model": "elevenlabs/scribe-v2",
+    web.core.service.ledger.put({**web.core.service.ledger.get(file), "title": "Итоги квартала", "speech_model": "elevenlabs/scribe-v2",
                             "cost": {"RUB": 12.5, "USD": 0.25},
                             "cost_details": [{"stage": "speech", "currency": "RUB", "cost": 12.5}],
                             "cost_models": [{"stage": "speech", "model": "elevenlabs/scribe-v2", "currency": "RUB",
                                              "cost": 12.5}],
                             "cost_providers": [{"provider": "RouterAI", "currency": "RUB", "cost": 12.5}]})
-    record = web.service.ledger.get(file)
-    web.trail.run(record, "ivanov", "manual")
+    record = web.core.service.ledger.get(file)
+    web.core.trail.run(record, "ivanov", "manual")
     assert record["runs"] == 2 and record["cost_total"] == {"RUB": 12.5, "USD": 0.5}
     # администратору суммы видны — и проверка их ловит
     assert money_in(admin.get("/api/admin/status").json()) and money_in(admin.get("/api/v1/costs").json())
@@ -4331,13 +4342,13 @@ def test_broken_streamed_upload_is_refused_in_words(site, monkeypatch):
     web, admin, ivanov, _ = staffed(site)
 
     def cut(*_):
-        raise web.ClientDisconnect()
+        raise web.api_v1.ClientDisconnect()
 
-    monkeypatch.setattr(web.upload, "stream_finish", cut)
+    monkeypatch.setattr(web.lifecycle.upload, "stream_finish", cut)
     refused = ivanov.put("/api/v1/upload", params={"dir": f"{HOME}/ivanov", "name": "вкс.mp4"}, content=b"video")
     assert refused.status_code == 400 and refused.json()["detail"].startswith("загрузка оборвалась: ")
-    assert list((web.cfg.inbox / upload.PARTS_DIR).glob("*.part")) == []
-    assert not (web.cfg.inbox / HOME / "ivanov" / "вкс.mp4").exists()
+    assert list((web.core.cfg.inbox / upload.PARTS_DIR).glob("*.part")) == []
+    assert not (web.core.cfg.inbox / HOME / "ivanov" / "вкс.mp4").exists()
 
 
 def test_results_trash_is_emptied_even_when_the_inbox_is_read_only(tmp_path, monkeypatch):
@@ -4358,23 +4369,23 @@ def test_results_trash_is_emptied_even_when_the_inbox_is_read_only(tmp_path, mon
 
     monkeypatch.setattr(folders.shutil, "rmtree", rmtree)
     with running(tmp_path) as (web, client):
-        assert not web.upload_ready and client.get("/api/status").status_code == 200
+        assert not web.core.upload_ready and client.get("/api/status").status_code == 200
         assert olds[0].is_dir() and not olds[1].exists()             # чистка при запуске дошла до корзины результатов
-        why = [line for line in web.log.tail() if "не чистится" in line]
+        why = [line for line in web.core.log.tail() if "не чистится" in line]
         assert len(why) == 1 and why[0].endswith("корзина входной папки не чистится: Read-only file system")
         again = tmp_path / "outbox" / folders.TRASH / "20260102-000000"
         again.mkdir()
         os.utime(again, (long_ago, long_ago))
-        web._clean()
-        web._clean()
+        web.lifecycle._clean()
+        web.lifecycle._clean()
         assert not again.exists()
-        assert len([line for line in web.log.tail() if "не чистится" in line]) == 1      # причина прежняя — строка одна
+        assert len([line for line in web.core.log.tail() if "не чистится" in line]) == 1      # причина прежняя — строка одна
         monkeypatch.setattr(folders.shutil, "rmtree", real)
-        web._clean()
+        web.lifecycle._clean()
         assert not olds[0].exists()
         calls = []
-        monkeypatch.setattr(web, "_clean", lambda: calls.append(1))
-        monkeypatch.setattr(web, "CLEAN_EVERY_SEC", 0.01)
+        monkeypatch.setattr(web.lifecycle, "_clean", lambda: calls.append(1))
+        monkeypatch.setattr(web.lifecycle, "CLEAN_EVERY_SEC", 0.01)
         with TestClient(web.app):               # перезапуск: чистка при запуске и дальше по кругу, а не один раз
             time.sleep(0.3)
         assert len(calls) > 2
@@ -4407,7 +4418,7 @@ def test_admin_sees_the_base_and_the_last_backup_and_a_warning_about_a_network_f
     assert stored["kind"] in ("local", "desktop", "network") and stored["warnings"] == []
     assert ivanov.get("/api/admin/status").status_code == 403
     # копию делает отдельная команда рядом с работающим сервисом — страница узнаёт о ней из базы
-    cfg = dataclasses.replace(web.cfg, backup_dir=tmp_path / "backup")
+    cfg = dataclasses.replace(web.core.cfg, backup_dir=tmp_path / "backup")
     cfg.backup_dir.mkdir()
     made = backup.create(cfg, with_inbox=False, kept=lambda path: True, say=lambda line: None)
     noted = admin.get("/api/admin/status").json()["storage"]["backup"]
@@ -4415,7 +4426,7 @@ def test_admin_sees_the_base_and_the_last_backup_and_a_warning_about_a_network_f
     assert admin.get("/api/admin/journal", params={"kind": "backup"}).json()["events"][0]["file"] == noted["file"]
     assert backup.verify(made["archive"], lambda line: None)["base"]["counts"]["users"] == 2
     # сетевая папка под базой — предупреждение на странице: без путей сервера, с тем, что делать
-    web.storage_warnings[:] = migrate.storage_warnings(web.cfg, {"type": "cifs", "source": "//server/share", "kind": db.NETWORK})
+    web.lifecycle.storage_warnings[:] = migrate.storage_warnings(web.core.cfg, {"type": "cifs", "source": "//server/share", "kind": db.NETWORK})
     warning, = admin.get("/api/admin/status").json()["storage"]["warnings"]
     assert "сетевой папке (cifs)" in warning and "server" not in warning and "локальный диск" in warning
     page = page_source("admin")
@@ -4439,10 +4450,10 @@ def meetings(site):
     for name, day in (("первая", "2026-10-01"), ("вторая", "2026-10-08")):
         rel = f"Планёрки/{name}.mp4"
         recorded(web, rel)
-        web.service.ledger.put({**web.service.ledger.get(rel), "title": f"Планёрка {day}", "record_date": day,
+        web.core.service.ledger.put({**web.core.service.ledger.get(rel), "title": f"Планёрка {day}", "record_date": day,
                                 "first_done_at": f"{day}T12:00:00+03:00", "finished_at": f"{day}T12:00:00+03:00"})
     set_protocol(web, "Планёрки/первая.mp4", TASKS_MD)
-    block = registry.block(web.service.ledger.get("Планёрки/первая.mp4"), marks.merged(external.tasks(TASKS_MD), {}))
+    block = registry.block(web.core.service.ledger.get("Планёрки/первая.mp4"), marks.merged(external.tasks(TASKS_MD), {}))
     path = set_protocol(web, "Планёрки/вторая.mp4", "<!-- протокол: тест -->\n\n# Протокол\n\nРешили.\n\n" + block)
     os.utime(path, (1_700_000_000, 1_700_000_000))          # протокол собран давно
     mindmap.write_for(path)
@@ -4459,11 +4470,11 @@ def test_owner_removes_the_block_and_it_is_gone_from_everything_built_from_the_p
 
     # читатель папки убрать не может; хозяин — может, без пересборки и вызова модели
     refused = petrov.post("/api/record/previous_tasks", json={"file": rel, "on": False})
-    assert refused.status_code == 403 and refused.json()["detail"] == web.NO_PREV_EDIT and PREV in path.read_text("utf-8")
+    assert refused.status_code == 403 and refused.json()["detail"] == web.tasks.NO_PREV_EDIT and PREV in path.read_text("utf-8")
     done = ivanov.post("/api/record/previous_tasks", json={"file": rel, "on": False})
     assert done.json() == {"ok": True, "file": rel, "present": False, "removed": True, "series": True}
     text = path.read_text(encoding="utf-8")
-    assert text == "<!-- протокол: тест -->\n\n# Протокол\n\nРешили.\n" and web.service.queue == []
+    assert text == "<!-- протокол: тест -->\n\n# Протокол\n\nРешили.\n" and web.core.service.queue == []
     assert path.stat().st_mtime == 1_700_000_000           # правка — не пересборка: время сборки протокола прежнее
     assert "Поручения прошлого совещания" not in path.with_name("вторая.map.html").read_text(encoding="utf-8")
     assert "Поручения прошлого" not in ivanov.get("/api/map", params={"file": rel}).text
@@ -4473,7 +4484,7 @@ def test_owner_removes_the_block_and_it_is_gone_from_everything_built_from_the_p
     assert not any("Поручения прошлого" in p.text for p in exported.paragraphs)
     assert ivanov.get("/api/search", params={"q": "Незакрытые поручения"}).json()["files"] == []
     assert ivanov.get("/api/result", params={"file": rel}).json()["previous"]["removed"] is True
-    assert web.service.ledger.get(rel)["prev_tasks_removed"] is True
+    assert web.core.service.ledger.get(rel)["prev_tasks_removed"] is True
     # повтор ничего не меняет и в журнал второй раз не пишется
     assert ivanov.post("/api/record/previous_tasks", json={"file": rel, "on": False}).json()["removed"] is True
     events = [e for e in admin.get("/api/admin/journal").json()["events"] if e["kind"] == "previous_tasks"]
@@ -4486,7 +4497,7 @@ def test_owner_removes_the_block_and_it_is_gone_from_everything_built_from_the_p
     assert path.stat().st_mtime == 1_700_000_000
     assert "Поручения прошлого совещания" in ivanov.get("/api/map", params={"file": rel}).text
     assert ivanov.get("/api/search", params={"q": "Незакрытые поручения"}).json()["files"][0]["file"] == rel
-    assert "prev_tasks_removed" not in web.service.ledger.get(rel)
+    assert "prev_tasks_removed" not in web.core.service.ledger.get(rel)
 
 
 def test_removed_block_is_not_brought_back_by_a_rebuild_and_comes_back_by_the_button_only(site):
@@ -4496,16 +4507,16 @@ def test_removed_block_is_not_brought_back_by_a_rebuild_and_comes_back_by_the_bu
     assert robot.post("/api/v1/previous_tasks", params={"file": rel, "on": False}).json()["removed"] is True
     # пересборка: обработчик берёт отметку из строки журнала и раздел не собирает
     said = []
-    tail = pipeline.previous_tasks(web.cfg, rel, web.service.ledger.history(), "2026-10-08", "", said.append, series=True)
+    tail = pipeline.previous_tasks(web.core.cfg, rel, web.core.service.ledger.history(), "2026-10-08", "", said.append, series=True)
     assert tail == "" and said == ["раздел «Поручения прошлого совещания» у этой записи убран вручную — не добавляю"]
-    web.service.ledger.put({**web.service.ledger.get(rel), "finished_at": "2026-10-10T12:00:00+03:00"})
-    assert web.service.ledger.get(rel)["prev_tasks_removed"] is True
+    web.core.service.ledger.put({**web.core.service.ledger.get(rel), "finished_at": "2026-10-10T12:00:00+03:00"})
+    assert web.core.service.ledger.get(rel)["prev_tasks_removed"] is True
 
     # пока протокол собирается, кнопка не трогает файл
-    web.service.enqueue_manual(rel, None, False, "ivanov", "rebuild")
+    web.core.service.enqueue_manual(rel, None, False, "ivanov", "rebuild")
     busy = ivanov.post("/api/record/previous_tasks", json={"file": rel, "on": True})
     assert busy.status_code == 409 and "собирается" in busy.json()["detail"]
-    web.service.queue.clear()
+    web.core.service.queue.clear()
 
     # у первой записи все поручения закрыты отметками — возвращать нечего: раздела нет, отметка снята
     first = ivanov.get("/api/result", params={"file": "Планёрки/первая.mp4"}).json()["tasks"]
@@ -4527,7 +4538,7 @@ def test_block_comes_back_only_in_a_series_folder_and_the_root_has_neither(site)
     refused = ivanov.post("/api/record/previous_tasks", json={"file": rel, "on": True})
     assert refused.status_code == 409 and "не отмечена как серия" in refused.json()["detail"]
     assert ivanov.get("/api/result", params={"file": rel}).json()["previous"]["series"] is False
-    assert web.service.series(rel) is False                 # и обработчик спросит то же самое
+    assert web.core.service.series(rel) is False                 # и обработчик спросит то же самое
     ivanov.post("/api/folder/series", json={"dir": "Планёрки", "on": True})
     assert ivanov.post("/api/record/previous_tasks", json={"file": rel, "on": True}).json()["present"] is True
 
@@ -4536,17 +4547,17 @@ def test_block_comes_back_only_in_a_series_folder_and_the_root_has_neither(site)
     task = {"who": "Иванов", "absent": False, "task": "Сверить склад", "due": None, "due_text": None, "status": None,
             "at": None, "at_sec": None, "done": False}
     root = set_protocol(web, "разное.mp4", "# Протокол\n\nДемонстрация.\n\n"
-                        + registry.block(web.service.ledger.get("Планёрки/первая.mp4"), [task]))
+                        + registry.block(web.core.service.ledger.get("Планёрки/первая.mp4"), [task]))
     assert admin.get("/api/result", params={"file": "разное.mp4"}).json()["previous"] == {
         "present": True, "removed": False, "series": False, "title": "Поручения прошлого совещания"}
     assert admin.post("/api/record/previous_tasks", json={"file": "разное.mp4", "on": False}).json()["present"] is False
     assert root.read_text(encoding="utf-8") == "# Протокол\n\nДемонстрация.\n"
     refused = admin.post("/api/record/previous_tasks", json={"file": "разное.mp4", "on": True})
     assert refused.status_code == 409 and "в корне" in refused.json()["detail"]
-    assert web.service.series("разное.mp4") is False
+    assert web.core.service.series("разное.mp4") is False
     # у корня переключателя нет
     assert admin.get("/api/browse").json()["series"] is False
-    assert admin.post("/api/folder/series", json={"dir": "", "on": True}).json()["detail"] == web.ROOT_NO_SERIES
+    assert admin.post("/api/folder/series", json={"dir": "", "on": True}).json()["detail"] == web.tasks.ROOT_NO_SERIES
     assert admin.post("/api/v1/series", params={"dir": "/", "on": True}).status_code == 400
 
 
@@ -4555,7 +4566,7 @@ def test_series_switch_follows_the_rights_and_is_seen_by_every_reader(site):
     admin.post("/api/folder", json={"dir": "Планёрки/Архив"})
     assert petrov.get("/api/browse", params={"path": "Планёрки"}).json()["series"] is True    # новая папка — серия
     refused = petrov.post("/api/folder/series", json={"dir": "Планёрки", "on": False})
-    assert refused.status_code == 403 and refused.json()["detail"] == web.NO_SERIES_EDIT
+    assert refused.status_code == 403 and refused.json()["detail"] == web.tasks.NO_SERIES_EDIT
     assert petrov.post("/api/folder/series", json={"dir": "Нет такой", "on": False}).status_code == 404
     robot, _ = keyed(web, ivanov)
     assert robot.post("/api/v1/series", params={"dir": "Планёрки", "on": False}).json()["series"] is False
@@ -4570,9 +4581,9 @@ def test_series_switch_follows_the_rights_and_is_seen_by_every_reader(site):
     assert admin.post("/api/admin/folders/rename", json={"dir": "Планёрки", "name": "Летучки"}).status_code == 200
     assert ivanov.get("/api/browse", params={"path": "Летучки"}).json()["series"] is False
     assert ivanov.get("/api/browse", params={"path": "Летучки/Архив"}).json()["series"] is True
-    assert web.serial.off() == {"Летучки"}
+    assert web.core.serial.off() == {"Летучки"}
     assert admin.post("/api/admin/folders/delete", json={"dir": "Летучки"}).json()["ok"]
-    assert web.serial.off() == set()
+    assert web.core.serial.off() == set()
     admin.post("/api/folder", json={"dir": "Летучки"})
     assert admin.get("/api/browse", params={"path": "Летучки"}).json()["series"] is True
 
@@ -4597,7 +4608,7 @@ def test_folder_named_like_the_results_of_a_record_is_refused(site):
     for answer in (admin.post("/api/folder", json={"dir": "Проекты/вкс"}),
                    admin.post("/api/admin/folders/rename", json={"dir": "Проекты/Архив", "name": "вкс"})):
         assert answer.status_code == 409 and answer.json()["detail"] == folders.RESULTS_TAKEN
-    assert not (web.cfg.inbox / "Проекты/вкс").exists() and (web.cfg.inbox / "Проекты/Архив").is_dir()
+    assert not (web.core.cfg.inbox / "Проекты/вкс").exists() and (web.core.cfg.inbox / "Проекты/Архив").is_dir()
     assert admin.post("/api/folder", json={"dir": "Проекты/вкс 2"}).status_code == 200
 
 
@@ -4607,14 +4618,14 @@ def test_upload_under_the_path_of_a_record_whose_source_was_removed_by_hand_is_r
     web, _, ivanov, _ = staffed(site)
     home = f"{HOME}/ivanov"
     recorded(web, f"{home}/планёрка.mp3")
-    (web.cfg.inbox / home / "планёрка.mp3").unlink()
+    (web.core.cfg.inbox / home / "планёрка.mp3").unlink()
     file = {"name": "планёрка.mp3", "size": 5, "stamp": "1", "dir": home}
     for answer in (ivanov.get("/api/upload", params=file),
                    ivanov.put("/api/upload", params={**file, "offset": 0}, content=b"12345"),
                    ivanov.put("/api/v1/upload", params={"dir": home, "name": "планёрка.mp3"}, content=b"12345")):
-        assert answer.status_code == 409 and answer.json()["detail"] == web.UPLOAD_KNOWN
-    assert not (web.cfg.inbox / home / "планёрка.mp3").exists()
-    assert not list((web.cfg.inbox / upload.PARTS_DIR).glob("*.part"))
+        assert answer.status_code == 409 and answer.json()["detail"] == web.browse.UPLOAD_KNOWN
+    assert not (web.core.cfg.inbox / home / "планёрка.mp3").exists()
+    assert not list((web.core.cfg.inbox / upload.PARTS_DIR).glob("*.part"))
     assert ivanov.put("/api/upload", params={**file, "name": "планёрка 2.mp3", "offset": 0}, content=b"12345").json()["done"]
 
 
@@ -4628,9 +4639,9 @@ def test_upload_finished_after_its_folder_was_renamed_or_deleted_is_refused(site
         assert act().status_code == 200
         late = admin.put("/api/upload", params={**file, "offset": 5}, content=b"67890")
         assert late.status_code == 409 and late.json()["detail"] == upload.FOLDER_GONE, name
-        assert not (web.cfg.inbox / name).exists(), name
-    assert not list(web.cfg.inbox.rglob("вкс.mp3"))
-    assert not [e for e in web.trail.read() if e["kind"] == "upload"]
+        assert not (web.core.cfg.inbox / name).exists(), name
+    assert not list(web.core.cfg.inbox.rglob("вкс.mp3"))
+    assert not [e for e in web.core.trail.read() if e["kind"] == "upload"]
 
 
 # ---------- выйти везде, завершить входы, пароль и ключи, заявка без подсказок, MAIL_DOMAINS ----------
@@ -4649,7 +4660,7 @@ def test_sign_out_everywhere_keeps_this_browser_and_ends_the_others(site):
     other = enter(web, "admin", ADMIN_PASSWORD)                      # admin из .env — так же
     assert admin.post("/api/logout/all").status_code == 200
     assert admin.get("/api/admin/status").status_code == 200 and other.get("/api/admin/status").status_code == 401
-    assert [e["by"] for e in web.trail.read() if e["kind"] == "logout_all"] == ["ivanov", "admin"]
+    assert [e["by"] for e in web.core.trail.read() if e["kind"] == "logout_all"] == ["ivanov", "admin"]
     assert TestClient(web.app).post("/api/logout/all").status_code == 401
 
 
@@ -4665,7 +4676,7 @@ def test_service_admin_ends_all_sessions_of_a_user(site):
     for login in ("nobody", "admin"):
         missing = admin.post("/api/admin/users/sessions", json={"login": login})
         assert missing.status_code == 404 and missing.json()["detail"] == "такого пользователя нет"
-    event = [e for e in web.trail.read() if e["kind"] == "sessions_end"][-1]
+    event = [e for e in web.core.trail.read() if e["kind"] == "sessions_end"][-1]
     assert (event["by"], event["login"]) == ("admin", "ivanov")
 
 
@@ -4695,8 +4706,8 @@ def test_password_change_revokes_the_keys_when_asked(site):
     ivanov = enter(web, "ivanov", "новый-пароль-1")
     changed = ivanov.post("/api/password", json={"old": "новый-пароль-1", "new": "новый-пароль-2", "revoke_keys": True})
     assert changed.json() == {"ok": True, "keys_revoked": 2}
-    assert robot.get("/api/v1/whoami").status_code == 401 and web.people.keys("ivanov") == []
-    assert [e.get("keys") for e in web.trail.read() if e["kind"] == "password"] == [None, 2]
+    assert robot.get("/api/v1/whoami").status_code == 401 and web.core.people.keys("ivanov") == []
+    assert [e.get("keys") for e in web.core.trail.read() if e["kind"] == "password"] == [None, 2]
 
 
 def test_password_by_link_revokes_the_keys_when_asked(office):
@@ -4711,7 +4722,7 @@ def test_password_by_link_revokes_the_keys_when_asked(office):
     done = guest.post("/api/set-password", json={"token": token, "password": "пароль-из-письма", "revoke_keys": True})
     assert done.json() == {"ok": True, "login": "ivanov", "keys_revoked": 1}
     assert robot.get("/api/v1/whoami").status_code == 401
-    assert [e.get("keys") for e in web.trail.read() if e["kind"] == "password_link"] == [1]
+    assert [e.get("keys") for e in web.core.trail.read() if e["kind"] == "password_link"] == [1]
 
 
 def test_request_form_does_not_tell_which_logins_and_addresses_are_taken(office):
@@ -4738,18 +4749,18 @@ def test_request_form_does_not_tell_which_logins_and_addresses_are_taken(office)
 def test_mail_without_mail_domains_is_warned_about_at_start_and_in_the_mail_block(office):
     web, guest, admin, post = office
     assert admin.get("/api/admin/requests").json()["mail"]["warnings"] == [mail.OPEN_DOMAINS]
-    assert any("ВНИМАНИЕ!!! НЕБЕЗОПАСНО" in line and "MAIL_DOMAINS" in line for line in web.log.lines)
+    assert any("ВНИМАНИЕ!!! НЕБЕЗОПАСНО" in line and "MAIL_DOMAINS" in line for line in web.core.log.lines)
 
 
 def test_request_address_must_be_from_mail_domains(tmp_path, monkeypatch):
     with running(tmp_path, extra={**MAIL_ENV, "MAIL_DOMAINS": "example.test"}) as (web, guest):
-        monkeypatch.setattr(web.mail, "send", Post().send)
+        monkeypatch.setattr(web.core.mail, "send", Post().send)
         refused = guest.post("/api/request", json={**CLAIM, "email": "x@gmail.test"})
         assert refused.status_code == 400 and refused.headers["x-field"] == "email"
         assert "example.test" in refused.json()["detail"]
         assert guest.post("/api/request", json=CLAIM).status_code == 200
         assert guest.get("/api/admin/requests", auth=("admin", ADMIN_PASSWORD)).json()["mail"]["warnings"] == []
-        assert not any("MAIL_DOMAINS" in line and "ВНИМАНИЕ" in line for line in web.log.lines)
+        assert not any("MAIL_DOMAINS" in line and "ВНИМАНИЕ" in line for line in web.core.log.lines)
 
 
 def test_pages_offer_sign_out_everywhere_and_revoking_the_keys():
@@ -4772,9 +4783,9 @@ def test_record_list_says_when_the_source_changed_or_is_missing(site):
     web, admin, ivanov, _ = staffed(site)
     for rel in ("Проекты/изменили.mp4", "Проекты/убрали.mp4", "Проекты/на месте.mp4"):
         recorded(web, rel)
-    web.service.ledger.amend("Проекты/изменили.mp4", source_state="changed")
-    (web.cfg.inbox / "Проекты/убрали.mp4").unlink()
-    web.service.scan_once()
+    web.core.service.ledger.amend("Проекты/изменили.mp4", source_state="changed")
+    (web.core.cfg.inbox / "Проекты/убрали.mp4").unlink()
+    web.core.service.scan_once()
     shown = {f["name"]: f["source"] for f in admin.get("/api/browse", params={"path": "Проекты"}).json()["files"]}
     assert shown == {"изменили.mp4": "changed", "убрали.mp4": "missing", "на месте.mp4": None}
     assert admin.get("/api/v1/record", params={"file": "Проекты/убрали.mp4"}).json()["source"] == "missing"
@@ -4786,12 +4797,12 @@ def test_file_held_by_the_scanner_is_shown_as_held_and_not_copying(site):
     """Файл, который сам в обработку не пойдёт (похож на недокопированный, копия готовой записи), человек видит
     отложенным, с причиной словами, — без имени записи, копией которой он оказался: она может быть чужой."""
     web, admin, _, _ = staffed(site)
-    (web.cfg.inbox / "Проекты").mkdir()
-    (web.cfg.inbox / "Проекты/копия.mp4").write_bytes(b"video")
-    web.service.scan_once()
-    web.service.pending["Проекты/копия.mp4"].held = "копия записи Снабжение/вкс.mp4 — запустите вручную или уберите файл"
+    (web.core.cfg.inbox / "Проекты").mkdir()
+    (web.core.cfg.inbox / "Проекты/копия.mp4").write_bytes(b"video")
+    web.core.service.scan_once()
+    web.core.service.pending["Проекты/копия.mp4"].held = "копия записи Снабжение/вкс.mp4 — запустите вручную или уберите файл"
     item, = admin.get("/api/browse", params={"path": "Проекты"}).json()["pending"]
-    assert item["state"] == "held" and item["note"] == web.HELD_DECISION and "Снабжение" not in json.dumps(item)
+    assert item["state"] == "held" and item["note"] == web.browse.HELD_DECISION and "Снабжение" not in json.dumps(item)
     watching, = admin.get("/api/admin/status").json()["watching"]
     assert "Снабжение/вкс.mp4" in watching["held"]                      # администратору — подробно
     assert '"held"' in page_source("index") and "отложен:" in page_source("admin")
@@ -4817,13 +4828,13 @@ def test_volumes_are_checked_at_start_and_daily_with_a_warning_on_the_page(tmp_p
         warning, = admin.get("/api/admin/status").json()["volumes"]["warnings"]
         assert warning.startswith("папка шаблонов не подключена с хоста") and "HOST_PROMPTS" in warning
         assert prompts not in warning
-        assert sum("ВНИМАНИЕ: папка шаблонов не подключена" in line for line in web.log.lines) == 1
-        web._check_volumes()                                    # суточная проверка: то же — строки нет
-        assert sum("ВНИМАНИЕ: папка шаблонов не подключена" in line for line in web.log.lines) == 1
+        assert sum("ВНИМАНИЕ: папка шаблонов не подключена" in line for line in web.core.log.lines) == 1
+        web.lifecycle._check_volumes()                                    # суточная проверка: то же — строки нет
+        assert sum("ВНИМАНИЕ: папка шаблонов не подключена" in line for line in web.core.log.lines) == 1
         monkeypatch.setattr(migrate, "volume_warnings", lambda cfg: [])
-        web._check_volumes()
+        web.lifecycle._check_volumes()
         assert admin.get("/api/admin/status").json()["volumes"]["warnings"] == []
-        assert any("тома установки подключены" in line for line in web.log.lines)
+        assert any("тома установки подключены" in line for line in web.core.log.lines)
     assert "state.volumes.warnings" in page_source("admin")
 
 
@@ -4833,13 +4844,13 @@ def test_service_marks_itself_alive_in_the_base(site):
     web, client = site
     admin = enter(web, "admin", ADMIN_PASSWORD)
     deadline = time.monotonic() + 5
-    while web.base.noted(web.ALIVE) is None and time.monotonic() < deadline:
+    while web.core.base.noted(web.lifecycle.ALIVE) is None and time.monotonic() < deadline:
         time.sleep(0.05)
-    beat = json.loads(web.base.noted(web.ALIVE))
-    assert beat["version"] == (ROOT / "VERSION").read_text().strip() and beat["workers"] == beat["of"] == web.cfg.workers
+    beat = json.loads(web.core.base.noted(web.lifecycle.ALIVE))
+    assert beat["version"] == (ROOT / "VERSION").read_text().strip() and beat["workers"] == beat["of"] == web.core.cfg.workers
     shown = admin.get("/api/admin/status").json()["heartbeat"]
-    assert shown["at"] == beat["at"] and 0 <= shown["ago_sec"] < 60 and shown["every_sec"] == web.HEARTBEAT_SEC
-    assert shown["started"] == web.started_at and shown["uptime_sec"] >= 0
+    assert shown["at"] == beat["at"] and 0 <= shown["ago_sec"] < 60 and shown["every_sec"] == web.lifecycle.HEARTBEAT_SEC
+    assert shown["started"] == web.lifecycle.started_at and shown["uptime_sec"] >= 0
     assert "beatChip(state.heartbeat)" in page_source("admin")
 
 
@@ -4851,7 +4862,7 @@ def test_names_known_in_the_decomposed_form_are_composed_once_at_start(tmp_path)
     with running(tmp_path) as (web, client):
         recorded(web, f"{folder}/вкс.mp4")
     with running(tmp_path) as (web, client):
-        assert list(web.service.ledger.records) == ["Отчёт й/вкс.mp4"]
+        assert list(web.core.service.ledger.records) == ["Отчёт й/вкс.mp4"]
         admin = enter(web, "admin", ADMIN_PASSWORD)
         assert [f["name"] for f in admin.get("/api/browse", params={"path": "Отчёт й"}).json()["files"]] == ["вкс.mp4"]
         assert any(e["kind"] == "folder_rename" and e["to"] == "Отчёт й"
@@ -4888,9 +4899,9 @@ def test_signed_names_join_the_folder_dictionary_without_a_rebuild(site):
     assert [p["name"] for p in roster] == ["Ершова Лидия Марковна", "Тихонов Павел Ильич", "Юдина Анна"]
 
     # пересборка не запускается — ни этой записи, ни соседней; протоколы папки не помечаются устаревшими
-    assert web.service.queue == [] and not web.service.running
+    assert web.core.service.queue == [] and not web.core.service.running
     assert ivanov.get("/api/result", params={"file": "Проекты/вторая.mp4", "kind": "summary"}).json()["dict_newer"] is False
-    events = [e for e in web.trail.read() if e["kind"] == "names"]
+    events = [e for e in web.core.trail.read() if e["kind"] == "names"]
     assert [e["dictionary"] for e in events] == [1, 1, 0] and all("Тихонов" not in json.dumps(e, ensure_ascii=False) for e in events)
     assert "в словарь папки добавлено" in page_source("admin")
 
@@ -4903,7 +4914,7 @@ def test_signed_names_join_the_folder_dictionary_without_a_rebuild(site):
     root = voiced(web, "в корне.mp4")
     signed = admin.post("/api/admin/names", json={"file": root, "parts": {"1": {"S1": "Тихонов Павел Ильич"}}})
     assert signed.status_code == 200 and signed.json()["dictionary_added"] == []
-    assert web.words.get(web.dictionary.FOLDERS, "")["people"] == []
+    assert web.core.words.get(web.core.dictionary.FOLDERS, "")["people"] == []
 
 
 # ---------- администратору: резервная копия из сервиса ----------
@@ -4911,7 +4922,7 @@ def test_signed_names_join_the_folder_dictionary_without_a_rebuild(site):
 def copy_done(web, timeout=30.0):
     """Копия, которую сервис делает в фоне, закончилась — удачно или нет."""
     end = time.monotonic() + timeout
-    while web.backup_job is not None:
+    while web.lifecycle.backup_job is not None:
         assert time.monotonic() < end, "копия не закончилась"
         time.sleep(0.02)
 
@@ -4941,11 +4952,11 @@ def test_backup_schedule_is_checked_saved_and_shown_on_the_page(tmp_path):
         assert shown["plan"]["by"] == "admin" and shown["plan"]["at"]
         nxt = datetime.datetime.fromisoformat(shown["next"])
         assert (nxt.weekday(), nxt.hour, nxt.minute) == (6, 3, 0) and nxt > datetime.datetime.now().astimezone()
-        assert web.trail.actions(kind="backup_plan")[0]["plan"]["keep"] == 3
-        assert any("расписание резервной копии" in line for line in web.log.tail())
+        assert web.core.trail.actions(kind="backup_plan")[0]["plan"]["keep"] == 3
+        assert any("расписание резервной копии" in line for line in web.core.log.tail())
         assert admin.post("/api/admin/backup/plan", json={"on": False, "time": "03:00"}).json()["backups"]["next"] is None
     with backed(tmp_path) as (web, _):                                   # после перезапуска — то же расписание
-        assert web.options.backup_plan()["on"] is False and web.options.backup_plan()["by"] == "admin"
+        assert web.core.options.backup_plan()["on"] is False and web.core.options.backup_plan()["by"] == "admin"
 
 
 def test_copy_now_goes_in_the_background_one_at_a_time_and_its_outcome_is_on_the_page(tmp_path, monkeypatch):
@@ -4954,11 +4965,11 @@ def test_copy_now_goes_in_the_background_one_at_a_time_and_its_outcome_is_on_the
         admin.post("/api/login", json={"login": "admin", "password": ADMIN_PASSWORD})
         admin.post("/api/admin/backup/plan", json={"on": False, "time": "03:00", "inbox": False, "keep": 1})
         go, real = threading.Event(), backup.create
-        monkeypatch.setattr(web.backup, "create", lambda *a, **kw: go.wait(10) and real(*a, **kw))
+        monkeypatch.setattr(web.lifecycle.backup, "create", lambda *a, **kw: go.wait(10) and real(*a, **kw))
         started = admin.post("/api/admin/backup/now")
         assert started.status_code == 200 and started.json()["backups"]["running"]["by"] == "admin"
         busy = admin.post("/api/admin/backup/now")                       # вторая копия рядом с идущей не начинается
-        assert busy.status_code == 409 and busy.json()["detail"] == web.BACKUP_BUSY
+        assert busy.status_code == 409 and busy.json()["detail"] == web.lifecycle.BACKUP_BUSY
         assert admin.get("/api/admin/status").json()["backups"]["running"]["how"] == backup.PAGE
         go.set()
         copy_done(web)
@@ -4967,7 +4978,7 @@ def test_copy_now_goes_in_the_background_one_at_a_time_and_its_outcome_is_on_the
         assert made["inbox"] is False and made["how"] == backup.PAGE and (tmp_path / "backup" / made["file"]).is_file()
         assert status["backups"]["running"] is None and status["backups"]["failed"] is None
         assert any("резервная копия сделана" in line and made["file"] in line for line in status["log"])
-        assert web.trail.actions(kind="backup")[0]["by"] == "admin"
+        assert web.core.trail.actions(kind="backup")[0]["by"] == "admin"
         # с настройкой «держать одну» вторая копия стирает первую
         time.sleep(1.1)                                                  # имя архива — с точностью до секунды
         admin.post("/api/admin/backup/now")
@@ -4998,16 +5009,16 @@ def test_scheduled_copy_is_made_once_in_its_time_and_the_next_waits_for_the_next
         plan = admin.post("/api/admin/backup/plan", json={"on": True, "time": "03:00", "keep": 2}).json()["backups"]["plan"]
         saved = datetime.datetime.fromisoformat(plan["at"])
         first = backup.upcoming(plan, saved)
-        assert not web._backup_due(saved) and not web._backup_due(first - datetime.timedelta(seconds=1))
-        assert web._backup_due(first + datetime.timedelta(hours=30))         # сервис проспал и это время, и следующее
-        assert client.portal.call(web._backup_tick, first + datetime.timedelta(hours=30)) is True
+        assert not web.lifecycle._backup_due(saved) and not web.lifecycle._backup_due(first - datetime.timedelta(seconds=1))
+        assert web.lifecycle._backup_due(first + datetime.timedelta(hours=30))         # сервис проспал и это время, и следующее
+        assert client.portal.call(web.lifecycle._backup_tick, first + datetime.timedelta(hours=30)) is True
         copy_done(web)
-        made = backup.last(web.base)
-        assert made["how"] == backup.SCHEDULE and web.trail.actions(kind="backup")[0]["by"] == ""
+        made = backup.last(web.core.base)
+        assert made["how"] == backup.SCHEDULE and web.core.trail.actions(kind="backup")[0]["by"] == ""
         # копия есть — до следующего времени по расписанию вторую не делает, пропущенное пачкой не догоняет
         later = datetime.datetime.fromisoformat(made["at"])
-        assert not web._backup_due(later) and client.portal.call(web._backup_tick, later) is False
-        assert web._backup_due(backup.upcoming(plan, later) + datetime.timedelta(minutes=1))
+        assert not web.lifecycle._backup_due(later) and client.portal.call(web.lifecycle._backup_tick, later) is False
+        assert web.lifecycle._backup_due(backup.upcoming(plan, later) + datetime.timedelta(minutes=1))
         assert len(list((tmp_path / "backup").glob("*.tar"))) == 1
 
 
@@ -5017,44 +5028,44 @@ def test_record_taken_off_the_queue_stays_off_after_a_restart_until_it_is_run_by
     file = "Проекты/вкс.mp4"
     with running(tmp_path) as (web, _):
         admin = enter(web, "admin", ADMIN_PASSWORD)
-        web.service._take = lambda: None                                 # очередь никто не разбирает
-        (web.cfg.inbox / "Проекты").mkdir()
-        (web.cfg.inbox / file).write_bytes(b"video" * 1000)
-        web.service.queue.append(watcher.QueueItem(path=file))
+        web.core.service._take = lambda: None                                 # очередь никто не разбирает
+        (web.core.cfg.inbox / "Проекты").mkdir()
+        (web.core.cfg.inbox / file).write_bytes(b"video" * 1000)
+        web.core.service.queue.append(watcher.QueueItem(path=file))
         taken = admin.post("/api/admin/queue/remove", json={"file": file})
         assert taken.status_code == 200 and taken.json() == {"ok": True, "file": file, "remembered": True}
-        assert web.service.queue == []
+        assert web.core.service.queue == []
         again = admin.post("/api/admin/queue/remove", json={"file": file})
-        assert again.status_code == 409 and again.json()["detail"] == web.NOT_QUEUED
-        assert web.trail.actions(kind="queue_remove")[0]["by"] == "admin"
-        assert any("снята из очереди" in line and file in line for line in web.log.tail())
+        assert again.status_code == 409 and again.json()["detail"] == web.processing.NOT_QUEUED
+        assert web.core.trail.actions(kind="queue_remove")[0]["by"] == "admin"
+        assert any("снята из очереди" in line and file in line for line in web.core.log.tail())
         assert [d["path"] for d in admin.get("/api/admin/status").json()["dropped"]] == [file]
     with running(tmp_path) as (web, _):
         admin = enter(web, "admin", ADMIN_PASSWORD)
-        web.service._take = lambda: None
+        web.core.service._take = lambda: None
         for _ in range(2):
-            web.service.scan_once()
-        assert web.service.queue == [] and web.service.pending == {}     # сканер её сам не берёт и после перезапуска
+            web.core.service.scan_once()
+        assert web.core.service.queue == [] and web.core.service.pending == {}     # сканер её сам не берёт и после перезапуска
         assert admin.post("/api/admin/run", json={"file": file}).status_code == 200
-        assert [i.path for i in web.service.queue] == [file] and web.service.dropped == {}
-        assert web.options.dropped() == {}
+        assert [i.path for i in web.core.service.queue] == [file] and web.core.service.dropped == {}
+        assert web.core.options.dropped() == {}
 
 
 def test_run_is_cancelled_by_the_administrator_and_only_a_running_one(site):
     web, admin, ivanov, _ = staffed(site)
     file = "Проекты/вкс.mp4"
     refused = admin.post("/api/admin/queue/cancel", json={"file": file})
-    assert refused.status_code == 409 and refused.json()["detail"] == web.NOT_RUNNING
-    web.service.running.append(job(file))
+    assert refused.status_code == 409 and refused.json()["detail"] == web.processing.NOT_RUNNING
+    web.core.service.running.append(job(file))
     try:
         asked = admin.post("/api/admin/queue/cancel", json={"file": file})
         assert asked.status_code == 200 and asked.json()["cancel"]["by"] == "admin"
         assert admin.get("/api/admin/status").json()["running"][0]["cancel"]["by"] == "admin"
-        assert web.trail.actions(kind="run_cancel")[0]["file"] == file
-        assert any("отменить прогон" in line and file in line for line in web.log.tail())
+        assert web.core.trail.actions(kind="run_cancel")[0]["file"] == file
+        assert any("отменить прогон" in line and file in line for line in web.core.log.tail())
         assert ivanov.post("/api/admin/queue/cancel", json={"file": file}).status_code == 403
     finally:
-        web.service.running.clear()
+        web.core.service.running.clear()
     page = page_source("admin")
     assert "/api/admin/queue/cancel" in page and "/api/admin/queue/remove" in page and "Отменить прогон" in page
 
@@ -5063,18 +5074,18 @@ def test_file_held_for_a_decision_can_be_run_by_hand(site):
     """Копия готовой записи и файл, похожий на недокопированный, ждут решения администратора: сервис пишет
     «запустите вручную». Прежде ручной запуск отвечал «файл ещё дописывается» — запустить было нельзя."""
     web, admin, _, _ = staffed(site)
-    web.service._take = lambda: None
-    (web.cfg.inbox / "Проекты").mkdir()
+    web.core.service._take = lambda: None
+    (web.core.cfg.inbox / "Проекты").mkdir()
     for name in ("копия.mp4", "обрубок.mp4", "копируется.mp4"):
-        (web.cfg.inbox / "Проекты" / name).write_bytes(b"video")
-    web.service.pending.update({
+        (web.core.cfg.inbox / "Проекты" / name).write_bytes(b"video")
+    web.core.service.pending.update({
         "Проекты/копия.mp4": watcher.Pending(size=5, mtime=0, held="копия записи Проекты/вкс.mp4 — запустите вручную"),
         "Проекты/обрубок.mp4": watcher.Pending(size=5, mtime=0, cut="по заголовку WAV в файле 100 байт"),
         "Проекты/копируется.mp4": watcher.Pending(size=5, mtime=0)})
     for name in ("копия.mp4", "обрубок.mp4"):
         assert admin.post("/api/admin/run", json={"file": f"Проекты/{name}"}).status_code == 200, name
     still = admin.post("/api/admin/run", json={"file": "Проекты/копируется.mp4"})
-    assert still.status_code == 409 and still.json()["detail"] == web.STILL_WRITTEN
+    assert still.status_code == 409 and still.json()["detail"] == web.processing.STILL_WRITTEN
 
 
 # ---------- одна проверка пути и один отказ на закрытое ----------
@@ -5103,7 +5114,7 @@ def test_closed_folder_answers_like_a_missing_one_in_every_method_with_dir(site)
     assert reader.status_code == 403 and "право загрузки" in reader.json()["detail"]
     moved = petrov.post("/api/v1/move", params={"file": f"{HOME}/petrov/личное.mp4", "dir": "Проекты"})
     assert moved.status_code == 403
-    assert [p for p in web.cfg.inbox.rglob("запись.mp3")] == []
+    assert [p for p in web.core.cfg.inbox.rglob("запись.mp3")] == []
 
 
 def test_closed_record_answers_like_a_missing_one_in_the_dictionary(site):
@@ -5115,7 +5126,7 @@ def test_closed_record_answers_like_a_missing_one_in_the_dictionary(site):
                 lambda file: ivanov.get("/api/dictionary", params={"file": file})):
         closed, missing = ask("Снабжение/итоги.mp4"), ask("Снабжение/нет такой.mp4")
         assert closed.status_code == missing.status_code == 404 and closed.json() == missing.json()
-        assert closed.json()["detail"] == web.NO_RECORD
+        assert closed.json()["detail"] == web.access.NO_RECORD
 
 
 def test_dots_in_dir_are_refused_with_400_in_dictionaries_and_series_too(site):
@@ -5138,10 +5149,10 @@ def test_owner_returns_a_deleted_record_from_the_trash_as_it_was(site):
     home = f"{HOME}/ivanov"
     file = f"{home}/вкс.mp4"
     recorded(web, file, by="ivanov")
-    web.words.put("records", file, [{"name": "Иванов Иван Иванович", "role": "", "aka": []}], [], "ivanov")
+    web.core.words.put("records", file, [{"name": "Иванов Иван Иванович", "role": "", "aka": []}], [], "ivanov")
     deleted = ivanov.post("/api/record/delete", json={"file": file}).json()
     stamp = deleted["trash"].rpartition("/")[2]
-    assert web.trail.uploaded == {} and web.words.get("records", file)["people"] == []
+    assert web.core.trail.uploaded == {} and web.core.words.get("records", file)["people"] == []
     listed = ivanov.get("/api/trash").json()
     assert listed["keep_days"] == 30
     assert [(i["id"], i["kind"], i["path"], i["by"]) for i in listed["items"]] == [(stamp, "record", file, "ivanov")]
@@ -5152,14 +5163,14 @@ def test_owner_returns_a_deleted_record_from_the_trash_as_it_was(site):
 
     back = ivanov.post("/api/trash/restore", json={"id": stamp})
     assert back.json() == {"ok": True, "kind": "record", "path": file, "records": 1}
-    assert (web.cfg.inbox / file).is_file() and "Решили." in ivanov.get("/api/result", params={"file": file}).json()["text"]
-    assert web.service.ledger.get(file)["runs"] == 1
-    assert web.trail.uploaded == {file: "ivanov"}                              # автор загрузки вернулся
-    assert web.words.get("records", file)["people"][0]["name"] == "Иванов Иван Иванович"
+    assert (web.core.cfg.inbox / file).is_file() and "Решили." in ivanov.get("/api/result", params={"file": file}).json()["text"]
+    assert web.core.service.ledger.get(file)["runs"] == 1
+    assert web.core.trail.uploaded == {file: "ivanov"}                              # автор загрузки вернулся
+    assert web.core.words.get("records", file)["people"][0]["name"] == "Иванов Иван Иванович"
     assert idle(web)                                                         # платной обработки нет
     assert ivanov.get("/api/trash").json()["items"] == []
     assert ivanov.post("/api/trash/restore", json={"id": stamp}).status_code == 404
-    assert web.trail.read()[-1]["kind"] == "record_restore" and web.trail.read()[-1]["by"] == "ivanov"
+    assert web.core.trail.read()[-1]["kind"] == "record_restore" and web.core.trail.read()[-1]["by"] == "ivanov"
     # прогоны снова идут за записью: после переименования расходы — под одним новым названием
     ivanov.post("/api/record/rename", json={"file": file, "name": "Итоги"})
     report = admin.get("/api/admin/report").json()
@@ -5171,7 +5182,7 @@ def test_record_is_not_returned_over_a_new_one_and_the_page_hears_why(site):
     file = f"{HOME}/ivanov/вкс.mp4"
     recorded(web, file)
     stamp = ivanov.post("/api/record/delete", json={"file": file}).json()["trash"].rpartition("/")[2]
-    (web.cfg.inbox / file).write_bytes(b"new")
+    (web.core.cfg.inbox / file).write_bytes(b"new")
     refused = ivanov.post("/api/trash/restore", json={"id": stamp})
     assert refused.status_code == 409 and "на прежнем месте уже есть запись" in refused.json()["detail"]
     assert ivanov.get("/api/trash").json()["items"][0]["id"] == stamp            # осталась в корзине
@@ -5182,7 +5193,7 @@ def test_service_admin_returns_a_deleted_folder_with_its_rights(site):
     admin.post("/api/folder", json={"dir": "Проекты"})
     admin.post("/api/access", json={"dir": "Проекты", "login": "ivanov", "manage": "tree"})
     recorded(web, "Проекты/вкс.mp4", by="admin")
-    web.words.put("folders", "Проекты", [], [{"term": "ВКС", "meaning": "видеосвязь"}], "admin")
+    web.core.words.put("folders", "Проекты", [], [{"term": "ВКС", "meaning": "видеосвязь"}], "admin")
     stamp = admin.post("/api/admin/folders/delete", json={"dir": "Проекты"}).json()["trash"].rpartition("/")[2]
     assert ivanov.get("/api/trash").json()["items"] == []                      # папку возвращает администратор сервиса
     assert ivanov.post("/api/trash/restore", json={"id": stamp}).status_code == 404
@@ -5191,9 +5202,9 @@ def test_service_admin_returns_a_deleted_folder_with_its_rights(site):
     back = admin.post("/api/trash/restore", json={"id": stamp}).json()
     assert back == {"ok": True, "kind": "folder", "path": "Проекты", "records": 1}
     assert ivanov.get("/api/result", params={"file": "Проекты/вкс.mp4"}).json()["can_act"]
-    assert web.words.get("folders", "Проекты")["terms"][0]["term"] == "ВКС"
-    assert web.trail.uploaded == {"Проекты/вкс.mp4": "admin"} and idle(web)
-    event = web.trail.read()[-1]
+    assert web.core.words.get("folders", "Проекты")["terms"][0]["term"] == "ВКС"
+    assert web.core.trail.uploaded == {"Проекты/вкс.mp4": "admin"} and idle(web)
+    event = web.core.trail.read()[-1]
     assert (event["kind"], event["folder"], event["records"]) == ("folder_restore", "Проекты", 1)
 
 
@@ -5207,18 +5218,18 @@ def test_due_reminder_goes_once_a_day_to_the_assignee_who_sees_the_folder(office
     web, admin, ivanov, petrov, post = desk(office)
     set_protocol(web, MEETING, TASKS_MD + "| **Орлова** | | | |\n| Прислать акт | завтра | — | — |\n")
     today = datetime.date.today()
-    morning = datetime.datetime.combine(today, datetime.time(web.notify.REMIND_HOUR, 5)).astimezone()
+    morning = datetime.datetime.combine(today, datetime.time(web.lifecycle.notify.REMIND_HOUR, 5)).astimezone()
     for text in ("Согласовать смету", "Прислать акт"):
         assert ivanov.post("/api/record/task", json={"file": MEETING, "key": _task_key(ivanov, text),
                                                      "due": today.isoformat()}).status_code == 200
-    run = lambda at: web.asyncio.run(web._remind_tick(at))
+    run = lambda at: web.core.asyncio.run(web.lifecycle._remind_tick(at))
     # напоминания выключены, пока человек сам не включит: никто не включал — писем нет
     assert ivanov.get("/api/me").json()["notify_due"] is False
     assert run(morning) is True and post.sent == []
-    web.base.note(web.REMINDED, "2000-01-01")
+    web.core.base.note(web.lifecycle.REMINDED, "2000-01-01")
     assert ivanov.post("/api/notify", json={"due": True}).json() == {"ok": True, "notify_ready": True, "notify_due": True}
-    web.people.set_notify("orlova", due=True)
-    assert run(morning.replace(hour=web.notify.REMIND_HOUR - 1)) is False and post.sent == []     # рано
+    web.core.people.set_notify("orlova", due=True)
+    assert run(morning.replace(hour=web.lifecycle.notify.REMIND_HOUR - 1)) is False and post.sent == []     # рано
     assert run(morning) is True
     # Иванов Иван — исполнитель; Орлова — тоже, но папка «Проекты» ей не открыта: письма ей нет
     assert [m.to for m in post.sent] == [["ivanov@example.test"]]
@@ -5228,20 +5239,20 @@ def test_due_reminder_goes_once_a_day_to_the_assignee_who_sees_the_folder(office
     assert "http://podyachiy.test/tasks?who=" in letter.text and "«Напоминания о сроках»" in letter.text
     assert "USD" not in letter.text and "$" not in letter.text
     assert run(morning.replace(hour=20)) is False and len(post.sent) == 1                       # второй раз за день — нет
-    assert web.trail.read()[-1]["kind"] == "due_mail" and web.trail.read()[-1]["to"] == "ivanov"
+    assert web.core.trail.read()[-1]["kind"] == "due_mail" and web.core.trail.read()[-1]["to"] == "ivanov"
 
     # человек отключил напоминания — назавтра письма нет; настройка «запись готова» не тронута
     assert ivanov.post("/api/notify", json={"due": False}).json() == {"ok": True, "notify_ready": True, "notify_due": False}
     assert ivanov.get("/api/me").json()["notify_due"] is False
-    web.base.note(web.REMINDED, "2000-01-01")
+    web.core.base.note(web.lifecycle.REMINDED, "2000-01-01")
     assert run(morning) is True and len(post.sent) == 1
     assert ivanov.post("/api/notify", json={}).status_code == 400
 
 
 def test_reminders_need_mail(site, monkeypatch):
     web, _ = site
-    monkeypatch.setattr(web.mail, "send", lambda *a, **kw: pytest.fail("без почты писем быть не должно"))
-    assert web.asyncio.run(web._remind_tick(datetime.datetime.now().astimezone().replace(hour=23))) is False
+    monkeypatch.setattr(web.core.mail, "send", lambda *a, **kw: pytest.fail("без почты писем быть не должно"))
+    assert web.core.asyncio.run(web.lifecycle._remind_tick(datetime.datetime.now().astimezone().replace(hour=23))) is False
 
 
 def test_tasks_calendar_has_the_same_filters_as_the_table(site):

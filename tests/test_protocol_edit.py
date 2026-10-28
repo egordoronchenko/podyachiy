@@ -48,7 +48,7 @@ def test_owner_edits_the_protocol_and_everything_built_from_it_sees_the_edit(sit
 
     # читатель папки протокол не правит
     refused = save(petrov, "# Чужое", shown["version"])
-    assert refused.status_code == 403 and refused.json()["detail"] == web.NO_PROTOCOL_EDIT
+    assert refused.status_code == 403 and refused.json()["detail"] == web.protocol_edit.NO_PROTOCOL_EDIT
     assert not petrov.get("/api/result", params={"file": REL}).json()["can_edit"]
 
     fixed = PROTOCOL.replace("Обсудили бюджет склада.", "Обсудили бюджет склада и поставку стеллажей.")
@@ -58,7 +58,7 @@ def test_owner_edits_the_protocol_and_everything_built_from_it_sees_the_edit(sit
     assert answer["changed"] and answer["version"] == summarize.digest(path.read_bytes()) != shown["version"]
     assert answer["edited"]["by"] == "ivanov" and answer["edited"]["how"] == "edit"
     # служебная пометка сервиса — на месте, текст — правленый; модель не звали, в очередь ничего не встало
-    assert path.read_text(encoding="utf-8") == HEADER + fixed and web.service.queue == []
+    assert path.read_text(encoding="utf-8") == HEADER + fixed and web.core.service.queue == []
 
     # карта, выгрузка, поиск, запись для ИИ-клиентов и реестр поручений видят правку сразу
     assert "поставку стеллажей" in ivanov.get("/api/map", params={"file": REL}).text
@@ -83,7 +83,7 @@ def test_owner_edits_the_protocol_and_everything_built_from_it_sees_the_edit(sit
     events = [e for e in admin.get("/api/admin/journal").json()["events"] if e["kind"].startswith("protocol_")]
     assert [(e["kind"], e["by"], e["file"]) for e in events] == [("protocol_edit", "ivanov", REL)]
     # признак ручной правки виден и там, откуда пересобирают: у подписей говорящих и в словаре записи
-    # (оба отдают его вместе с names_newer и dict_newer — web._rebuild_state)
+    # (оба отдают его вместе с names_newer и dict_newer — web.common._rebuild_state)
     assert ivanov.get("/api/dictionary", params={"file": REL}).json()["edited"]["by"] == "ivanov"
     again = save(ivanov, fixed, answer["version"]).json()
     assert not again["changed"] and len(ivanov.get("/api/v1/versions", params={"file": REL}).json()["versions"]) == 1
@@ -94,21 +94,21 @@ def test_edit_over_someone_elses_edit_or_a_rebuild_is_refused(site, monkeypatch)
     opened = version(ivanov)                        # оба открыли один и тот же протокол
     assert save(admin, PROTOCOL + "\nДобавил администратор.\n", opened).status_code == 200
     late = save(ivanov, PROTOCOL + "\nДобавил Иванов.\n", opened)
-    assert late.status_code == 409 and late.json()["detail"] == web.PROTOCOL_CHANGED
+    assert late.status_code == 409 and late.json()["detail"] == web.protocol_edit.PROTOCOL_CHANGED
     assert "Добавил администратор." in path.read_text(encoding="utf-8")
     assert "Добавил Иванов." not in path.read_text(encoding="utf-8")
     # без отпечатка правку не принимают
     assert ivanov.post("/api/v1/protocol", json={"file": REL, "text": "# Протокол"}).status_code == 422
 
     # пока протокол собирается, править его нельзя: пересборка запишет поверх
-    monkeypatch.setattr(web.service, "running", [T.job(REL)])
+    monkeypatch.setattr(web.core.service, "running", [T.job(REL)])
     busy = save(ivanov, "# Протокол\n", version(ivanov))
-    assert busy.status_code == 409 and busy.json()["detail"] == web.PROTOCOL_BUSY
-    monkeypatch.setattr(web.service, "running", [])
+    assert busy.status_code == 409 and busy.json()["detail"] == web.protocol_edit.PROTOCOL_BUSY
+    monkeypatch.setattr(web.core.service, "running", [])
 
     # у записи без протокола и у чужой записи — 404
     path.unlink()
-    assert save(ivanov, "# Протокол\n", opened).json()["detail"] == web.NO_PROTOCOL_HERE
+    assert save(ivanov, "# Протокол\n", opened).json()["detail"] == web.protocol_edit.NO_PROTOCOL_HERE
     assert enter(web, "petrov").get("/api/v1/versions", params={"file": "Нет/такой.mp4"}).status_code == 404
 
 
@@ -116,16 +116,16 @@ def test_text_of_an_edit_is_checked(site):
     web, _, ivanov, _, path = desk(site)
     base = version(ivanov)
     long = save(ivanov, "а" * (summarize.EDIT_MAX_CHARS + 1), base)
-    assert long.status_code == 413 and long.json()["detail"] == web.PROTOCOL_TOO_LONG
+    assert long.status_code == 413 and long.json()["detail"] == web.protocol_edit.PROTOCOL_TOO_LONG
     for text in ("", "  \n\n", HEADER):
         empty = save(ivanov, text, base)
-        assert empty.status_code == 400 and empty.json()["detail"] == web.PROTOCOL_EMPTY, repr(text)
+        assert empty.status_code == 400 and empty.json()["detail"] == web.protocol_edit.PROTOCOL_EMPTY, repr(text)
     control = save(ivanov, "# Протокол\x00\n", base)
-    assert control.status_code == 400 and control.json()["detail"] == web.PROTOCOL_NOT_TEXT
+    assert control.status_code == 400 and control.json()["detail"] == web.protocol_edit.PROTOCOL_NOT_TEXT
     # половинка суррогатной пары в JSON — не текст UTF-8
     broken = ivanov.post("/api/v1/protocol", content=json.dumps({"file": REL, "base": base}, ensure_ascii=False)
                          .replace("}", ', "text": "\\ud800"}').encode("utf-8"), headers={"Content-Type": "application/json"})
-    assert broken.status_code == 400 and broken.json()["detail"] == web.PROTOCOL_NOT_TEXT
+    assert broken.status_code == 400 and broken.json()["detail"] == web.protocol_edit.PROTOCOL_NOT_TEXT
     assert path.read_text(encoding="utf-8") == HEADER + PROTOCOL
     # перевод строки Windows и служебная пометка в начале самой правки — не беда: пометка сервиса одна
     done = save(ivanov, "<!-- своя пометка -->\r\n# Протокол\r\n\r\nРешили.\r\n", base)
@@ -155,7 +155,7 @@ def test_any_version_comes_back_as_an_edit_and_can_itself_be_undone(site):
     # версии, которой нет, и метки, которые не метки, — 404
     for stamp in ("20000101-000000", "../планёрка", ""):
         gone = ivanov.post("/api/v1/protocol/restore", json={"file": REL, "stamp": stamp, "base": back.json()["version"]})
-        assert gone.status_code == 404 and gone.json()["detail"] == web.NO_VERSION, stamp
+        assert gone.status_code == 404 and gone.json()["detail"] == web.protocol_edit.NO_VERSION, stamp
         assert ivanov.get("/api/v1/version", params={"file": REL, "stamp": stamp}).status_code == 404
     # возвращает тот же хозяин папки: читателю — 403
     refused = enter(web, "petrov").post("/api/v1/protocol/restore",

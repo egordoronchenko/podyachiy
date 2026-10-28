@@ -32,8 +32,8 @@ def site(tmp_path, monkeypatch):
     """Сервис с почтой — письма никуда не уходят: методы отправки протокола без почты до пути не доходят."""
     with running(tmp_path, extra=MAIL_ENV) as (web, client):
         post = Post()
-        monkeypatch.setattr(web.mail, "send", post.send)
-        monkeypatch.setattr(web.mail, "send_each", post.send_each)
+        monkeypatch.setattr(web.core.mail, "send", post.send)
+        monkeypatch.setattr(web.core.mail, "send_each", post.send_each)
         yield web, client
 
 
@@ -89,13 +89,13 @@ def test_dots_in_any_path_parameter_of_any_method_lead_nowhere(site):
     web, admin, ivanov, _ = filled(site)
     admin.post("/api/access", json={"dir": "Проекты", "login": "ivanov", "manage": "tree"})
     steward, _ = keyed(web, admin, "Claude Code", 30, manage=True)
-    web.service._take = lambda: None                      # очередь не разбирается: прогон ничего не тронет
-    (web.cfg.inbox / "Снабжение" / "Тайное").mkdir()
+    web.core.service._take = lambda: None                      # очередь не разбирается: прогон ничего не тронет
+    (web.core.cfg.inbox / "Снабжение" / "Тайное").mkdir()
     good = {"file": "Проекты/вкс.mp4", "dir": "Проекты", "path": "Проекты"}
     bad = {"file": ["Проекты/../Снабжение/итоги.mp4", "../users.json", "Проекты/./вкс.mp4"],
            "dir": ["Проекты/../Снабжение", "..", "Проекты/../../outbox", "Проекты/./Сметы"]}
     bad["path"] = bad["dir"]
-    before = (sorted(web.service.ledger.records), sorted(p.as_posix() for p in web.cfg.inbox.rglob("*")))
+    before = (sorted(web.core.service.ledger.records), sorted(p.as_posix() for p in web.core.cfg.inbox.rglob("*")))
     methods = [m for m in path_methods(web, PATHS) if m[:2] not in FILTERS]
     assert len(methods) > 40
     for method, path, params in methods:
@@ -109,8 +109,8 @@ def test_dots_in_any_path_parameter_of_any_method_lead_nowhere(site):
                     if client is ivanov:
                         assert "Тайное" not in got.text and "Снабжение/итоги" not in got.text.replace(value, ""), (
                             method, path, name, value, got.text[:200])
-    assert web.service.queue == [] and web.service.running == []
-    assert (sorted(web.service.ledger.records), sorted(p.as_posix() for p in web.cfg.inbox.rglob("*"))) == before
+    assert web.core.service.queue == [] and web.core.service.running == []
+    assert (sorted(web.core.service.ledger.records), sorted(p.as_posix() for p in web.core.cfg.inbox.rglob("*"))) == before
 
 
 # ---------- путь записи в разложенной форме ----------
@@ -126,9 +126,9 @@ def test_record_path_in_the_decomposed_form_finds_the_record_in_every_method_wit
     одинаковых записей: переименование и удаление одной не мешают проверке другой."""
     web, admin, _, _ = filled(site)
     admin.post("/api/folder", json={"dir": "Проекты/Архив"})
-    web.service._take = lambda: None                      # ручной запуск только ставит в очередь
-    lost = {web.NO_RECORD, "такой записи нет или её папка вам не открыта", "файл не найден", web.NOT_QUEUED,
-            web.NOT_RUNNING}
+    web.core.service._take = lambda: None                      # ручной запуск только ставит в очередь
+    lost = {web.access.NO_RECORD, "такой записи нет или её папка вам не открыта", "файл не найден", web.processing.NOT_QUEUED,
+            web.processing.NOT_RUNNING}
     methods = [m for m in path_methods(web, {"file"}) if m[:2] not in FILTERS]
     assert len(methods) >= 30
     for n, (method, path, params) in enumerate(methods):
@@ -137,9 +137,9 @@ def test_record_path_in_the_decomposed_form_finds_the_record_in_every_method_wit
             recorded(web, file)
             set_protocol(web, file, TASKS_MD)
             if path == "/api/admin/queue/remove":
-                web.service.queue.append(watcher.QueueItem(path=file))
+                web.core.service.queue.append(watcher.QueueItem(path=file))
             elif path == "/api/admin/queue/cancel":
-                web.service.running.append(job(file))
+                web.core.service.running.append(job(file))
         extra = {"dir": "Проекты/Архив"} if "dir" in params else {}
         composed = ask(admin, method, path, params, {"file": pair[0], **extra})
         decomposed = ask(admin, method, path, params, {"file": nfd(pair[1]), **extra})
@@ -147,7 +147,7 @@ def test_record_path_in_the_decomposed_form_finds_the_record_in_every_method_wit
         # в составной форме метод запись нашёл: проверка не пустая, дальше — тот же ответ
         assert composed.status_code != 422 and shown(composed)[1] not in lost, (method, path, composed.text[:200])
         assert shown(decomposed) == shown(composed), (method, path, decomposed.text[:200])
-    web.service.running.clear()
+    web.core.service.running.clear()
 
 
 def test_record_known_only_in_the_decomposed_form_is_not_taken_for_its_composed_twin(site):
@@ -160,5 +160,5 @@ def test_record_known_only_in_the_decomposed_form_is_not_taken_for_its_composed_
     recorded(web, nfd(composed))
     gone = admin.post("/api/record/delete", json={"file": nfd(composed)})
     assert gone.status_code == 200, gone.text
-    assert web.service.ledger.get(composed) is not None and web.service.ledger.get(nfd(composed)) is None
+    assert web.core.service.ledger.get(composed) is not None and web.core.service.ledger.get(nfd(composed)) is None
     assert admin.get("/api/result", params={"file": composed}).status_code == 200

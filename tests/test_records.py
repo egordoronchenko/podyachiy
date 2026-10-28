@@ -102,7 +102,7 @@ def test_scanner_does_not_take_a_renamed_or_moved_record_for_a_new_one(tmp_path)
 def test_scanner_waits_while_a_record_is_being_moved(tmp_path):
     cfg, service = setup(tmp_path)
     scan = scanner(cfg, service)
-    scan.scan_lock.acquire()                  # так действие с записью держит замок в web.py
+    scan.scan_lock.acquire()                  # так действие с записью держит замок в app/web
     walk = threading.Thread(target=scan.scan_once)
     walk.start()
     walk.join(0.3)

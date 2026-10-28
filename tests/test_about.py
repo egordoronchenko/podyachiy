@@ -54,7 +54,7 @@ def test_about_is_shown_to_everyone_who_is_in_and_tells_nothing_private(site, mo
         assert "license" not in seen
         assert seen["documents"] == {"license": True, "third-party": True}
     dump = json.dumps(ivanov.get("/api/about").json(), ensure_ascii=False)
-    for private in ("sk-test", "127.0.0.1", "ivanov", "petrov", str(web.cfg.inbox)):
+    for private in ("sk-test", "127.0.0.1", "ivanov", "petrov", str(web.core.cfg.inbox)):
         assert private not in dump, private
 
     licence = ivanov.get("/api/about/license")
@@ -74,7 +74,7 @@ def test_version_is_in_the_health_check_and_whoami(site):
     health = site[1].get("/api/status").json()
     assert health == {"ok": True, "version": VERSION}                        # формат проверки живости прежний, поле добавлено
     assert admin.get("/api/v1/whoami").json()["version"] == VERSION
-    assert any(f"podyachiy {VERSION} запущен" in line for line in web.log.tail_from(0)[1])
+    assert any(f"podyachiy {VERSION} запущен" in line for line in web.core.log.tail_from(0)[1])
 
 
 def test_personal_mode_shows_about_without_login(tmp_path):

@@ -362,7 +362,7 @@ def test_page_shows_what_is_really_in_the_files(site):
     assert text(admin, "meeting", "default").json()["text"] == text_of("meeting.md")
 
     # файл поправили на сервере, в обход страницы: страница показывает то, что лежит в файле
-    path = web.cfg.prompts_dir / "meeting.md"
+    path = web.core.cfg.prompts_dir / "meeting.md"
     path.write_text(text_of("meeting.md").replace("## 5. Задачи", "## 5. Дела"), encoding="utf-8")
     meeting = items(admin)["meeting"]
     assert meeting["state"] == "changed" and meeting["outside"] and meeting["by"] == ""
@@ -370,8 +370,8 @@ def test_page_shows_what_is_really_in_the_files(site):
     assert "## 5. Дела" in text(admin, "meeting").json()["text"] and "## 5. Задачи" in text(admin, "meeting", "default").json()["text"]
     # испорченный руками файл страницу не ломает: показан как есть, с объяснением
     path.write_bytes("Без разделов, в другой кодировке".encode("cp1251"))
-    (web.cfg.prompts_dir / "call.md").unlink()
-    (web.cfg.prompts_dir / "types.json").write_text("{", encoding="utf-8")
+    (web.core.cfg.prompts_dir / "call.md").unlink()
+    (web.core.cfg.prompts_dir / "types.json").write_text("{", encoding="utf-8")
     seen = admin.get("/api/admin/templates")
     assert seen.status_code == 200 and "не читается" in seen.json()["problem"]
     broken = items(admin)
@@ -393,7 +393,7 @@ def test_admin_edits_a_template_gets_warnings_and_rolls_back(site):
     web, admin, ivanov, _ = staffed(site)
     seed(web)
     original = text_of("meeting.md")
-    path = web.cfg.prompts_dir / "meeting.md"
+    path = web.core.cfg.prompts_dir / "meeting.md"
 
     # обязательного нет — отказ, файл не тронут
     for bad, why in (("", "текст пустой"), ("Просто напиши протокол.", "не описаны разделы протокола"),
@@ -416,7 +416,7 @@ def test_admin_edits_a_template_gets_warnings_and_rolls_back(site):
     assert admin.post("/api/admin/templates/save", json={"id": "meeting", "text": edited}).json()["changed"] is False
 
     # обработка берёт уже новый текст — без перезапуска
-    assert "## 5. Что делать дальше" in templates.load_template(web.cfg.prompts_dir, "meeting")[1]
+    assert "## 5. Что делать дальше" in templates.load_template(web.core.cfg.prompts_dir, "meeting")[1]
 
     # откат к прошлой версии: текущий текст сам уходит в прошлые версии
     back = admin.post("/api/admin/templates/restore", json={"id": "meeting", "version": meeting["backups"][0]["id"]}).json()
@@ -445,7 +445,7 @@ def test_admin_edits_a_template_gets_warnings_and_rolls_back(site):
         assert refused.status_code == code and why in refused.json()["detail"], why
     assert path.read_text(encoding="utf-8") == edited
 
-    events = [e for e in web.trail.read() if e["kind"] == "template_save"]
+    events = [e for e in web.core.trail.read() if e["kind"] == "template_save"]
     assert [e["how"] for e in events] == ["page", "backup", "page", "default", "file"]
     assert events[0]["by"] == "admin" and events[0]["file"] == "meeting.md" and events[0]["warnings"] == 1
     assert admin.get("/api/admin/journal").status_code == 200
@@ -456,11 +456,11 @@ def test_glossary_and_the_tasks_for_the_model_are_edited_on_the_same_page(site):
     seed(web)
     done = admin.post("/api/admin/templates/save", json={"id": "glossary", "text": "# наши слова\nСКУД, Ромашка\n"}).json()
     assert done["changed"] and done["warnings"] == []
-    assert templates.load_glossary(web.cfg.prompts_dir).endswith("СКУД, Ромашка")
-    assert speech.glossary_terms(web.cfg.prompts_dir) == ["СКУД", "Ромашка"]
+    assert templates.load_glossary(web.core.cfg.prompts_dir).endswith("СКУД, Ромашка")
+    assert speech.glossary_terms(web.core.cfg.prompts_dir) == ["СКУД", "Ромашка"]
     empty = admin.post("/api/admin/templates/save", json={"id": "glossary", "text": ""}).json()
     assert empty["changed"] and "нет ни одного термина" in empty["warnings"][0]
-    assert templates.load_glossary(web.cfg.prompts_dir) == ""
+    assert templates.load_glossary(web.core.cfg.prompts_dir) == ""
     refused = admin.post("/api/admin/templates/save", json={"id": "triage", "text": "Определи тип записи."})
     assert refused.status_code == 400 and "JSON с полем type" in refused.json()["detail"]
     assert admin.post("/api/admin/templates/restore", json={"id": "glossary", "version": "default"}).json()["changed"]
@@ -490,10 +490,10 @@ def test_admin_adds_an_own_type_and_the_service_offers_it_everywhere(site):
     # ручной запуск и страницы показывают новый тип; разбор получает его в задании
     assert admin.get("/api/admin/status").json()["templates"][key] == "Разбор инцидента"
     assert admin.get("/api/browse").json()["templates"][key] == "Разбор инцидента"
-    assert f"- {key} — Разбор инцидента: {WHEN}" in templates.load_triage(web.cfg.prompts_dir)
+    assert f"- {key} — Разбор инцидента: {WHEN}" in templates.load_triage(web.core.cfg.prompts_dir)
     assert admin.post("/api/admin/run", json={"file": "запись.mp4", "template": key}).status_code == 200
-    assert web.service.queue[0].template == key
-    web.service.queue.clear()
+    assert web.core.service.queue[0].template == key
+    web.core.service.queue.clear()
     assert admin.post("/api/admin/run", json={"file": "запись.mp4", "template": "выдуманный"}).status_code == 400
 
     # правка шаблона своего типа и его описания
@@ -512,10 +512,10 @@ def test_admin_adds_an_own_type_and_the_service_offers_it_everywhere(site):
     assert admin.post("/api/admin/templates/type/delete", json={"key": key}).json()["ok"]
     assert key not in items(admin) and key not in admin.get("/api/admin/status").json()["templates"]
     assert admin.post("/api/admin/run", json={"file": "запись.mp4", "template": key}).status_code == 400
-    assert not (web.cfg.prompts_dir / f"{key}.md").exists()
-    assert own.strip() in templates.backup_text(web.cfg.prompts_dir, f"{key}.md",
-                                                templates.backups(web.cfg.prompts_dir, f"{key}.md")[0]["id"])
-    assert key not in web.options.template_notes()
+    assert not (web.core.cfg.prompts_dir / f"{key}.md").exists()
+    assert own.strip() in templates.backup_text(web.core.cfg.prompts_dir, f"{key}.md",
+                                                templates.backups(web.core.cfg.prompts_dir, f"{key}.md")[0]["id"])
+    assert key not in web.core.options.template_notes()
     assert [k for k in kinds(web) if k.startswith("type_")] == ["type_create", "type_change", "type_delete"]
 
 
@@ -525,14 +525,14 @@ def test_rebuild_of_a_record_made_by_a_removed_type_lets_triage_choose_again(sit
     from tests.test_web import voiced
     key = admin.post("/api/admin/templates/type", json={"title": "Разбор инцидента", "when": WHEN}).json()["key"]
     file = voiced(web, "Проекты/планёрка.mp4")
-    web.service.ledger.put({**web.service.ledger.get(file), "template": key, "template_auto": False,
+    web.core.service.ledger.put({**web.core.service.ledger.get(file), "template": key, "template_auto": False,
                             "template_title": "Разбор инцидента"})
     admin.post("/api/admin/templates/type/delete", json={"key": key})
     # запись осталась как была: тип и его название — в журнале обработки
-    assert web.service.ledger.get(file)["template_title"] == "Разбор инцидента"
+    assert web.core.service.ledger.get(file)["template_title"] == "Разбор инцидента"
     done = admin.post("/api/admin/names", json={"file": file, "parts": {}, "lines": {}, "rebuild": True})
-    assert done.status_code == 200 and web.service.queue[0].template is None       # шаблон выберет разбор
-    assert any("типа «razbor_incidenta» больше нет" in line for line in web.log.tail_from(0)[1])
+    assert done.status_code == 200 and web.core.service.queue[0].template is None       # шаблон выберет разбор
+    assert any("типа «razbor_incidenta» больше нет" in line for line in web.core.log.tail_from(0)[1])
 
 
 def test_templates_are_read_by_a_manage_key_and_changed_only_on_the_page(site):
@@ -541,17 +541,17 @@ def test_templates_are_read_by_a_manage_key_and_changed_only_on_the_page(site):
     steward, _ = keyed(web, admin, "с управлением", 30, manage=True)
     robot, _ = keyed(web, admin, "обычный")
     assert steward.get("/api/admin/templates").status_code == 200 and text(steward, "meeting").status_code == 200
-    assert robot.get("/api/admin/templates").json()["detail"] == web.BY_KEY_ONLY_READS
+    assert robot.get("/api/admin/templates").json()["detail"] == web.access.BY_KEY_ONLY_READS
     original = text_of("meeting.md")
-    for client, detail in ((steward, web.PAGE_ONLY), (robot, web.BY_KEY_ONLY_READS)):
+    for client, detail in ((steward, web.access.PAGE_ONLY), (robot, web.access.BY_KEY_ONLY_READS)):
         for answer in (client.post("/api/admin/templates/save", json={"id": "meeting", "text": "## Раздел"}),
                        client.put("/api/admin/templates/upload", params={"id": "meeting"}, content=b"## x"),
                        client.post("/api/admin/templates/restore", json={"id": "meeting", "version": "default"}),
                        client.post("/api/admin/templates/type", json={"title": "Разбор инцидента", "when": WHEN}),
                        client.post("/api/admin/templates/type/delete", json={"key": "incident"})):
             assert answer.status_code == 403 and answer.json()["detail"] == detail
-    assert (web.cfg.prompts_dir / "meeting.md").read_text(encoding="utf-8") == original
-    assert not (web.cfg.prompts_dir / "types.json").exists()
+    assert (web.core.cfg.prompts_dir / "meeting.md").read_text(encoding="utf-8") == original
+    assert not (web.core.cfg.prompts_dir / "types.json").exists()
 
 
 def test_personal_mode_edits_templates_without_login(tmp_path):
@@ -755,13 +755,13 @@ def test_common_rules_are_one_more_file_on_the_templates_page(site):
     saved = admin.post("/api/admin/templates/save", json={"id": "common", "text": edited}).json()
     assert saved["changed"] and saved["warnings"] == [] and len(items(admin)["common"]["backups"]) == 1
     for key in templates.TEMPLATES:
-        assert "Новое правило." in templates.load_template(web.cfg.prompts_dir, key)[1], key
+        assert "Новое правило." in templates.load_template(web.core.cfg.prompts_dir, key)[1], key
     assert items(admin)["common"]["state"] == "changed" and items(admin)["meeting"]["state"] == "standard"
     # шаблон, подключающий то, чего нет, не сохраняется
     bad = admin.post("/api/admin/templates/save", json={"id": "meeting", "text": text_of("meeting.md") + "\n@@ нет-такого\n"})
     assert bad.status_code == 400 and "нет-такого" in bad.json()["detail"]
     assert admin.post("/api/admin/templates/restore", json={"id": "common", "version": "default"}).json()["changed"]
-    assert {key: sha(t) for key, t in assembled(web.cfg.prompts_dir).items()} == ASSEMBLED
+    assert {key: sha(t) for key, t in assembled(web.core.cfg.prompts_dir).items()} == ASSEMBLED
 
 
 def test_untouched_templates_of_an_older_version_move_to_the_common_rules(tmp_path):
@@ -770,7 +770,7 @@ def test_untouched_templates_of_an_older_version_move_to_the_common_rules(tmp_pa
     файла дальше действует и в них. Правленные руками остаются как есть и собираются как раньше."""
     old = assembled(STANDARD)
     with running(tmp_path) as (web, client):
-        prompts = web.cfg.prompts_dir
+        prompts = web.core.cfg.prompts_dir
         prompts.mkdir(parents=True, exist_ok=True)
         for key in ("meeting", "lecture"):
             (prompts / f"{key}.md").write_text(old[key] + "\n", encoding="utf-8")

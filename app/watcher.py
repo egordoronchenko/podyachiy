@@ -172,7 +172,7 @@ class Service:
     # значение из .env. Спрашивается перед каждой записью — смена действует без перезапуска.
     speech_model: Callable[[], str]
     # Письмо человеку об исходе обработки: (строка журнала обработки, "ready" | "failed", логин).
-    # Задаёт сервис (web.py); зовётся из событийного цикла и не должен его задерживать.
+    # Задаёт сервис (app/web/lifecycle.py); зовётся из событийного цикла и не должен его задерживать.
     tell: Callable[[dict, str, str, bool], None]        # запись, исход, кому, ручной ли это запуск
     # Действующий словарь записи по её пути: участники и сокращения её самой и её папок
     # (dictionary.Store.effective). Спрашивается перед каждым заданием — правка словаря
@@ -208,7 +208,7 @@ class Service:
     # Переезжают в событийном цикле (settle), а не в потоке обхода.
     adopt: dict[str, str] = field(default_factory=dict)
     # Для переезда записей и папок тем же путём, что у кнопок «Переименовать» (records.py, folders.py): права
-    # пользователей (users.Users) и словари (dictionary.Store). Задаёт сервис (web.py).
+    # пользователей (users.Users) и словари (dictionary.Store). Задаёт сервис (app/web/lifecycle.py).
     people: object | None = None
     dictionaries: object | None = None
     # Записи, которые администратор снял из очереди (unqueue): путь → {size, mtime, by, at}. Сканер их сам не
@@ -218,7 +218,7 @@ class Service:
     dropped: dict[str, dict] = field(default_factory=dict)
     keep_dropped: Callable[[dict], None] | None = None
     # Webhook «запись готова»: (строка журнала обработки, событие webhook.READY | webhook.FAILED). Когда событие
-    # положено, решает webhook.due; задаёт сервис (web.py), зовётся из событийного цикла и не должен его держать:
+    # положено, решает webhook.due; задаёт сервис (app/web/lifecycle.py), зовётся из событийного цикла и не должен его держать:
     # само событие только ложится в очередь доставки.
     hook: Callable[[dict, str], None] | None = None
     # Обход входной папки и действия с записью (records.py) друг друга исключают: сканер

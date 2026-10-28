@@ -206,21 +206,21 @@ def test_admin_sets_the_logo_and_the_name_and_everyone_sees_them(site):
     assert page.status_code == 200 and '<span class="meta">АО "Ромашка &amp; Ко"</span>' in page.text
     assert "attachment" in page.headers["content-disposition"] and "<img" not in page.text.split("<body")[1][:600]
     assert 'Ромашка' in ivanov.get("/api/map", params=query).text
-    assert web.mail.service_label() == 'Подьячий · АО "Ромашка & Ко"'
+    assert web.core.mail.service_label() == 'Подьячий · АО "Ромашка & Ко"'
 
     assert [k for k in kinds(web) if k.startswith("brand")] == ["brand_logo", "brand_logo", "brand_name"]
-    event = [e for e in web.trail.read() if e["kind"] == "brand_logo"][0]
+    event = [e for e in web.core.trail.read() if e["kind"] == "brand_logo"][0]
     assert (event["by"], event["format"], event["width"], event["height"]) == ("admin", "JPEG", 800, 400)
 
     cleared = admin.post("/api/admin/brand/reset").json()
     assert cleared["logo"] == "" and cleared["name"] == "" and guest.get("/api/brand").json() == {"name": "", "logo": None}
-    assert guest.get(fresh["small"]).status_code == 404 and web.mail.service_label() == "Подьячий"
+    assert guest.get(fresh["small"]).status_code == 404 and web.core.mail.service_label() == "Подьячий"
     word = docx.Document(io.BytesIO(ivanov.get("/api/export", params={**query, "format": "docx"}).content))
     assert word.sections[0].header.paragraphs[0].text == ""
     assert "Ромашка" not in ivanov.get("/api/v1/record.html", params=query).text
     assert [k for k in kinds(web) if k.startswith("brand")][-1] == "brand_reset"
     # в выходной папке и в каталоге приложения ничего не появилось: оформление живёт в папке состояния
-    assert not list(web.cfg.outbox.rglob("brand*")) and (web.cfg.state_dir / "brand").is_dir()
+    assert not list(web.core.cfg.outbox.rglob("brand*")) and (web.core.cfg.state_dir / "brand").is_dir()
 
 
 def test_look_changes_only_on_the_page_even_with_a_manage_key(site):
@@ -228,13 +228,13 @@ def test_look_changes_only_on_the_page_even_with_a_manage_key(site):
     steward, _ = keyed(web, admin, "с управлением", 30, manage=True)
     robot, _ = keyed(web, admin, "обычный")
     assert steward.get("/api/admin/brand").status_code == 200                    # посмотреть ключом можно
-    assert robot.get("/api/admin/brand").json()["detail"] == web.BY_KEY_ONLY_READS
-    for client, detail in ((steward, web.PAGE_ONLY), (robot, web.BY_KEY_ONLY_READS)):
+    assert robot.get("/api/admin/brand").json()["detail"] == web.access.BY_KEY_ONLY_READS
+    for client, detail in ((steward, web.access.PAGE_ONLY), (robot, web.access.BY_KEY_ONLY_READS)):
         for answer in (client.put("/api/admin/brand/logo", content=picture()),
                        client.post("/api/admin/brand/name", json={"name": "Ромашка"}),
                        client.post("/api/admin/brand/reset")):
             assert answer.status_code == 403 and answer.json()["detail"] == detail
-    assert site[1].get("/api/brand").json() == {"name": "", "logo": None} and not (web.cfg.state_dir / "brand").exists()
+    assert site[1].get("/api/brand").json() == {"name": "", "logo": None} and not (web.core.cfg.state_dir / "brand").exists()
 
 
 def test_personal_mode_has_no_look_of_its_own(tmp_path):
@@ -246,17 +246,17 @@ def test_personal_mode_has_no_look_of_its_own(tmp_path):
             assert answer.status_code == 404 and "в личном режиме" in answer.json()["detail"]
         assert client.get("/brand/abc/logo.png").status_code == 404
         # даже если файлы оформления остались от корпоративной установки — личная их не показывает
-        web.look.set_logo(picture(), "owner")
-        web.look.set_name("Ромашка", "owner")
-        assert client.get("/api/brand").json() == {"name": "", "logo": None} and web.organization() == ""
-        assert client.get(f"/brand/{web.look.view()['logo']}/logo.png").status_code == 404
+        web.core.look.set_logo(picture(), "owner")
+        web.core.look.set_name("Ромашка", "owner")
+        assert client.get("/api/brand").json() == {"name": "", "logo": None} and web.core.organization() == ""
+        assert client.get(f"/brand/{web.core.look.view()['logo']}/logo.png").status_code == 404
 
 
 def test_letters_of_the_service_are_signed_with_the_name(tmp_path, monkeypatch):
     with running(tmp_path, extra=MAIL_ENV) as (web, client):
         sent = []
-        monkeypatch.setattr(web.mail, "send", lambda cfg, to, letter, *a, **kw: sent.append(
-            web.mail.message(cfg, to, *letter)) or {})
+        monkeypatch.setattr(web.core.mail, "send", lambda cfg, to, letter, *a, **kw: sent.append(
+            web.core.mail.message(cfg, to, *letter)) or {})
         admin = enter(web, "admin", ADMIN_PASSWORD)
         admin.post("/api/admin/brand/name", json={"name": "ООО Ромашка"})
         assert admin.post("/api/admin/mail/test").status_code == 200

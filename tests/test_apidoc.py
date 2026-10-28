@@ -37,21 +37,21 @@ def stand(tmp_path):
     и с ключом «с управлением»."""
     with running(tmp_path) as (web, guest):
         T.seed(web)
-        web.service._take = lambda: None            # очередь никто не разбирает: платное до поставщика не дойдёт
+        web.core.service._take = lambda: None            # очередь никто не разбирает: платное до поставщика не дойдёт
         admin = enter(web, "admin", ADMIN_PASSWORD)
         admin.post("/api/admin/users/save", json={"login": "ivanov", "name": "Иванов Иван", "password": T.PASSWORD})
         for path in ("Проекты", "Проекты/Архив"):
             admin.post("/api/folder", json={"dir": path})
         admin.post("/api/access", json={"dir": "Проекты", "login": "ivanov", "read": "tree"})
         T.recorded(web, MEETING, by="ivanov")
-        out = web.cfg.outbox / "Проекты" / "планёрка"
+        out = web.core.cfg.outbox / "Проекты" / "планёрка"
         (out / "summary" / "планёрка.md").write_text(T.TASKS_MD, encoding="utf-8")
         (out / "transcript").mkdir()
         (out / "transcript" / "планёрка.json").write_text(json.dumps({"cuts": [], "segments": [
             {"start": 5, "end": 9, "speaker": "S1", "text": "Коллеги, добрый день, начинаем планёрку."},
             {"start": 10, "end": 20, "speaker": "S2", "text": "Спасибо. По складу: бюджет согласован, стеллажи привезут."}]}),
             encoding="utf-8")
-        web.service.ledger.put({**web.service.ledger.get(MEETING), "title": "Планёрка по складу",
+        web.core.service.ledger.put({**web.core.service.ledger.get(MEETING), "title": "Планёрка по складу",
                                 "audio_duration_sec": 600, "record_date": "2026-03-12"})
         for login, name in (("orlova", "Орлова Анна"), ("gromov", "Громов Пётр")):
             assert guest.post("/api/request", json={"name": name, "email": "", "login": login}).status_code == 200
@@ -178,7 +178,7 @@ def test_parameters_and_body_fields_come_from_the_routes(stand):
             assert set(op.body) == set(model["properties"]), op.id
             assert set(model.get("required", [])) <= set(op.send), op.id
     tree = {p["name"]: p for p in by_address["GET", "/api/v1/tree"]["parameters"]}
-    assert tree["depth"]["schema"] == {"type": "integer", "default": web.TREE_DEPTH} and not tree["depth"]["required"]
+    assert tree["depth"]["schema"] == {"type": "integer", "default": web.api_v1.TREE_DEPTH} and not tree["depth"]["required"]
     record = {p["name"]: p for p in by_address["GET", "/api/v1/record"]["parameters"]}
     assert record["file"]["required"] and record["file"]["example"] == MEETING
     assert {p["name"] for p in by_address["GET", "/api/v1/tasks"]["parameters"]} >= {"who", "open"}      # имена из адреса
@@ -223,40 +223,40 @@ def test_every_example_request_is_accepted_and_the_answer_has_the_described_fiel
         if name == "post-admin-mail-test":
             continue                # без почты отвечает 503: пример проверяет отдельный тест, с почтой
         if name == "post-admin-queue-remove":
-            web.service.queue.append(T.watcher.QueueItem(path=MEETING))      # снимать есть что
+            web.core.service.queue.append(T.watcher.QueueItem(path=MEETING))      # снимать есть что
         if name == "post-admin-queue-cancel":
-            web.service.running.append(T.job(MEETING))                        # прогон идёт
+            web.core.service.running.append(T.job(MEETING))                        # прогон идёт
         answer = client.request(method, path, **kw)
         if name == "post-admin-queue-cancel":
-            web.service.running.clear()
+            web.core.service.running.clear()
         assert answer.status_code == 200, f"{name}: {answer.status_code} {answer.text[:300]}"
         (media, good), = item["responses"]["200"]["content"].items()
         assert answer.headers["content-type"].split(";")[0] == media, name
         if media == "application/json":
             assert set(good["example"]) <= set(answer.json()), f"{name}: {set(good['example']) - set(answer.json())}"
         # в очередь ставит только ручной запуск; подпись и словарь в примерах — без пересборки
-        assert [i.path for i in web.service.queue] == ([MEETING] if name == "post-admin-run" else []), name
-        web.service.queue.clear()
+        assert [i.path for i in web.core.service.queue] == ([MEETING] if name == "post-admin-run" else []), name
+        web.core.service.queue.clear()
         if name == "put-upload":
             T.recorded(web, answer.json()["file"])              # вместо обработки: запись готова
         done += 1
-    assert done == len(todo) - 1 and web.service.running == []
+    assert done == len(todo) - 1 and web.core.service.running == []
     # примеры сделали то, что обещали: запись загружена, переименована и перенесена
-    assert web.service.ledger.get("Проекты/Архив/Планёрка 12.03.mp4") and (web.cfg.inbox / "Проекты/Договоры 2026").is_dir()
-    assert "sidorov" not in web.people.users and "orlova" in web.people.users
+    assert web.core.service.ledger.get("Проекты/Архив/Планёрка 12.03.mp4") and (web.core.cfg.inbox / "Проекты/Договоры 2026").is_dir()
+    assert "sidorov" not in web.core.people.users and "orlova" in web.core.people.users
     assert plain.get("/api/v1/record", params={"file": MEETING}).json()["tasks"][0]["done"] is True
     # платная часть подписи и словаря — rebuild=true: до очереди, не дальше
     for method, path in (("POST", "/api/v1/speakers"), ("PUT", "/api/v1/dictionary")):
         rebuilt = plain.request(method, path, params={"file": MEETING, "rebuild": True})
         assert rebuilt.status_code == 200 and rebuilt.json()["rebuild"] == "queued" and rebuilt.json()["rebuilding"]
-        assert [(i.path, i.force) for i in web.service.queue] == [(MEETING, False)]
-        web.service.queue.clear()
+        assert [(i.path, i.force) for i in web.core.service.queue] == [(MEETING, False)]
+        web.core.service.queue.clear()
 
 
 def test_trial_letter_example_is_accepted_when_mail_is_on(tmp_path, monkeypatch):
     with running(tmp_path, extra=T.MAIL_ENV) as (web, client):
         post = T.Post()
-        monkeypatch.setattr(web.mail, "send", post.send)
+        monkeypatch.setattr(web.core.mail, "send", post.send)
         item = client.get("/api/v1/openapi.json").json()["paths"]["/api/admin/mail/test"]["post"]
         answer = client.post("/api/admin/mail/test", auth=("admin", ADMIN_PASSWORD), **request_of(item))
         example = item["responses"]["200"]["content"]["application/json"]["example"]
@@ -266,7 +266,7 @@ def test_trial_letter_example_is_accepted_when_mail_is_on(tmp_path, monkeypatch)
 def strings_in_code():
     """Все строки из кода приложения: куски текста, из которых складываются отказы."""
     found = []
-    for path in (ROOT / "app").glob("*.py"):
+    for path in (ROOT / "app").rglob("*.py"):           # с пакетом app/web
         if path.name != "apidoc.py":
             found += [node.value for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
                       if isinstance(node, ast.Constant) and isinstance(node.value, str)]
@@ -311,7 +311,7 @@ def test_refusal_texts_are_the_ones_written_in_the_code(stand):
     for path in T.COSTS:
         item = spec["paths"][path]["get"]
         assert (item["x-rights"]["level"], item["x-key"]) == (apidoc.ADMIN, "manage"), path
-        assert described(path, "get", "403") == [apidoc.PLAIN_KEY, web.NO_COSTS], path
+        assert described(path, "get", "403") == [apidoc.PLAIN_KEY, web.access.NO_COSTS], path
         for client in (plain, ivanov):
             refused = client.get(path)
             assert refused.status_code == 403 and refused.json()["detail"] in described(path, "get", "403"), path
@@ -327,7 +327,7 @@ def test_markdown_for_the_model_is_built_from_the_same_description(stand):
     web, guest, plain, _ = stand
     spec = guest.get("/api/v1/openapi.json").json()
     text = plain.get("/api/v1").text
-    frame = (web.SKILL / "API.md").read_text(encoding="utf-8")
+    frame = (web.core.SKILL / "API.md").read_text(encoding="utf-8")
     assert "{{" not in text and "{{API}}" in frame and "### " not in frame        # методов в самом файле нет
     heads = re.findall(r"^### (GET|POST|PUT) (/api/[\w./-]+)(?:\?(\S+))?$", text, flags=re.M)
     assert [(m, p) for m, p, _ in heads] == [(m, p) for m, p, _ in operations(spec)]
@@ -398,27 +398,29 @@ def test_api_page_is_served_without_login_and_needs_no_internet(stand):
 # ---------- платные методы ----------
 
 # К платной обработке ведут две вещи: задание в очереди обработчиков и новый файл во входной папке (его
-# сервис возьмёт сам). Метод платный, если его обработчик доходит до них — сам или через функции web.py.
+# сервис возьмёт сам). Метод платный, если его обработчик доходит до них — сам или через функции app/web.
 PAID_CALLS = {"service.enqueue_manual", "upload.append", "upload.stream_finish"}
 # Платные адреса страниц: в описании API их нет, у каждого есть двойник в /api/v1.
 PAID_PAGES = {("PUT", "/api/upload"), ("POST", "/api/admin/names"), ("POST", "/api/dictionary")}
 
 
 def paid_routes() -> set[tuple[str, str]]:
-    """Адреса web.py, чей обработчик может привести к платной обработке, — по самому коду."""
-    tree = ast.parse((ROOT / "app" / "web.py").read_text(encoding="utf-8"))
+    """Адреса app/web, чей обработчик может привести к платной обработке, — по самому коду. Функции
+    разделов зовут друг друга по имени; сервис — core.service, поэтому у вызова берутся два последних звена."""
     uses, routes = {}, {}
-    for node in tree.body:
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
-        uses[node.name] = {f"{n.value.id}.{n.attr}" if isinstance(n, ast.Attribute) else n.id
-                           for n in ast.walk(node) if isinstance(n, ast.Name)
-                           or isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)}
-        for d in node.decorator_list:
-            if (isinstance(d, ast.Call) and isinstance(d.func, ast.Attribute) and getattr(d.func.value, "id", "") == "app"
-                    and d.func.attr in ("get", "post", "put", "delete", "patch")
-                    and d.args and isinstance(d.args[0], ast.Constant)):
-                routes[(d.func.attr.upper(), d.args[0].value)] = node.name
+    for path in sorted((ROOT / "app" / "web").glob("*.py")):
+        for node in ast.parse(path.read_text(encoding="utf-8")).body:
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            uses[node.name] = {f"{getattr(n.value, 'id', None) or n.value.attr}.{n.attr}" if isinstance(n, ast.Attribute)
+                               else n.id for n in ast.walk(node) if isinstance(n, ast.Name)
+                               or isinstance(n, ast.Attribute) and isinstance(n.value, (ast.Name, ast.Attribute))}
+            for d in node.decorator_list:
+                if (isinstance(d, ast.Call) and isinstance(d.func, ast.Attribute)
+                        and getattr(d.func.value, "id", "") == "router"
+                        and d.func.attr in ("get", "post", "put", "delete", "patch")
+                        and d.args and isinstance(d.args[0], ast.Constant)):
+                    routes[(d.func.attr.upper(), d.args[0].value)] = node.name
 
     def paid(name: str, seen: set[str]) -> bool:
         seen.add(name)
@@ -428,7 +430,7 @@ def paid_routes() -> set[tuple[str, str]]:
 
 
 def test_every_method_that_can_lead_to_paid_processing_is_marked_paid(stand):
-    """x-paid стоит ровно у тех описанных методов, что могут поставить запись в обработку, — по коду web.py,
+    """x-paid стоит ровно у тех описанных методов, что могут поставить запись в обработку, — по коду app/web,
     а не по памяти: новый платный путь (ещё одна пересборка, загрузка) без пометки тест покажет."""
     _, guest, _, _ = stand
     described = {(m, p): item for m, p, item in operations(guest.get("/api/v1/openapi.json").json())}

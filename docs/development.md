@@ -9,10 +9,13 @@ Python 3.12, FastAPI, uvicorn, httpx; ffmpeg — отдельной програ
 CSS и JavaScript без сборки. Состояние — база SQLite `state/podyachiy.db` (`app/db.py`).
 
 **Сценарии страниц** лежат отдельными файлами: страница `app/static/<страница>.html`, её сценарий —
-`app/static/<страница>.js`, общее — `common.js`. Сервис отдаёт заголовок Content-Security-Policy
-`script-src 'self'`, и браузер встроенный сценарий не исполнит. Встроенные `<script>` и обработчики
-`on…=` в разметке и в строках `innerHTML` запрещает тест `tests/test_security.py`; обработчики
-вешаются из сценария. Исключение одно — карта записи: самостоятельный файл со своим сценарием,
+`app/static/<страница>.js`, общее — `common.js`. Сценарий страницы администрирования разнесён по
+разделам: `admin.js` (общее и «Обработка»), `admin-users.js`, `admin-templates.js`, `admin-brand.js`,
+`admin-folders.js`, `admin-costs.js` и последним — `admin-start.js` (запуск). Это обычные сценарии, не
+модули: переменные и функции у них общие, порядок подключения в `admin.html` важен. Сервис отдаёт
+заголовок Content-Security-Policy `script-src 'self'`, и браузер встроенный сценарий не исполнит.
+Встроенные `<script>` и обработчики `on…=` в разметке и в строках `innerHTML` запрещает тест
+`tests/test_security.py`; обработчики вешаются из сценария. Исключение одно — карта записи: самостоятельный файл со своим сценарием,
 сервис разрешает ровно его, по хешу.
 
 **Схема базы** меняется шагами из `MIGRATIONS` в `app/db.py`: шаг N приводит базу к версии N, сервис
@@ -38,7 +41,17 @@ python -m compileall -q app
 
 ```
 app/             код сервиса
-  web.py         страницы и все адреса API, проверка входа и прав
+  web/           страницы и все адреса API, проверка входа и прав; app.web:app — приложение
+    __init__.py  сборка: приложение из server.py, статика, адреса разделов по порядку
+    core.py      настройки и общее состояние: хранилища, пределы частоты, флаги запуска
+    common.py    общие помощники разделов: путь и протокол записи, пересборка, CSP страниц
+    access.py    вход и права: viewer, steward, person, admin_guard, перепроверка домена
+    lifecycle.py запуск и фоновая работа: проверки, чистка, копия по расписанию, напоминания, lifespan
+    server.py    приложение FastAPI, отказы по-русски, заголовки и проверки на каждый запрос
+    …            разделы адресов, по модулю на раздел (pages, browse, api_v1, skill, access_keys,
+                 results, record_actions, trash, tasks, protocol_edit, letters, login, access_requests,
+                 folders_access, admin_users, speakers, dictionaries, reports, branding, prompt_templates,
+                 processing): у каждого свой APIRouter
   apidoc.py      описание внешнего API: из него openapi.json, страница /api и текст для модели
   watcher.py     сканер входной папки, очередь, обработчики
   pipeline.py    обработка одной записи целиком
@@ -61,7 +74,8 @@ app/             код сервиса
   export.py      протокол в DOCX и PDF
   …              остальные модули — по одному на задачу, назначение в первой строке файла
   skill/         навык для ИИ-клиентов
-  static/        страницы и их сценарии (<страница>.html и <страница>.js), стили, шрифты, логотип
+  static/        страницы и их сценарии (<страница>.html и <страница>.js, у администрирования — admin-*.js),
+                 стили, шрифты, логотип
 prompts/         шаблоны протоколов и словарь терминов
 tests/           тесты (pytest)
 install/         установка из готового образа: compose.yml, .env.example, Caddyfile.example, инструкция
