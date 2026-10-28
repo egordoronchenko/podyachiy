@@ -13,8 +13,10 @@ from pathlib import Path
 
 import pytest
 
-from app import db, dictionary, media, pipeline, records, watcher
+from app import db, dictionary, ledger, media, pipeline, records, speech, triage, usage, watcher
 from app.ledger import Ledger
+from tests.test_pipeline import REL as QUIET, silent  # noqa: F401 — запись с подменённым распознаванием
+from tests.test_reuse import TRI
 
 
 @dataclasses.dataclass(frozen=True)
@@ -658,3 +660,133 @@ def test_decomposed_record_next_to_its_composed_twin_stays_and_is_said(tmp_path)
     svc.known_to_nfc()
     assert sorted(svc.ledger.records) == sorted(["Встреча ё.mp3", nfd("Встреча ё.mp3")])
     assert sum("разложенной форме" in line and "оставляю" in line for line in svc.lines) == 1
+
+
+# ---------- администратор снимает запись из очереди и отменяет прогон ----------
+
+def test_record_taken_off_the_queue_is_not_queued_again_until_it_changes_or_is_run_by_hand(tmp_path):
+    """Снятую из очереди новую запись сканер на следующем обходе взял бы снова — и платно распознал.
+    Сервис помнит, что её сняли вручную (и в базе — переживает перезапуск), пока её не запустят вручную
+    или файл не изменится: изменённый файл — уже другая запись."""
+    svc = watched(tmp_path)
+    kept = []
+    svc.keep_dropped = lambda entries: kept.append(dict(entries))
+    rel = "Проекты/вкс.mp4"
+    src = svc.cfg.inbox / rel
+    src.parent.mkdir()
+    src.write_bytes(b"video" * 4000)
+    svc.scan_once()
+    svc.scan_once()
+    assert [i.path for i in svc.queue] == [rel]
+    assert svc.unqueue(rel, "admin") is True
+    assert svc.queue == [] and kept[-1][rel]["by"] == "admin" and kept[-1][rel]["size"] == 20000
+    for _ in range(3):
+        svc.scan_once()
+    assert svc.queue == [] and svc.pending == {}
+    assert [(d["path"], d["by"]) for d in svc.snapshot()["dropped"]] == [(rel, "admin")]
+    assert sum("снята из очереди" in line for line in svc.lines) == 1
+    assert svc.unqueue(rel, "admin") is None                    # в очереди её уже нет
+
+    src.write_bytes(b"video" * 4001)                            # файл изменился — это уже другая запись
+    svc.scan_once()
+    svc.scan_once()
+    assert [i.path for i in svc.queue] == [rel] and kept[-1] == {} and svc.snapshot()["dropped"] == []
+    assert any("изменился после того, как его сняли из очереди" in line for line in svc.lines)
+
+    svc.unqueue(rel, "admin")
+    svc.enqueue_manual(rel, None, False, "admin", "manual")     # ручной запуск — решение администратора
+    assert [i.path for i in svc.queue] == [rel] and svc.dropped == {} and kept[-1] == {}
+
+
+def test_retry_taken_off_the_queue_waits_too_and_a_manual_run_just_leaves_it(tmp_path):
+    svc = watched(tmp_path)
+    retried, done = "Проекты/план.mp4", "Проекты/итоги.mp4"
+    processed(svc, retried, status="error", error="HTTP 502", finished_at="2026-01-01T00:00:00+03:00")
+    processed(svc, done, data=b"audio" * 3000)
+    svc.scan_once()
+    assert [(i.path, i.reason) for i in svc.queue] == [(retried, "retry")]
+    assert svc.unqueue(retried, "admin") is True                # повтор после сбоя — тоже платный
+    svc.scan_once()
+    assert svc.queue == []
+    svc.enqueue_manual(done, None, False, "admin", "rebuild")
+    assert svc.unqueue(done, "admin") is False                  # готовую сканер сам и так не возьмёт: помнить нечего
+    assert svc.queue == [] and list(svc.dropped) == [retried]
+
+
+def cancelling(cfg, seen, monkeypatch, cancel_at):
+    """Обработчик над настоящим pipeline.process; распознавание — по частям, каждая платная;
+    администратор нажимает «Отменить прогон» там, где скажет cancel_at."""
+    trail = types.SimpleNamespace(runs=[], run=lambda record, by, reason: trail.runs.append((dict(record), by, reason)),
+                                  uploader=lambda file: "ivanov")
+    told = []
+    svc = watcher.Service(cfg=cfg, log=seen.lines.append, ledger=Ledger(db.Database(cfg.outbox.parent / "state")),
+                          journal=trail, speech_model=lambda: cfg.model, tell=lambda *a: told.append(a),
+                          words=lambda rel: dictionary.merge([]), series=lambda rel: False)
+    provider = types.SimpleNamespace(title="RouterAI", currency="RUB")
+    monkeypatch.setattr(speech, "audio_duration", lambda path: 3 * speech.CHUNK_SEC)
+
+    async def stt(client, cfg, chunk, log=None, terms=()):
+        seen.paid += 1
+        usage.add("speech", cfg.model, {"cost": 10.0}, provider)
+        if cancel_at == "speech" and seen.paid == 1:
+            assert svc.cancel(QUIET, "admin")["by"] == "admin"     # посреди распознавания, пока идёт первая часть
+        return {"text": "Добрый день", "words": [{"word": "Добрый", "start": 0.1, "end": 0.4, "speaker": 0},
+                                                 {"word": "день", "start": 0.5, "end": 0.8, "speaker": 0}]}
+
+    async def tri(*a, **kw):
+        if cancel_at == "triage":
+            svc.cancel(QUIET, "admin")
+        return dict(TRI)
+
+    monkeypatch.setattr(speech, "call_stt", stt)
+    monkeypatch.setattr(triage, "triage_file", tri)
+    return svc, trail, told
+
+
+@pytest.mark.parametrize("before", [None, "ok"])
+def test_cancelled_run_stops_before_the_next_paid_request_and_keeps_what_is_paid_for(silent, monkeypatch, before):
+    """Прогон отменяют посреди распознавания: идущий запрос поставщику не обрывается (за него могли уже
+    списать деньги), следующая часть не заказывается. Оплаченное — в расходах и на диске: повтор берёт
+    готовую часть, не платя за неё снова. Исход — «отменено администратором», по расписанию не повторяется,
+    письма никому. Готовая прежде запись остаётся готовой: её протокол на месте."""
+    cfg, seen = silent
+    svc, trail, told = cancelling(cfg, seen, monkeypatch, "speech")
+    parts = len(speech.plan_chunks(3 * speech.CHUNK_SEC))
+    assert parts > 2
+    if before:
+        svc.ledger.put({"file": QUIET, "stem": "тишина", "status": "ok", "cost": {"RUB": 5.0}, "summary": "summary/тишина.md",
+                        "finished_at": "2026-10-01T10:00:00+03:00"})
+        svc.enqueue_manual(QUIET, None, True, "admin", "manual")
+    else:
+        svc.queue.append(watcher.QueueItem(path=QUIET))
+    drain(svc)
+    assert seen.paid == 1 and seen.text == 0
+    rec = svc.ledger.get(QUIET)
+    assert rec[ledger.CANCELLED]["by"] == "admin" and rec["cost"] == {"RUB": 10.0}
+    if before:
+        assert rec["status"] == "ok" and rec["runs"] == 2 and rec["cost_total"] == {"RUB": 15.0}
+    else:
+        assert rec["status"] == "error" and "отменил администратор admin" in rec["error"]
+    assert not svc.ledger.retry_due(QUIET) and told == []
+    (record, by, reason), = trail.runs
+    assert record[ledger.CANCELLED]["by"] == "admin" and record["cost"] == {"RUB": 10.0}
+    out = cfg.outbox / "Планёрки" / "тишина"
+    assert (out / "transcript" / speech.RAW_DIR / "тишина.part01.json").is_file()
+    assert not (out / "тишина.error.json").exists() and not (out / f"тишина{ledger.MARKER_SUFFIX}").exists()
+    assert any(line.startswith("отменено: ") and "admin" in line for line in seen.lines)
+    assert any("автоматически не повторяю" in line for line in seen.lines)
+
+    svc.enqueue_manual(QUIET, None, False, "admin", "manual")   # запустили снова: оплаченная часть — с диска
+    drain(svc)
+    assert seen.paid == parts and ledger.CANCELLED not in svc.ledger.get(QUIET)
+
+
+def test_cancel_between_the_text_steps_is_a_cancel_and_not_a_missing_protocol(silent, monkeypatch):
+    cfg, seen = silent
+    svc, trail, told = cancelling(cfg, seen, monkeypatch, "triage")
+    svc.queue.append(watcher.QueueItem(path=QUIET))
+    drain(svc)
+    rec = svc.ledger.get(QUIET)
+    assert rec["status"] == "error" and rec[ledger.CANCELLED]["by"] == "admin"
+    assert seen.text == 0                                       # ни поручений, ни протокола не заказывал
+    assert svc.cancel(QUIET, "admin") is None                   # прогона больше нет — отменять нечего

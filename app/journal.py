@@ -30,6 +30,7 @@ import json
 import sqlite3
 
 from . import db, usage
+from .ledger import CANCELLED
 
 BUCKETS = ("day", "week", "month", "year")
 EARLIER = "earlier"          # этап для расходов, набежавших до появления журнала
@@ -138,12 +139,14 @@ class Journal:
             con.execute(f"UPDATE runs SET settled = 1 WHERE {db.below('path')}", db.span(folder))
 
     def run(self, record: dict, by: str, reason: str) -> dict:
-        """Прогон записи закончился — сколько он стоил и кому его отнести."""
+        """Прогон записи закончился — сколько он стоил и кому его отнести. Прогон, отменённый
+        администратором, — тоже прогон: оплаченное до отмены в нём, и кто отменил (cancelled)."""
+        cancelled = {CANCELLED: record[CANCELLED]} if record.get(CANCELLED) else {}
         return self.write(
             "run", by, file=record["file"], uploaded_by=self.uploader(record["file"]),
             reason=reason, status=record.get("status"), started_at=record.get("started_at"),
             audio_sec=record.get("audio_duration_sec"), cost=usage.amounts(record.get("cost")),
-            stages=record.get("cost_models") or [], providers=record.get("cost_providers") or [])
+            stages=record.get("cost_models") or [], providers=record.get("cost_providers") or [], **cancelled)
 
     def replace(self, events: list[dict]) -> None:
         """Журнал заново из готовых событий, в этом порядке: пути прогонов и авторы загрузок

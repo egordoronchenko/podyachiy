@@ -520,7 +520,8 @@ button.ghost { background: transparent; color: var(--ink-2); border-color: var(-
 button.ghost:hover:not(:disabled) { background: var(--surface-2); color: var(--ink); }
 button.icon { min-height: 34px; padding: 6px; width: 34px; display: grid; place-items: center; }
 label { display: block; font-size: 12.5px; color: var(--ink-3); margin: 12px 0 5px; font-weight: 550; }
-input[type=text], input[type=search], input[type=password], input[type=date], input[type=email], select, textarea {
+input[type=text], input[type=search], input[type=password], input[type=date], input[type=email], input[type=time],
+input[type=number], select, textarea {
   width: 100%; max-width: 560px; min-height: 38px; padding: 8px 11px;
   font: inherit; font-size: 13.5px; color: var(--ink);
   background: var(--surface-2); border: 1px solid var(--line-2); border-radius: 8px;
@@ -1328,4 +1329,15 @@ pre.aboutcopy {
   .modal .title { flex-wrap: wrap; }
   .modal .title .t { flex: 1 1 240px; }
   .modal .title .acts { flex: 0 1 auto; flex-wrap: wrap; justify-content: flex-end; margin-left: auto; }
+}
+
+/* резервная копия на «Обработке»: поля расписания в ряд, на телефоне — столбиком и в рост пальца;
+   кнопки очереди («Снять из очереди», «Отменить прогон») на телефоне — тоже */
+.bkstate { font-size: 13.5px; color: var(--ink-2); line-height: 1.5; }
+.bkgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 0 14px; max-width: 680px; }
+.jobacts { margin-top: 10px; }
+.jobacts button.dangerlink { margin-left: 0; }
+@media (max-width: 600px), (pointer: coarse) {
+  #backup input:not([type=checkbox]), #backup select, #backup button, #backup .check { min-height: 44px; }
+  #queue .rowacts button, #running button { min-height: 44px; }
 }

@@ -374,7 +374,6 @@ def test_command_line_returns_codes_and_writes_a_failed_copy_to_the_log(tmp_path
     cfg = install(tmp_path)
     monkeypatch.setattr(backup.Settings, "from_env", classmethod(lambda cls: cfg))
     monkeypatch.setattr(db, "kept", lambda path: True)
-    monkeypatch.setattr(backup.create, "__kwdefaults__", None, raising=False)
     monkeypatch.setattr(backup.create, "__defaults__", (None, True, 0, print, db.kept, None))
     monkeypatch.setattr(backup.restore, "__defaults__", (print, db.kept))
     assert backup.main(["create", "--keep", "5"]) == 0
@@ -463,3 +462,76 @@ def test_one_record_is_not_brought_back_while_the_service_runs(tmp_path):
     assert ledger.Ledger(base).get(file) is None and not (cfg.inbox / file).exists()
     base.close()
     assert backup.record(cfg, made["archive"], file, quiet)["file"] == file          # остановлен — можно
+
+
+# ---------- копия из самого сервиса: по расписанию и кнопкой ----------
+
+def moment(text: str) -> datetime.datetime:
+    """Время сервиса: по его часовому поясу (TZ), как его считает сервис."""
+    return datetime.datetime.fromisoformat(text).astimezone()
+
+
+def test_scheduled_copy_is_due_once_per_slot_and_missed_slots_are_not_caught_up_in_a_batch():
+    """«Сейчас» — по часовому поясу сервиса. Копия положена, когда наступило время по расписанию, а после
+    него не было ни копии, ни попытки, ни сохранения самого расписания. Сервис был выключен три дня — одна
+    копия, когда он снова работает, а не три подряд; сбой в назначенное время — следующая попытка снова
+    по расписанию, а не каждую минуту."""
+    daily = {**backup.PLAN, "on": True, "time": "03:00", "every": "day"}
+    wednesday = moment("2026-10-28T10:00:00")
+    assert wednesday.weekday() == 2
+    assert backup.slot(daily, wednesday) == moment("2026-10-28T03:00:00")
+    assert backup.slot(daily, moment("2026-10-28T02:59:59")) == moment("2026-10-27T03:00:00")
+    assert backup.upcoming(daily, wednesday) == moment("2026-10-29T03:00:00")
+    weekly = {**daily, "every": "week", "weekday": 6}                       # по воскресеньям
+    assert backup.slot(weekly, wednesday) == moment("2026-10-25T03:00:00")
+    assert backup.upcoming(weekly, wednesday) == moment("2026-11-01T03:00:00")
+    assert backup.upcoming(weekly, moment("2026-11-01T02:00:00")) == moment("2026-11-01T03:00:00")
+
+    iso = lambda text: moment(text).isoformat()
+    saved = iso("2026-10-20T12:00:00")
+    assert backup.due(daily, wednesday, [saved, iso("2026-10-25T03:10:00")])         # выключен с 25-го: одна копия
+    assert not backup.due(daily, wednesday, [saved, iso("2026-10-28T09:00:00")])     # копия уже есть
+    assert not backup.due(daily, wednesday, [saved, None, iso("2026-10-28T03:00:05")])   # попытка была — сбой
+    assert not backup.due(daily, wednesday, [iso("2026-10-28T09:30:00")])           # расписание сохранено позже
+    assert backup.due(daily, moment("2026-10-29T03:00:00"), [iso("2026-10-28T09:30:00")])
+    assert not backup.due({**daily, "on": False}, wednesday, [saved])                # выключено — никогда
+    assert not backup.due(weekly, wednesday, [saved, iso("2026-10-25T03:20:00")])   # неделя ещё не прошла
+
+
+def test_copy_made_by_the_service_goes_to_its_journal_and_a_failure_stays_until_the_next_copy(tmp_path):
+    """Из сервиса копия пишет итог в его журнал работы (страница показывает его хвост), событие — от имени
+    того, кто нажал кнопку, или сервиса (по расписанию). Несостоявшаяся копия — строкой «ВНИМАНИЕ», событием
+    и отметкой в базе для предупреждения на странице; удачная копия отметку снимает."""
+    cfg = install(tmp_path)
+    base = db.Database(cfg.state_dir)
+    lines = []
+    made = backup.create(cfg, kept=kept, say=quiet, by="admin", how=backup.PAGE, log=lines.append, base=base)
+    assert lines == [line for line in lines if line.startswith("резервная копия сделана: ")] and len(lines) == 1
+    assert lines[0] not in (cfg.outbox / "_logs" / "podyachiy.log").read_text(encoding="utf-8")   # в файл пишет журнал сервиса
+    event = journal.Journal(base).actions(kind="backup")[0]
+    assert (event["by"], event["how"], event["file"]) == ("admin", backup.PAGE, made["archive"].rsplit("/", 1)[-1])
+    assert backup.failure(base) is None
+
+    backup.failed(cfg, "на диске нет места", how=backup.SCHEDULE, log=lines.append, base=base)
+    assert lines[-1] == "ВНИМАНИЕ: резервная копия НЕ сделана: на диске нет места"
+    noted = backup.failure(base)
+    assert (noted["why"], noted["how"], noted["by"]) == ("на диске нет места", backup.SCHEDULE, "") and noted["at"]
+    assert journal.Journal(base).actions(kind="backup_failed")[0]["why"] == "на диске нет места"
+    backup.create(cfg, kept=kept, say=quiet, how=backup.SCHEDULE, log=lines.append, base=base,
+                  now=datetime.datetime(2030, 1, 1, 3, 0).astimezone())
+    assert backup.failure(base) is None and backup.last(base)["how"] == backup.SCHEDULE
+    base.close()
+
+
+def test_failed_copy_from_the_command_line_is_seen_on_the_page_too(tmp_path, monkeypatch, capsys):
+    """Копию по расписанию делают и системным планировщиком командой: её отказ виден на странице так же."""
+    cfg = install(tmp_path)
+    monkeypatch.setattr(backup.Settings, "from_env", classmethod(lambda cls: cfg))
+    assert backup.main(["create", "--to", str(tmp_path / "нет такой")]) == 1
+    base = db.Database(cfg.state_dir)
+    assert backup.failure(base)["how"] == backup.COMMAND and "папки для копий" in backup.failure(base)["why"]
+    base.close()
+    empty = types.SimpleNamespace(**{**vars(cfg), "state_dir": tmp_path / "пустая"})
+    monkeypatch.setattr(backup.Settings, "from_env", classmethod(lambda cls: empty))
+    assert backup.main(["create"]) == 1 and "базы" in capsys.readouterr().err
+    assert not (tmp_path / "пустая").exists()                           # отметку об отказе базе без базы не пишем

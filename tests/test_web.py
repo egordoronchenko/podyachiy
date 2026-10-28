@@ -76,6 +76,10 @@ ADMIN_ONLY = [
     ("POST", "/api/admin/domain/check", {}),
     ("POST", "/api/admin/users/domain", {"login": "petrov"}),
     ("POST", "/api/admin/users/sessions", {"login": "petrov"}),
+    ("POST", "/api/admin/backup/plan", {"on": True, "time": "03:00"}),
+    ("POST", "/api/admin/backup/now", None),
+    ("POST", "/api/admin/queue/remove", {"file": "запись.mp4"}),
+    ("POST", "/api/admin/queue/cancel", {"file": "запись.mp4"}),
 ]
 # Параметры адреса для запросов из ADMIN_ONLY, которым без них отвечать нечем.
 QUERY = {"/api/admin/templates/text": {"id": "meeting"}, "/api/admin/templates/upload": {"id": "meeting"}}
@@ -4847,3 +4851,222 @@ def test_names_known_in_the_decomposed_form_are_composed_once_at_start(tmp_path)
         assert [f["name"] for f in admin.get("/api/browse", params={"path": "Отчёт й"}).json()["files"]] == ["вкс.mp4"]
         assert any(e["kind"] == "folder_rename" and e["to"] == "Отчёт й"
                    for e in admin.get("/api/admin/journal").json()["events"])
+
+
+def test_signed_names_join_the_folder_dictionary_without_a_rebuild(site):
+    """ФИО, подписанное говорящему, — подтверждённое имя: оно попадает в словарь папки записи, и в
+    следующих записях папки модель его уже знает. Подписывать и править словарь может один и тот же
+    хозяин папки, так что обхода прав нет; пересборку протоколов это само по себе не запускает."""
+    web, admin, ivanov, petrov = staffed(site)
+    admin.post("/api/folder", json={"dir": "Проекты"})
+    admin.post("/api/access", json={"dir": "Проекты", "login": "ivanov", "manage": "only"})
+    admin.post("/api/access", json={"dir": "Проекты", "login": "petrov", "read": "only"})
+    file = voiced(web, "Проекты/планёрка.mp4")
+    voiced(web, "Проекты/вторая.mp4")
+    admin.post("/api/dictionary", json={"path": "Проекты", "people": "Ершова Лидия Марковна (Лида) — главный бухгалтер"})
+    robot, _ = keyed(web, ivanov, "Cursor")
+
+    page = ivanov.post("/api/admin/names", json={"file": file, "parts": {
+        "1": {"S1": "Тихонов Павел Ильич", "S2": "Лида"}, "2": {"S2": "Иван", "S3": "павел ильич тихонов"}}})
+    assert page.status_code == 200 and page.json()["dictionary_added"] == ["Тихонов Павел Ильич"]
+    folder = ivanov.get("/api/dictionary", params={"path": "Проекты"}).json()
+    assert [(p["name"], p["role"]) for p in folder["people"]] == [
+        ("Ершова Лидия Марковна", "главный бухгалтер"), ("Тихонов Павел Ильич", "")]
+    assert folder["changed_by"] == "Иванов"
+    # ключ доступа — то же самое; подпись одной реплики — тоже подтверждённое имя
+    line = robot.post("/api/v1/speakers", params={"file": file, "line": "21.00", "name": "Юдина Анна"})
+    assert line.status_code == 200 and line.json()["dictionary_added"] == ["Юдина Анна"]
+    again = robot.post("/api/v1/speakers", params={"file": file, "part": 2, "label": "S2", "name": "Юдина Анна"})
+    assert again.json()["dictionary_added"] == []
+    # подсказки при подписи в соседней записи уже знают новых людей
+    roster = ivanov.get("/api/result", params={"file": "Проекты/вторая.mp4", "kind": "summary"}).json()["roster"]
+    assert [p["name"] for p in roster] == ["Ершова Лидия Марковна", "Тихонов Павел Ильич", "Юдина Анна"]
+
+    # пересборка не запускается — ни этой записи, ни соседней; протоколы папки не помечаются устаревшими
+    assert web.service.queue == [] and not web.service.running
+    assert ivanov.get("/api/result", params={"file": "Проекты/вторая.mp4", "kind": "summary"}).json()["dict_newer"] is False
+    events = [e for e in web.trail.read() if e["kind"] == "names"]
+    assert [e["dictionary"] for e in events] == [1, 1, 0] and all("Тихонов" not in json.dumps(e, ensure_ascii=False) for e in events)
+    assert "в словарь папки добавлено" in page_source("admin")
+
+    # читатель подписывать не может — и словарь через подпись не меняет
+    refused = petrov.post("/api/admin/names", json={"file": file, "parts": {"1": {"S1": "Чужой Человек"}}})
+    assert refused.status_code == 403
+    assert len(ivanov.get("/api/dictionary", params={"path": "Проекты"}).json()["people"]) == 3
+
+    # запись в корне: своего словаря у корня нет — пополнять нечего
+    root = voiced(web, "в корне.mp4")
+    signed = admin.post("/api/admin/names", json={"file": root, "parts": {"1": {"S1": "Тихонов Павел Ильич"}}})
+    assert signed.status_code == 200 and signed.json()["dictionary_added"] == []
+    assert web.words.get(web.dictionary.FOLDERS, "")["people"] == []
+
+
+# ---------- администратору: резервная копия из сервиса ----------
+
+def copy_done(web, timeout=30.0):
+    """Копия, которую сервис делает в фоне, закончилась — удачно или нет."""
+    end = time.monotonic() + timeout
+    while web.backup_job is not None:
+        assert time.monotonic() < end, "копия не закончилась"
+        time.sleep(0.02)
+
+
+def backed(tmp_path):
+    (tmp_path / "backup").mkdir(exist_ok=True)
+    return running(tmp_path, extra={"BACKUP_DIR": str(tmp_path / "backup")})
+
+
+def test_backup_schedule_is_checked_saved_and_shown_on_the_page(tmp_path):
+    with backed(tmp_path) as (web, _):
+        admin = enter(web, "admin", ADMIN_PASSWORD)
+        fresh = admin.get("/api/admin/status").json()["backups"]
+        assert fresh["plan"] == {**backup.PLAN, "by": "", "at": ""} and fresh["next"] is None
+        assert fresh["running"] is None and fresh["failed"] is None
+        plan = lambda **kw: admin.post("/api/admin/backup/plan", json={"on": True, "time": "03:00", **kw})
+        for wrong, said in (({"time": "25:00"}, "время копии"), ({"time": "3"}, "время копии"),
+                            ({"every": "month"}, "частота копии"), ({"every": "week", "weekday": 7}, "день недели"),
+                            ({"keep": 0}, "сколько копий держать")):
+            refused = plan(**wrong)
+            assert refused.status_code == 400 and refused.json()["detail"].startswith(said), wrong
+        saved = plan(every="week", weekday=6, inbox=False, keep=3)
+        assert saved.status_code == 200
+        shown = saved.json()["backups"]
+        assert {k: shown["plan"][k] for k in backup.PLAN} == {"on": True, "time": "03:00", "every": "week", "weekday": 6,
+                                                            "inbox": False, "keep": 3}
+        assert shown["plan"]["by"] == "admin" and shown["plan"]["at"]
+        nxt = datetime.datetime.fromisoformat(shown["next"])
+        assert (nxt.weekday(), nxt.hour, nxt.minute) == (6, 3, 0) and nxt > datetime.datetime.now().astimezone()
+        assert web.trail.actions(kind="backup_plan")[0]["plan"]["keep"] == 3
+        assert any("расписание резервной копии" in line for line in web.log.tail())
+        assert admin.post("/api/admin/backup/plan", json={"on": False, "time": "03:00"}).json()["backups"]["next"] is None
+    with backed(tmp_path) as (web, _):                                   # после перезапуска — то же расписание
+        assert web.options.backup_plan()["on"] is False and web.options.backup_plan()["by"] == "admin"
+
+
+def test_copy_now_goes_in_the_background_one_at_a_time_and_its_outcome_is_on_the_page(tmp_path, monkeypatch):
+    with backed(tmp_path) as (web, admin):
+        # копия идёт в событийном цикле сервиса: клиент — тот, что ходит в него (а не в свой цикл на запрос)
+        admin.post("/api/login", json={"login": "admin", "password": ADMIN_PASSWORD})
+        admin.post("/api/admin/backup/plan", json={"on": False, "time": "03:00", "inbox": False, "keep": 1})
+        go, real = threading.Event(), backup.create
+        monkeypatch.setattr(web.backup, "create", lambda *a, **kw: go.wait(10) and real(*a, **kw))
+        started = admin.post("/api/admin/backup/now")
+        assert started.status_code == 200 and started.json()["backups"]["running"]["by"] == "admin"
+        busy = admin.post("/api/admin/backup/now")                       # вторая копия рядом с идущей не начинается
+        assert busy.status_code == 409 and busy.json()["detail"] == web.BACKUP_BUSY
+        assert admin.get("/api/admin/status").json()["backups"]["running"]["how"] == backup.PAGE
+        go.set()
+        copy_done(web)
+        status = admin.get("/api/admin/status").json()
+        made = status["storage"]["backup"]
+        assert made["inbox"] is False and made["how"] == backup.PAGE and (tmp_path / "backup" / made["file"]).is_file()
+        assert status["backups"]["running"] is None and status["backups"]["failed"] is None
+        assert any("резервная копия сделана" in line and made["file"] in line for line in status["log"])
+        assert web.trail.actions(kind="backup")[0]["by"] == "admin"
+        # с настройкой «держать одну» вторая копия стирает первую
+        time.sleep(1.1)                                                  # имя архива — с точностью до секунды
+        admin.post("/api/admin/backup/now")
+        copy_done(web)
+        assert len(list((tmp_path / "backup").glob("*.tar"))) == 1
+
+        # тома копий нет: строка «ВНИМАНИЕ», предупреждение на странице — до следующей удачной копии
+        for leftover in (tmp_path / "backup").iterdir():
+            leftover.unlink()
+        (tmp_path / "backup").rmdir()
+        admin.post("/api/admin/backup/now")
+        copy_done(web)
+        status = admin.get("/api/admin/status").json()
+        failed = status["backups"]["failed"]
+        assert "папки для копий" in failed["why"] and failed["how"] == backup.PAGE and failed["by"] == "admin"
+        assert any("ВНИМАНИЕ: резервная копия НЕ сделана: папки для копий" in line for line in status["log"])
+        (tmp_path / "backup").mkdir()
+        admin.post("/api/admin/backup/now")
+        copy_done(web)
+        assert admin.get("/api/admin/status").json()["backups"]["failed"] is None
+        page = page_source("admin")
+        assert "/api/admin/backup/now" in page and "/api/admin/backup/plan" in page and "Сделать копию сейчас" in page
+
+
+def test_scheduled_copy_is_made_once_in_its_time_and_the_next_waits_for_the_next_time(tmp_path):
+    with backed(tmp_path) as (web, client):
+        admin = enter(web, "admin", ADMIN_PASSWORD)
+        plan = admin.post("/api/admin/backup/plan", json={"on": True, "time": "03:00", "keep": 2}).json()["backups"]["plan"]
+        saved = datetime.datetime.fromisoformat(plan["at"])
+        first = backup.upcoming(plan, saved)
+        assert not web._backup_due(saved) and not web._backup_due(first - datetime.timedelta(seconds=1))
+        assert web._backup_due(first + datetime.timedelta(hours=30))         # сервис проспал и это время, и следующее
+        assert client.portal.call(web._backup_tick, first + datetime.timedelta(hours=30)) is True
+        copy_done(web)
+        made = backup.last(web.base)
+        assert made["how"] == backup.SCHEDULE and web.trail.actions(kind="backup")[0]["by"] == ""
+        # копия есть — до следующего времени по расписанию вторую не делает, пропущенное пачкой не догоняет
+        later = datetime.datetime.fromisoformat(made["at"])
+        assert not web._backup_due(later) and client.portal.call(web._backup_tick, later) is False
+        assert web._backup_due(backup.upcoming(plan, later) + datetime.timedelta(minutes=1))
+        assert len(list((tmp_path / "backup").glob("*.tar"))) == 1
+
+
+# ---------- администратору: очередь на «Обработке» ----------
+
+def test_record_taken_off_the_queue_stays_off_after_a_restart_until_it_is_run_by_hand(tmp_path):
+    file = "Проекты/вкс.mp4"
+    with running(tmp_path) as (web, _):
+        admin = enter(web, "admin", ADMIN_PASSWORD)
+        web.service._take = lambda: None                                 # очередь никто не разбирает
+        (web.cfg.inbox / "Проекты").mkdir()
+        (web.cfg.inbox / file).write_bytes(b"video" * 1000)
+        web.service.queue.append(watcher.QueueItem(path=file))
+        taken = admin.post("/api/admin/queue/remove", json={"file": file})
+        assert taken.status_code == 200 and taken.json() == {"ok": True, "file": file, "remembered": True}
+        assert web.service.queue == []
+        again = admin.post("/api/admin/queue/remove", json={"file": file})
+        assert again.status_code == 409 and again.json()["detail"] == web.NOT_QUEUED
+        assert web.trail.actions(kind="queue_remove")[0]["by"] == "admin"
+        assert any("снята из очереди" in line and file in line for line in web.log.tail())
+        assert [d["path"] for d in admin.get("/api/admin/status").json()["dropped"]] == [file]
+    with running(tmp_path) as (web, _):
+        admin = enter(web, "admin", ADMIN_PASSWORD)
+        web.service._take = lambda: None
+        for _ in range(2):
+            web.service.scan_once()
+        assert web.service.queue == [] and web.service.pending == {}     # сканер её сам не берёт и после перезапуска
+        assert admin.post("/api/admin/run", json={"file": file}).status_code == 200
+        assert [i.path for i in web.service.queue] == [file] and web.service.dropped == {}
+        assert web.options.dropped() == {}
+
+
+def test_run_is_cancelled_by_the_administrator_and_only_a_running_one(site):
+    web, admin, ivanov, _ = staffed(site)
+    file = "Проекты/вкс.mp4"
+    refused = admin.post("/api/admin/queue/cancel", json={"file": file})
+    assert refused.status_code == 409 and refused.json()["detail"] == web.NOT_RUNNING
+    web.service.running.append(job(file))
+    try:
+        asked = admin.post("/api/admin/queue/cancel", json={"file": file})
+        assert asked.status_code == 200 and asked.json()["cancel"]["by"] == "admin"
+        assert admin.get("/api/admin/status").json()["running"][0]["cancel"]["by"] == "admin"
+        assert web.trail.actions(kind="run_cancel")[0]["file"] == file
+        assert any("отменить прогон" in line and file in line for line in web.log.tail())
+        assert ivanov.post("/api/admin/queue/cancel", json={"file": file}).status_code == 403
+    finally:
+        web.service.running.clear()
+    page = page_source("admin")
+    assert "/api/admin/queue/cancel" in page and "/api/admin/queue/remove" in page and "Отменить прогон" in page
+
+
+def test_file_held_for_a_decision_can_be_run_by_hand(site):
+    """Копия готовой записи и файл, похожий на недокопированный, ждут решения администратора: сервис пишет
+    «запустите вручную». Прежде ручной запуск отвечал «файл ещё дописывается» — запустить было нельзя."""
+    web, admin, _, _ = staffed(site)
+    web.service._take = lambda: None
+    (web.cfg.inbox / "Проекты").mkdir()
+    for name in ("копия.mp4", "обрубок.mp4", "копируется.mp4"):
+        (web.cfg.inbox / "Проекты" / name).write_bytes(b"video")
+    web.service.pending.update({
+        "Проекты/копия.mp4": watcher.Pending(size=5, mtime=0, held="копия записи Проекты/вкс.mp4 — запустите вручную"),
+        "Проекты/обрубок.mp4": watcher.Pending(size=5, mtime=0, cut="по заголовку WAV в файле 100 байт"),
+        "Проекты/копируется.mp4": watcher.Pending(size=5, mtime=0)})
+    for name in ("копия.mp4", "обрубок.mp4"):
+        assert admin.post("/api/admin/run", json={"file": f"Проекты/{name}"}).status_code == 200, name
+    still = admin.post("/api/admin/run", json={"file": "Проекты/копируется.mp4"})
+    assert still.status_code == 409 and still.json()["detail"] == web.STILL_WRITTEN

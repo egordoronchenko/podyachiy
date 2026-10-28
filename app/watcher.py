@@ -27,7 +27,7 @@ from typing import Callable
 from . import folders, marks, media, notify, pipeline, records, upload
 from .config import Settings
 from .journal import Journal
-from .ledger import MAX_FAILURES, RETRY_AFTER_SEC, RETRY_STATUSES, SOURCE_CHANGED, SOURCE_STATE, Ledger
+from .ledger import CANCELLED, MAX_FAILURES, RETRY_AFTER_SEC, RETRY_STATUSES, SOURCE_CHANGED, SOURCE_STATE, Ledger
 
 # временные файлы копирования: пока идёт передача, имя выглядит так
 TEMP_SUFFIXES = {".tmp", ".part", ".crdownload", ".partial", ".!ut"}
@@ -212,6 +212,12 @@ class Service:
     # пользователей (users.Users) и словари (dictionary.Store). Задаёт сервис (web.py).
     people: object | None = None
     dictionaries: object | None = None
+    # Записи, которые администратор снял из очереди (unqueue): путь → {size, mtime, by, at}. Сканер их сам не
+    # берёт — иначе снятая новая запись тут же вернулась бы в очередь и ушла в платное распознавание, — пока
+    # файл не изменится или запись не запустят вручную. Хранятся в базе (keep_dropped — записать весь список;
+    # задаёт сервис): перезапуск их не забывает.
+    dropped: dict[str, dict] = field(default_factory=dict)
+    keep_dropped: Callable[[dict], None] | None = None
     # Обход входной папки и действия с записью (records.py) друг друга исключают: сканер
     # сверяет файлы на диске с журналом обработки по пути, а переименование меняет и то,
     # и другое не одним шагом. Застань сканер середину — принял бы запись за новую.
@@ -372,6 +378,8 @@ class Service:
             except OSError:
                 continue
             if st.st_size == 0:
+                continue
+            if rel in self.dropped and self._still_dropped(rel, st):
                 continue
 
             if self.ledger.is_processed(rel):
@@ -617,10 +625,81 @@ class Service:
 
     # ---------- обработчики ----------
 
+    # ---------- снять из очереди, отменить прогон ----------
+
+    def _set_dropped(self, entries: dict) -> None:
+        """Список снятых из очереди — сначала в базу, потом в память: не записался — не изменился."""
+        if self.keep_dropped is not None:
+            self.keep_dropped(entries)
+        self.dropped = entries
+
+    def _forget_dropped(self, rel: str) -> None:
+        if rel in self.dropped:
+            self._set_dropped({k: v for k, v in self.dropped.items() if k != rel})
+
+    def _still_dropped(self, rel: str, st) -> bool:
+        """Снятая из очереди запись та же — размер и время изменения те же: сканер её не берёт. Файл
+        изменился — это уже другая запись: отметка снимается, и дальше файл идёт как любой."""
+        seen = self.dropped[rel]
+        if (seen["size"], seen["mtime"]) == (st.st_size, st.st_mtime):
+            return True
+        self._forget_dropped(rel)
+        self.log(f"{rel}: файл изменился после того, как его сняли из очереди, — дальше как с любым файлом")
+        return False
+
+    def unqueue(self, path: str, by: str) -> bool | None:
+        """Администратор снимает запись из очереди — все её задания там; идущий прогон не трогается
+        (его отменяет cancel). None — в очереди её нет. True — сервис запомнил, что её сняли вручную:
+        иначе сканер взял бы её снова (новая запись, повтор после сбоя). False — помнить нечего: сам
+        сканер её и так не возьмёт (готовая запись, у которой сняли пересборку)."""
+        items = [i for i in list(self.queue) if i.path == path]
+        if not items:
+            return None
+        remember = not self.ledger.is_processed(path) or self.ledger.retry_due(path)
+        if remember:
+            try:
+                st = (self.cfg.inbox / path).stat()
+            except OSError:
+                remember = False                # файла нет — сканер его и не увидит
+            else:
+                self._set_dropped({**self.dropped, path: {"size": st.st_size, "mtime": st.st_mtime, "by": by,
+                                                          "at": pipeline.now_iso()}})
+        for item in items:
+            self.queue.remove(item)
+        self.log(f"{path}: снята из очереди вручную ({by})"
+                 + (" — сама в обработку не пойдёт, пока файл не изменится или её не запустят вручную" if remember else ""))
+        return remember
+
+    def cancel(self, path: str, by: str) -> dict | None:
+        """Администратор отменяет идущий прогон записи: тот остановится перед следующим платным запросом
+        (pipeline.checkpoint), идущий запрос поставщику доработает. Отдаёт отметку {by, at}; None — запись
+        сейчас не обрабатывается. Отменить уже отменяемое — та же, первая отметка."""
+        for job in list(self.running):
+            if job["file"] == path:
+                if not job.get("cancel"):
+                    job["cancel"] = {"by": by, "at": pipeline.now_iso()}
+                    self.log(f"{path}: {by} просит отменить прогон — остановлю перед следующим платным запросом; "
+                             f"идущий запрос поставщику не обрываю: за него могли уже списать деньги")
+                return job["cancel"]
+        return None
+
+    @staticmethod
+    def _cancelled(record: dict, prev: dict | None) -> dict:
+        """Отменённый прогон — не исход записи. Запись, исход которой уже был (готова, без протокола, без
+        звука), им и остаётся — её результаты на месте; от прогона у неё — его расход и отметка об отмене.
+        Новая запись и запись после сбоя — с исходом «отменено» (ошибка с отметкой CANCELLED): по расписанию
+        такая не повторяется (ledger.retry_due)."""
+        if not prev or prev.get("status") in (None, "error"):
+            return record
+        spent = {k: record[k] for k in ("started_at", "cost", "cost_details", "cost_models", "cost_providers",
+                                        "api_calls") if k in record}
+        return {**prev, **spent, CANCELLED: record[CANCELLED]}
+
     def enqueue_manual(self, path: str, template: str | None, force: bool,
                        by: str, reason: str, model: str = "") -> None:
         """Запуск человеком: в начало очереди — его возьмёт первый освободившийся
-        обработчик."""
+        обработчик. Снятая прежде из очереди запись этим снова разрешена."""
+        self._forget_dropped(path)
         self.queue.insert(0, QueueItem(path=path, template=template,
                                        force=force, manual=True, by=by, reason=reason, model=model))
         self.log(f"ручной запуск ({by}): {path}, "
@@ -700,6 +779,7 @@ class Service:
             job["chunks_total"] = total
 
         prev = self.ledger.get(item.path)
+        pipeline.halt.set(lambda: job.get("cancel"))        # отменил ли администратор (cancel)
         try:
             stem = (pipeline.stem_of(self.cfg.inbox, item.path, prev) if prev
                     else pipeline.stem_for(self.cfg.inbox, item.path, self.ledger.records))
@@ -721,6 +801,8 @@ class Service:
                     "manual": item.manual, "force": item.force,
                 }
                 run = False
+            if record.get(CANCELLED):
+                record = self._cancelled(record, prev)
             self._source_kept(record, prev)
             saved = self._save(item, record, prev, run)
         finally:
@@ -777,7 +859,11 @@ class Service:
                 self._after(item, record, prev)
 
     def _after(self, item: QueueItem, record: dict, prev: dict | None) -> None:
-        """Исход записан: что будет дальше и кому письмо."""
+        """Исход записан: что будет дальше и кому письмо. Об отменённом прогоне писем нет: что дальше,
+        решил администратор."""
+        if record.get(CANCELLED):
+            self.log(f"{item.path}: прогон отменён — автоматически не повторяю; нужна — запустите вручную")
+            return
         self._say_retry_plan(item.path)
         self._announce(item, record, prev)
 
@@ -859,6 +945,9 @@ class Service:
                  "held": f"похоже, докопирован не до конца: {p.cut}" if p.cut else p.held or ""}
                 for rel, p in sorted(self.pending.items())
             ],
+            # снятые из очереди вручную: сами в обработку не идут (unqueue); файла уже нет — не показываются
+            "dropped": [{"path": rel, "by": d["by"], "at": d["at"]} for rel, d in sorted(self.dropped.items())
+                        if (self.cfg.inbox / rel).is_file()],
             "scans": self.scans,
             "last_scan": self.last_scan,
         }

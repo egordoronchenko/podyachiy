@@ -17,7 +17,9 @@ import datetime
 import json
 import tempfile
 import time
+from contextvars import ContextVar
 from pathlib import Path
+from typing import Callable
 
 from . import actions, dictionary, external, ledger, marks, media, names, registry, speech, summarize, templates, triage, usage
 from .config import Settings
@@ -28,6 +30,32 @@ MODE = "transcript"
 class NoSpeechError(media.NoAudioError):
     """Звук в записи есть, но распознавание не нашло в нём ни слова. Исход тот же, что у записи без
     звука (no_audio), — окончательный; только деньги за распознавание уже потрачены."""
+
+
+# Отмена прогона администратором (watcher.Service.cancel). Прогон останавливается не посреди дела, а
+# между платными запросами: перед каждым шагом и перед каждой следующей частью распознавания. Идущий
+# запрос поставщику не обрывается — поставщик мог уже выполнить работу и списать за неё деньги, а
+# оборванный ответ сервис бы не получил: ни суммы в расходах, ни результата на диске. Дожидается и
+# ffmpeg — он бесплатный. Всё, что успело сделаться, остаётся на диске, и повтор берёт его готовым.
+# Спросить «не отменили ли» — halt: переменная контекста задания, как накопитель расходов в usage.py;
+# обработчик кладёт в неё вопрос перед прогоном. Ответ — {"by", "at"}, кто и когда отменил, или None.
+halt: ContextVar[Callable[[], dict | None]] = ContextVar("halt", default=lambda: None)
+CANCELLED_TEXT = "обработку отменил администратор {by} — автоматически не повторяется: нужна — запустите вручную"
+
+
+class Cancelled(Exception):
+    """Прогон отменён администратором; mark — кто и когда."""
+
+    def __init__(self, mark: dict):
+        super().__init__(CANCELLED_TEXT.format(by=mark.get("by") or "сервиса"))
+        self.mark = mark
+
+
+def checkpoint() -> None:
+    """Перед платным шагом: отменили — дальше не идти."""
+    mark = halt.get()()
+    if mark:
+        raise Cancelled(mark)
 
 
 def now_iso() -> str:
@@ -283,12 +311,20 @@ async def process(
         record["reused_transcript"] = bool(t)
 
         if t is None:
+            checkpoint()
             audio_path = await asyncio.to_thread(
                 media.ensure_audio, src, out_dir, stem, force, log)
+
+            async def progress(done: int, total: int) -> None:
+                if on_progress:
+                    await on_progress(done, total)
+                if done < total:
+                    checkpoint()            # следующая часть — новый платный запрос
+
             with tempfile.TemporaryDirectory(prefix="chunks_") as tmp:
                 log(f"шаг 1: расшифровка с разделением говорящих — {cfg.model}")
                 t = await speech.transcribe_one(
-                    audio_path, out_dir, stem, cfg, Path(tmp), on_progress=on_progress, log=log,
+                    audio_path, out_dir, stem, cfg, Path(tmp), on_progress=progress, log=log,
                     terms=dictionary.hints(words) + speech.glossary_terms(cfg.prompts_dir))
             if names.forget(out_dir, stem):
                 log("подписи говорящих сброшены: запись распознана заново, "
@@ -326,6 +362,7 @@ async def process(
                    if record["reused_transcript"] else None)
             record["reused_triage"] = bool(tri)
             if tri is None:
+                checkpoint()
                 log("шаг 2: разбор записи — тип, название, кто есть кто")
                 tri = await triage.triage_file(
                     out_dir, stem, templates.load_triage(cfg.prompts_dir, kinds), cfg, log, glossary, kinds,
@@ -359,12 +396,15 @@ async def process(
 
             notes = triage.notes(tri, signed, unsigned, source_note(src))
             if kinds[template_key].get("actions"):
+                checkpoint()
                 log(f"шаг 3: поручения — независимо выписывают {', '.join(cfg.actions_models)}")
                 notes += await actions.extract_file(
                     out_dir, stem, templates.load_actions(cfg.prompts_dir), cfg, log,
                     notes=notes, glossary=glossary, who=who)
+                checkpoint()
                 log(f"шаг 4: протокол по шаблону «{title}»")
             else:
+                checkpoint()
                 log(f"шаг 3: протокол по шаблону «{title}»")
             tail = (previous_tasks(cfg, rel, neighbours or [], tri["date"], started, log, marked, series=series)
                     if cfg.prev_tasks else "")
@@ -376,11 +416,17 @@ async def process(
             record["summary_chars"] = smeta["summary_chars"]
             record["timestamps"] = smeta["timestamps"]
             record["timestamps_unknown"] = smeta["timestamps_unknown"]
+        except Cancelled:
+            raise                   # отмена — не сбой протокола
         except Exception as e:
             record.update({"status": "no_summary", "error": str(e)[:500],
                            "summary_chars": 0})
             log(f"протокол не сделан: {rel} — {e}. Расшифровка на месте и при "
                 f"повторе без force заново оплачена не будет")
+    except Cancelled as e:
+        record.update({"status": "error", "error": str(e), ledger.CANCELLED: e.mark})
+        log(f"отменено: {rel} — прогон отменил {e.mark.get('by') or 'администратор'}. Сделанное до отмены "
+            f"оплачено и лежит на диске: при запуске заново готовое возьмётся без новой оплаты")
     except NoSpeechError as e:
         record.update({"status": "no_audio", "error": str(e)})
         log(f"нет речи: {rel} — {e}. Автоматически не повторяю: распознавание той же тишины снова стоило бы денег")
@@ -406,6 +452,8 @@ async def process(
             f"говорящих {record.get('speakers') or 0}, "
             f"слов без метки {(record.get('unlabeled') or 0) * 100:.0f}%, {cost}")
 
+    if record.get(ledger.CANCELLED):
+        return record               # отмена — не исход записи: на диске что было и что прогон успел сделать
     if record["status"] in ("ok", "no_audio"):
         ledger.write_marker(out_dir, stem, record, log)
         # прошлый неудачный прогон больше не описывает состояние записи

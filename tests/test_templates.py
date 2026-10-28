@@ -38,7 +38,7 @@ def test_standard_files_pass_the_check():
         warnings = templates.check("type", text_of(meta["file"]))
         assert (warnings == []) == (key in ("meeting", "call")), (key, warnings)
     assert any("Нет раздела «Задачи»" in w for w in templates.check("type", text_of("lecture.md")))
-    for item in ("triage", "actions", "glossary"):
+    for item in ("triage", "actions", "glossary", "common"):
         assert templates.check(item, text_of(templates.SERVICE[item]["file"])) == [], item
 
 
@@ -141,7 +141,8 @@ def test_own_type_is_added_changed_and_removed(prompts):
     kinds_now = templates.types(prompts)
     assert list(kinds_now)[:4] == list(templates.TEMPLATES) and kinds_now[key] == {
         "title": "Разбор инцидента", "file": "razbor_incidenta.md", "custom": True, "when": WHEN, "actions": True}
-    assert templates.load_template(prompts, key) == ("Разбор инцидента", text_of("meeting.md").strip())
+    # текст — копия шаблона совещания, со строками общих правил: собирается так же, как он
+    assert templates.load_template(prompts, key) == ("Разбор инцидента", templates.load_template(prompts, "meeting")[1])
     assert json.loads((prompts / "types.json").read_text(encoding="utf-8")) == {
         key: {"title": "Разбор инцидента", "when": WHEN, "actions": True}}
 
@@ -349,7 +350,8 @@ def test_page_shows_what_is_really_in_the_files(site):
     web, admin, ivanov, _ = staffed(site)
     seed(web)
     seen = admin.get("/api/admin/templates").json()
-    assert [t["id"] for t in seen["items"]] == ["meeting", "lecture", "call", "spec", "triage", "actions", "glossary"]
+    assert [t["id"] for t in seen["items"]] == ["meeting", "lecture", "call", "spec", "triage", "actions", "glossary",
+                                               "common"]
     assert seen["problem"] == "" and seen["writable"] and seen["limits"]["chars"] == templates.MAX_CHARS
     meeting = items(admin)["meeting"]
     assert (meeting["kind"], meeting["title"], meeting["file"], meeting["state"]) == ("type", "Совещание", "meeting.md", "standard")
@@ -556,7 +558,7 @@ def test_personal_mode_edits_templates_without_login(tmp_path):
     """Шаблоны нужны и одному человеку за своим компьютером."""
     with running(tmp_path, mode="personal") as (web, client):
         seed(web)
-        assert len(items(client)) == 7
+        assert len(items(client)) == 8
         edited = text_of("lecture.md") + "\n\n## 8. Домашнее задание\n"
         assert client.post("/api/admin/templates/save", json={"id": "lecture", "text": edited}).json()["changed"]
         assert items(client)["lecture"]["by"] == "owner"
@@ -641,10 +643,149 @@ def test_recognition_gets_the_hints_record_first_and_the_glossary_last(prompts, 
 
 
 def test_shipped_prompts_tell_to_treat_the_list_as_a_hint():
-    """Правила о списке участников стоят в задании на разбор, на поручения и во всех четырёх шаблонах."""
+    """Правила о списке участников стоят в задании на разбор, на поручения и во всех четырёх шаблонах
+    (в шаблонах — частью из общих правил: проверяется собранный текст, тот, что уходит модели)."""
     assert "6. Список участников — подсказка, а не перечень присутствующих" in text_of("triage.md")
-    for name in ("meeting.md", "call.md", "lecture.md", "spec.md"):
-        body = text_of(name)
+    for name in templates.TEMPLATES:
+        body = templates.load_template(STANDARD, name)[1]
         assert "подсказка, а не перечень присутствующих" in body and "Ершова Лидия Марковна" in body, name
         assert "не попадает вовсе" in body and "пиши в точности как в списке" in " ".join(body.split()), name
     assert "исполнителем\n   по списку не назначай" in text_of("actions.md")
+
+
+# ---------- общие правила шаблонов ----------
+
+# Отпечатки собранных заданий модели из поставки, снятые до выноса общих правил в common.md:
+# модель получает ровно тот же текст, что и раньше, — ни на знак другой.
+ASSEMBLED = {
+    "meeting": "23fa7644b5a038dd850af342d69a54224ddc18ea043bd579ff8156c7acffa1c9",
+    "lecture": "0a60b6c13da6fc4224e8a56ad787ce14c459e7bd80d7f50e79e9ce7c70319830",
+    "call": "9f01f5a95233ddf2102c759d2fbca6100063454750fa22dc1683419ea06a6679",
+    "spec": "289437f52088d5e3245dace42bda7bfa684ec22202dad69f2d49a9ce65fe96b3",
+    "triage": "684ca88474f65129dc264e38266eb41a0cfc4c5f15bc8e32ae6e40c27df1547f",
+    "actions": "4a4187c34e394b2c1ab14312f5bc88cafa76d6bb7a648a9632cc2b009168a6a5",
+}
+
+
+def sha(text: str) -> str:
+    import hashlib
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def assembled(prompts_dir) -> dict:
+    out = {key: templates.load_template(prompts_dir, key)[1] for key in templates.TEMPLATES}
+    return {**out, "triage": templates.load_triage(prompts_dir), "actions": templates.load_actions(prompts_dir)}
+
+
+def test_shipped_templates_give_the_model_the_same_text_after_the_common_rules_moved_out():
+    assert {key: sha(text) for key, text in assembled(STANDARD).items()} == ASSEMBLED
+    # одинаковое действительно вынесено: каждый кусок общего файла подключают хотя бы два шаблона
+    found = templates.pieces(text_of(templates.COMMON_FILE))
+    used = {key: templates.includes(text_of(meta["file"])) for key, meta in templates.TEMPLATES.items()}
+    assert found and set(found) == {name for names in used.values() for name in names}
+    for name in found:
+        assert sum(name in names for names in used.values()) >= 2, name
+    assert all(used.values())                                       # общие правила есть в каждом шаблоне
+    assert "Ершова Лидия Марковна" in text_of(templates.COMMON_FILE) and "Ершова" not in text_of("meeting.md")
+
+
+def test_common_piece_reaches_every_template_that_includes_it(prompts):
+    common = text_of(templates.COMMON_FILE)
+    rule = "Если после шаблона дан список участников — это подсказка, а не перечень присутствующих."
+    assert rule in common
+    templates.save(prompts, templates.COMMON_FILE, common.replace(rule, rule + " Новое общее правило."))
+    for key, text in assembled(prompts).items():
+        assert ("Новое общее правило." in text) == (key in templates.TEMPLATES), key
+
+    # свой текст без строк «@@» — как раньше: собирается как есть
+    own = assembled(STANDARD)["meeting"] + "\n\n## 8. Своё\n"
+    (prompts / "meeting.md").write_text(own, encoding="utf-8")
+    assert templates.load_template(prompts, "meeting")[1] == own.strip()
+    # подключён кусок, которого нет, — шаблон не годится, и обработка говорит, чего не хватает
+    (prompts / "call.md").write_text(text_of("call.md") + "\n@@ нет-такого\n", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="нет-такого.*common.md"):
+        templates.load_template(prompts, "call")
+    (prompts / templates.COMMON_FILE).unlink()
+    with pytest.raises(RuntimeError, match="common.md"):
+        templates.load_template(prompts, "lecture")
+    assert templates.load_template(prompts, "meeting")[1] == own.strip()            # без «@@» общий файл не нужен
+
+
+def test_common_file_and_includes_are_checked_before_saving(prompts):
+    meeting = text_of("meeting.md")
+    # шаблон проверяется в том виде, в каком уйдёт модели: правила из общего файла в нём есть
+    assert templates.check_file(prompts, "type", meeting) == []
+    for bad, why in ((meeting + "\n@@ нет-такого\n", "«нет-такого»"),
+                     (meeting + "\n@@ два слова\n", "имени куска в ней не разобрать")):
+        with pytest.raises(templates.TemplateError, match=why):
+            templates.check_file(prompts, "type", bad)
+    common = text_of(templates.COMMON_FILE)
+    assert templates.check_file(prompts, "common", common) == []
+    assert templates.kind_of("common") == "common" and templates.file_of(prompts, "common") == templates.COMMON_FILE
+    piece = "@@ список-участников"
+    without = common.replace(piece, "@@ другое-имя")
+    with pytest.raises(templates.TemplateError, match="список-участников.*meeting.md"):
+        templates.check_file(prompts, "common", without)
+    for bad, why in ((common + "\n" + piece + "\nещё раз\n", "дважды"), (common + "\n@@ пустой\n\n", "пустой")):
+        with pytest.raises(templates.TemplateError, match=why):
+            templates.check_file(prompts, "common", bad)
+    assert "ни одного куска" in templates.check("common", "только пояснение")[0]
+
+
+def test_common_rules_are_one_more_file_on_the_templates_page(site):
+    web, admin, _, _ = staffed(site)
+    seed(web)
+    seen = items(admin)
+    common = seen["common"]
+    assert (common["kind"], common["file"], common["state"], common["problem"], common["warnings"]) == (
+        "common", templates.COMMON_FILE, "standard", "", [])
+    assert "@@ имя" in common["when"] and common["includes"] == []
+    assert seen["meeting"]["includes"] == templates.includes(text_of("meeting.md")) and seen["call"]["includes"]
+    assert seen["triage"]["includes"] == [] and seen["meeting"]["warnings"] == []
+    assert text(admin, "common").json()["text"] == text_of(templates.COMMON_FILE)
+
+    # кусок, который подключают шаблоны, из общего файла не убрать: обработка встала бы
+    original = text_of(templates.COMMON_FILE)
+    refused = admin.post("/api/admin/templates/save", json={
+        "id": "common", "text": original.replace("@@ список-участников", "@@ переименован")})
+    assert refused.status_code == 400 and "meeting.md" in refused.json()["detail"]
+    # правка куска действует во всех шаблонах, которые его подключают, со следующей записи
+    edited = original.replace("а не перечень присутствующих.", "а не перечень присутствующих. Новое правило.", 1)
+    saved = admin.post("/api/admin/templates/save", json={"id": "common", "text": edited}).json()
+    assert saved["changed"] and saved["warnings"] == [] and len(items(admin)["common"]["backups"]) == 1
+    for key in templates.TEMPLATES:
+        assert "Новое правило." in templates.load_template(web.cfg.prompts_dir, key)[1], key
+    assert items(admin)["common"]["state"] == "changed" and items(admin)["meeting"]["state"] == "standard"
+    # шаблон, подключающий то, чего нет, не сохраняется
+    bad = admin.post("/api/admin/templates/save", json={"id": "meeting", "text": text_of("meeting.md") + "\n@@ нет-такого\n"})
+    assert bad.status_code == 400 and "нет-такого" in bad.json()["detail"]
+    assert admin.post("/api/admin/templates/restore", json={"id": "common", "version": "default"}).json()["changed"]
+    assert {key: sha(t) for key, t in assembled(web.cfg.prompts_dir).items()} == ASSEMBLED
+
+
+def test_untouched_templates_of_an_older_version_move_to_the_common_rules(tmp_path):
+    """Установка до общего файла: в томе шаблонов лежат тексты целиком. Нетронутые сервис при запуске
+    заменяет новыми, с подключением общих правил, — модель получает тот же текст, а правка общего
+    файла дальше действует и в них. Правленные руками остаются как есть и собираются как раньше."""
+    old = assembled(STANDARD)
+    with running(tmp_path) as (web, client):
+        prompts = web.cfg.prompts_dir
+        prompts.mkdir(parents=True, exist_ok=True)
+        for key in ("meeting", "lecture"):
+            (prompts / f"{key}.md").write_text(old[key] + "\n", encoding="utf-8")
+        (prompts / "call.md").write_text(old["call"] + "\n\n## 8. Наш раздел\n", encoding="utf-8")
+        seed(web)
+        assert (prompts / "meeting.md").read_text(encoding="utf-8") == text_of("meeting.md")
+        assert (prompts / "lecture.md").read_text(encoding="utf-8") == text_of("lecture.md")
+        assert (prompts / "call.md").read_text(encoding="utf-8") == old["call"] + "\n\n## 8. Наш раздел\n"
+        assert {key: sha(t) for key, t in assembled(prompts).items() if key != "call"} == {
+            key: d for key, d in ASSEMBLED.items() if key != "call"}
+        assert templates.load_template(prompts, "call")[1] == old["call"] + "\n\n## 8. Наш раздел"
+        admin = enter(web, "admin", ADMIN_PASSWORD)
+        seen = items(admin)
+        assert (seen["meeting"]["state"], seen["meeting"]["outside"], seen["meeting"]["backups"]) == ("standard", False, [])
+        assert seen["call"]["state"] == "changed" and seen["call"]["includes"] == []
+        # второй запуск ничего не меняет
+        before = {p.name: p.read_bytes() for p in prompts.iterdir() if p.is_file()}
+        seed(web)
+        assert {p.name: p.read_bytes() for p in prompts.iterdir() if p.is_file()} == before

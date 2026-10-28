@@ -27,6 +27,11 @@ docker compose run — при остановленном): папки берут
 шла копия, попадёт в архив результатами, но не строкой базы: после восстановления сервис
 возьмёт её снова — расшифровку переиспользует с диска и заново сделает только протокол.
 Обратный порядок оставлял бы записи, которые в базе готовы, а на диске без результатов.
+
+Копию делает и сам сервис: по расписанию со страницы «Обработка» и кнопкой «Сделать копию сейчас»
+(web.py). Расписание — одно время суток по часовому поясу сервиса (TZ), каждый день или раз в неделю;
+когда копия положена, решает due: пропущенное время (сервис был выключен) не догоняется пачкой —
+одна копия, как только сервис снова работает.
 """
 from __future__ import annotations
 
@@ -35,6 +40,7 @@ import datetime
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import sys
@@ -56,6 +62,9 @@ BASE = f"state/{db.FILE}"
 PARTS = ("state", "prompts", "outbox", "inbox")
 CHUNK = 1 << 20
 LAST = "last_backup"                    # под этим ключом в базе лежат сведения о последней копии
+FAILED = "backup_failed"                # а здесь — о последней несостоявшейся, пока после неё не было удачной
+# кто сделал копию: команда в контейнере, сервис по расписанию, человек кнопкой на странице (или ключом)
+COMMAND, SCHEDULE, PAGE = "command", "schedule", "page"
 # таблицы, строки которых считаются в описи: число строк до копии и после восстановления должно совпасть
 COUNTED = ("users", "grants", "keys", "dictionaries", "requests", "records", "marks", "events", "runs")
 
@@ -129,8 +138,13 @@ def _latest(folder: Path) -> list[Path]:
 
 
 def create(cfg, to: Path | None = None, with_inbox: bool = True, keep: int = 0, say=print,
-           kept=db.kept, now: datetime.datetime | None = None) -> dict:
-    """Делает копию и отдаёт её опись (с полем archive — путь архива). Сбой — BackupError."""
+           kept=db.kept, now: datetime.datetime | None = None, *, by: str = "", how: str = COMMAND,
+           log=None, base: db.Database | None = None) -> dict:
+    """Делает копию и отдаёт её опись (с полем archive — путь архива). Сбой — BackupError.
+
+    Из сервиса: by — кто нажал кнопку (пусто — сервис сам, по расписанию), how — как сделана (COMMAND,
+    SCHEDULE, PAGE), log — журнал работы сервиса (итог — строкой в него, а не дописью в файл мимо него),
+    base — его база."""
     started = time.perf_counter()
     target = Path(to or cfg.backup_dir)
     places = roots(cfg)
@@ -166,11 +180,14 @@ def create(cfg, to: Path | None = None, with_inbox: bool = True, keep: int = 0, 
     skip = [target.resolve(), places["state"] / migrate.WORK, places["inbox"] / upload.PARTS_DIR]
     skip += [places["state"] / (db.FILE + tail) for tail in ("", "-wal", "-shm", "-journal")]
     try:
-        base = db.Database(places["state"])
-        try:
+        if base is not None:
             base.snapshot(snapshot)
-        finally:
-            base.close()
+        else:
+            own = db.Database(places["state"])
+            try:
+                own.snapshot(snapshot)
+            finally:
+                own.close()
         con = sqlite3.connect(snapshot)
         try:
             if con.execute("PRAGMA quick_check").fetchone()[0] != "ok":
@@ -263,7 +280,7 @@ def create(cfg, to: Path | None = None, with_inbox: bool = True, keep: int = 0, 
             + (f"; НЕ ПРОЧИТАНО файлов — {len(manifest['skipped'])}: копия неполная" if manifest["skipped"] else "")
             + (f"; старых копий удалено — {len(removed)}" if removed else ""))
     _note(cfg, line, {"file": final.name, "bytes": manifest["archive_bytes"], "files": len(manifest["files"]),
-                      "inbox": with_inbox, "skipped": len(manifest["skipped"])})
+                      "inbox": with_inbox, "skipped": len(manifest["skipped"]), "how": how}, by, log, base)
     say(line)
     return manifest
 
@@ -291,32 +308,141 @@ def _thin(target: Path, keep: int, say) -> list[str]:
     return removed
 
 
-def _note(cfg, line: str, event: dict) -> None:
-    """Итог копии — строкой в журнал работы, событием в журнал действий и отметкой «последняя копия»
-    для страницы администратора. Сбой здесь копию не отменяет: архив уже готов."""
+def _line(cfg, line: str, log) -> None:
+    """Строка в журнал работы: в журнал сервиса, когда копию делает он, иначе — дописью в файл журнала."""
+    if log is not None:
+        log(line)
+        return
     try:
         path = Path(cfg.outbox) / logbook.LOG_DIR / logbook.LOG_FILE
         path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "a", encoding="utf-8") as log:
-            log.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {line}\n")
+        with open(path, "a", encoding="utf-8") as out:
+            out.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {line}\n")
     except OSError:
         pass
+
+
+def _noted(cfg, base: db.Database | None, write) -> None:
+    """write(база) — в базу сервиса: его собственную или открытую на время. Базы нет — ничего: заводить
+    пустую ради отметки нельзя. Сбой здесь копию не отменяет и не подменяет её отказ."""
     try:
-        base = db.Database(cfg.state_dir)
+        if base is not None:
+            write(base)
+            return
+        if not (Path(cfg.state_dir) / db.FILE).is_file():
+            return
+        own = db.Database(cfg.state_dir)
         try:
-            with base.write():
-                journal.Journal(base).write("backup", "", **event)
-                base.note(LAST, json.dumps({"at": journal.now_iso(), **event}, ensure_ascii=False))
+            write(own)
         finally:
-            base.close()
+            own.close()
     except (sqlite3.Error, db.Refusal):
         pass
 
 
+def _note(cfg, line: str, event: dict, by: str = "", log=None, base: db.Database | None = None) -> None:
+    """Итог копии — строкой в журнал работы, событием в журнал действий и отметкой «последняя копия»
+    для страницы администратора; отметка о прежнем сбое снимается. Сбой здесь копию не отменяет: архив
+    уже готов."""
+    _line(cfg, line, log)
+
+    def write(into: db.Database) -> None:
+        with into.write() as con:
+            journal.Journal(into).write("backup", by, **event)
+            into.note(LAST, json.dumps({"at": journal.now_iso(), **event}, ensure_ascii=False))
+            con.execute("DELETE FROM meta WHERE key = ?", (FAILED,))
+    _noted(cfg, base, write)
+
+
+def failed(cfg, why: str, *, by: str = "", how: str = COMMAND, log=None, base: db.Database | None = None) -> None:
+    """Несостоявшаяся копия — строкой «ВНИМАНИЕ» в журнал работы (вывода копии по расписанию никто не
+    видит), событием в журнал действий и отметкой для предупреждения на странице «Обработка»: она висит,
+    пока следующая копия не удастся."""
+    _line(cfg, f"ВНИМАНИЕ: резервная копия НЕ сделана: {why}", log)
+
+    def write(into: db.Database) -> None:
+        with into.write():
+            journal.Journal(into).write("backup_failed", by, why=why, how=how)
+            into.note(FAILED, json.dumps({"at": journal.now_iso(), "why": why, "how": how, "by": by},
+                                         ensure_ascii=False))
+    _noted(cfg, base, write)
+
+
 def last(base: db.Database) -> dict | None:
-    """Сведения о последней копии, сделанной этой командой: когда, архив, размер, с записями ли."""
+    """Последняя копия — командой или из сервиса: когда, архив, размер, с записями ли, как сделана (how)."""
     noted = base.noted(LAST)
     return json.loads(noted) if noted else None
+
+
+def failure(base: db.Database) -> dict | None:
+    """Последняя несостоявшаяся копия, если удачной после неё не было: когда, почему, как сделана, кем."""
+    noted = base.noted(FAILED)
+    return json.loads(noted) if noted else None
+
+
+# ---------- расписание ----------
+
+# Расписание, пока его не сохраняли на странице, — выключено. keep — сколько последних копий держать.
+PLAN = {"on": False, "time": "03:00", "every": "day", "weekday": 0, "inbox": True, "keep": 7}
+EVERY = ("day", "week")
+KEEP_MAX = 365
+_CLOCK = re.compile(r"([01]\d|2[0-3]):[0-5]\d")
+
+
+def plan_of(on: bool, at: str, every: str, weekday: int, inbox: bool, keep: int) -> dict:
+    """Расписание со страницы, проверенное. Не годится — BackupError: что поправить."""
+    if not _CLOCK.fullmatch(at or ""):
+        raise BackupError("время копии — ЧЧ:ММ по часовому поясу сервиса, например 03:00")
+    if every not in EVERY:
+        raise BackupError("частота копии: day — каждый день или week — раз в неделю")
+    if not 0 <= weekday <= 6:
+        raise BackupError("день недели: от 0 (понедельник) до 6 (воскресенье)")
+    if not 1 <= keep <= KEEP_MAX:
+        raise BackupError(f"сколько копий держать: от 1 до {KEEP_MAX}; копии старше стираются")
+    return {"on": bool(on), "time": at, "every": every, "weekday": weekday if every == "week" else 0,
+            "inbox": bool(inbox), "keep": keep}
+
+
+WEEKDAYS = ("понедельникам", "вторникам", "средам", "четвергам", "пятницам", "субботам", "воскресеньям")
+
+
+def described(plan: dict) -> str:
+    """Расписание словами — для журнала работы."""
+    if not plan["on"]:
+        return "выключено"
+    when = "каждый день" if plan["every"] == "day" else f"по {WEEKDAYS[plan['weekday']]}"
+    return (f"{when} в {plan['time']}" + ("" if plan["inbox"] else ", без исходных записей")
+            + f", держать копий: {plan['keep']}")
+
+
+def slot(plan: dict, now: datetime.datetime) -> datetime.datetime:
+    """Последнее время копии по расписанию, не позже now — времени сервиса, с его часовым поясом."""
+    hour, minute = map(int, plan["time"].split(":"))
+    moment = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if moment > now:
+        moment -= datetime.timedelta(days=1)
+    if plan["every"] == "week":
+        moment -= datetime.timedelta(days=(moment.weekday() - plan["weekday"]) % 7)
+    return moment
+
+
+def upcoming(plan: dict, now: datetime.datetime) -> datetime.datetime:
+    """Следующее время копии по расписанию — позже now."""
+    return slot(plan, now) + datetime.timedelta(days=7 if plan["every"] == "week" else 1)
+
+
+def due(plan: dict, now: datetime.datetime, since: list[str | None]) -> bool:
+    """Положена ли копия сейчас: расписание включено, и его последнее время наступило позже всего, что
+    в since (ISO с часовым поясом): сохранения самого расписания, последней копии, последней неудачи.
+
+    Пропущенное не догоняется пачкой: сервис проспал три назначенных времени — одна копия, как только он
+    снова работает, потому что «последнее время» одно. Неудача тоже в since: следующая попытка — снова по
+    расписанию, а не каждую минуту. Расписание, сохранённое после назначенного времени, ждёт следующего:
+    включённое в 10 утра не делает тут же копию «за сегодняшние 3 часа ночи»."""
+    if not plan.get("on"):
+        return False
+    latest = max((datetime.datetime.fromisoformat(at) for at in since if at), default=None)
+    return latest is None or slot(plan, now) > latest
 
 
 # ---------- проверка ----------
@@ -652,18 +778,8 @@ def main(argv: list[str] | None = None) -> int:
     except BackupError as e:
         print(f"ОТКАЗ: {e}", file=sys.stderr)
         if args.command == "create":
-            _fail(cfg, str(e))
+            failed(cfg, str(e))
         return 1
-
-
-def _fail(cfg, why: str) -> None:
-    """Несостоявшаяся копия — строкой в журнал работы: по расписанию её вывода никто не видит."""
-    try:
-        path = Path(cfg.outbox) / logbook.LOG_DIR / logbook.LOG_FILE
-        with open(path, "a", encoding="utf-8") as log:
-            log.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} ВНИМАНИЕ: резервная копия НЕ сделана: {why}\n")
-    except OSError:
-        pass
 
 
 if __name__ == "__main__":

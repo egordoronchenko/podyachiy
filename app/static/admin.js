@@ -71,7 +71,9 @@ function render() {
   const stored = state.storage.warnings.map(w => `<div class="nhint warn lines" role="alert">${icon("alert", 14)}<span><b>Внимание:</b> ${esc(w)}.
       Подробно — <a href="/install-guide">в инструкции по установке</a>, раздел «Резервная копия и восстановление».</span></div>`).join("") +
     // тома установки: не подключены с хоста, мало места — текст сервиса уже говорит, что сделать
-    state.volumes.warnings.map(w => `<div class="nhint warn lines" role="alert">${icon("alert", 14)}<span><b>Внимание:</b> ${esc(w)}.</span></div>`).join("");
+    state.volumes.warnings.map(w => `<div class="nhint warn lines" role="alert">${icon("alert", 14)}<span><b>Внимание:</b> ${esc(w)}.</span></div>`).join("") +
+    // копия из сервиса не удалась: что не так и что сделать — до следующей удачной копии
+    backupWarning(state.backups);
   const box = document.getElementById("storagewarn");
   if (box.dataset.shown !== stored) { box.innerHTML = stored; box.dataset.shown = stored; }
 
@@ -93,7 +95,7 @@ function render() {
     </div>`).join("");
 
   // записей в работе несколько: у каждой свой шаг и свой прогресс
-  document.getElementById("running").innerHTML = !jobs.length
+  paint(document.getElementById("running"), !jobs.length
     ? `<div class="empty">${icon("idle", 17)}простой — жду появления записей во входной папке</div>`
     : jobs.map(job => `<div class="job">
        <dl class="kv">
@@ -109,21 +111,30 @@ function render() {
              aria-valuemin="0" aria-valuemax="${job.chunks_total}"
              aria-valuenow="${job.chunks_done}"><i style="width:${100 * job.chunks_done / job.chunks_total}%"></i></div>
         <div class="dim" style="font-size:12.5px;margin-top:6px">часть ${job.chunks_done} из ${job.chunks_total}</div>` : "") +
-      `</div>`).join("");
+      cancelPart(job) + `</div>`).join(""));
 
   let q = "";
   if (state.queue.length) {
-    q += `<div class="scroll"><table><thead><tr><th>в очереди</th><th>шаблон</th><th>запуск</th></tr></thead><tbody>` +
-      state.queue.map(i => `<tr>
+    q += `<div class="scroll"><table><thead><tr><th>в очереди</th><th>шаблон</th><th>запуск</th><th>действия</th></tr></thead><tbody>` +
+      state.queue.map(i => `<tr${qAsk === i.path ? ` class="picked"` : ""}>
         <td class="path">${esc(i.path)}</td>
         <td>${esc(state.templates[i.template] || "по разбору записи")}</td>
         <td class="dim">${i.manual ? "вручную" : "авто"}${i.force ? ", перезапись" : ""}${
           i.model ? `, ${esc(modelTitle(i.model))}` : ""}${
-          jobs.some(j => j.file === i.path) ? ", после текущего прогона этой записи" : ""}</td></tr>`).join("") +
+          jobs.some(j => j.file === i.path) ? ", после текущего прогона этой записи" : ""}</td>
+        <td><div class="rowacts">${unqueuePart(i.path)}</div></td></tr>`).join("") +
       `</tbody></table></div>`;
   }
-  if (state.watching.length) {
+  if (state.dropped.length) {
     q += `<div class="scroll" style="margin-top:${state.queue.length ? "12px" : "0"}">
+      <table><thead><tr><th>сняты из очереди вручную</th><th>кто и когда</th></tr></thead><tbody>` +
+      state.dropped.map(d => `<tr><td class="path">${esc(d.path)}</td><td class="dim">${esc(d.by)}, ${esc(when(d.at))}</td></tr>`).join("") +
+      `</tbody></table></div>
+      <div class="fhint">Сами в обработку не пойдут: нужна запись — запустите её в «Ручном запуске»; файл изменят — он
+        пойдёт в очередь сам, как новый.</div>`;
+  }
+  if (state.watching.length) {
+    q += `<div class="scroll" style="margin-top:${state.queue.length || state.dropped.length ? "12px" : "0"}">
       <table><thead><tr><th>копируется</th><th>размер</th><th>не меняется</th></tr></thead><tbody>` +
       state.watching.map(w => `<tr>
         <td class="path">${esc(w.path)}${w.held ? `<div class="err-text">${icon("alert", 13)} отложен: ${esc(w.held)}</div>` : ""}</td>
@@ -132,8 +143,8 @@ function render() {
           <span class="dim">(замеров ${w.stable} из ${w.needed})</span></td></tr>`).join("") +
       `</tbody></table></div>`;
   }
-  document.getElementById("queue").innerHTML = q ||
-    `<div class="empty">${icon("clock", 17)}очередь пуста, новых файлов нет</div>`;
+  paint(document.getElementById("queue"), q ||
+    `<div class="empty">${icon("clock", 17)}очередь пуста, новых файлов нет</div>`);
 
   document.getElementById("history").innerHTML = !history.length
     ? `<div class="empty">${icon("doc", 17)}пока ничего не обработано — положите запись во входную папку</div>`
@@ -147,6 +158,7 @@ function render() {
         if (h.reused_transcript) tags.push(`<span class="tag">расшифровка готовая</span>`);
         if (h.speakers_unreliable) tags.push(`<span class="tag warn">метки ненадёжны</span>`);
         if (h.crowded_meeting) tags.push(`<span class="tag warn">многолюдно</span>`);
+        if (h.cancelled) tags.push(`<span class="tag warn">прогон отменён: ${esc(h.cancelled.by)}</span>`);
         return `<tr>
           <td><a class="open" data-file="${esc(h.file)}" role="button" tabindex="0"
                  title="Открыть протокол и расшифровку"><span class="path">${esc(h.file)}</span></a>
@@ -171,9 +183,228 @@ function render() {
 
   renderSpeech();
   renderProviders();
+  renderBackup();
   renderAdmin();
   syncTemplates();
 }
+
+/* Страница перерисовывает сводку каждые три секунды. Блок с кнопками перерисовывается, только когда в нём
+   что-то изменилось, а кнопка в фокусе после перерисовки снова получает фокус (по data-focus): иначе фокус
+   с клавиатуры терялся бы на каждом опросе. */
+function paint(box, html) {
+  if (box.dataset.shown === html) return;
+  const was = box.contains(document.activeElement) ? document.activeElement.dataset.focus : null;
+  box.innerHTML = html;
+  box.dataset.shown = html;
+  if (was) {
+    const again = box.querySelector(`[data-focus="${CSS.escape(was)}"]`);
+    if (again) again.focus();
+  }
+}
+
+/* ---------- очередь: снять запись, отменить прогон ----------
+   Оба действия — с подтверждением в самой строке. Снятая новая запись сама в очередь не вернётся, пока файл
+   не изменится или её не запустят вручную. Отмена прогона не обрывает идущий запрос поставщику: за него могли
+   уже списать деньги, — прогон останавливается перед следующим платным запросом. */
+let qAsk = null, qBusy = null;          // запись, которую спросили «снять?»; которую снимают сейчас
+let cAsk = null, cBusy = null;          // то же для отмены прогона
+
+function unqueuePart(path) {
+  const p = esc(path);
+  if (qBusy === path) return `<button type="button" class="danger" disabled>Снимаю…</button>`;
+  if (qAsk === path) return `<span>Снять? Сама не вернётся, пока файл не изменят или её не запустят вручную.</span>
+    <button type="button" class="ghost" data-qkeep data-focus="qkeep:${p}">Оставить</button>
+    <button type="button" class="danger" data-qremove="${p}" data-focus="qremove:${p}">Снять из очереди</button>`;
+  return `<button type="button" class="ghost dangerlink" data-qask="${p}" data-focus="qask:${p}"
+    aria-label="Снять из очереди ${p}">Снять из очереди</button>`;
+}
+
+const CANCEL_HINT = "Прогон остановится перед следующим платным запросом. Идущий запрос поставщику не обрывается: " +
+  "за него могли уже списать деньги";
+
+function cancelPart(job) {
+  const f = esc(job.file), id = "canceltitle-" + state.running.indexOf(job);
+  if (job.cancel) return `<div class="nhint busy lines" style="margin-top:10px">${icon("clock", 14)}<span><b>Отменяется</b>
+      (${esc(job.cancel.by)}): прогон остановится перед следующим платным запросом — идущий запрос поставщику
+      дорабатывает.</span></div>`;
+  if (cAsk === job.file) return `<div class="up dangerbox" style="margin-top:12px" role="alertdialog" aria-labelledby="${id}">
+      <b id="${id}">Отменить прогон «${f}»?</b>
+      <ul class="plain">
+        <li>идущий запрос поставщику не обрывается — за него могли уже списать деньги; прогон остановится перед
+          следующим платным запросом, это может занять несколько минут;</li>
+        <li>оплаченное до отмены остаётся в расходах и на диске: запуск заново возьмёт готовое без новой оплаты;</li>
+        <li>по расписанию запись не повторится и писем о ней не будет — запустить её снова можно в «Ручном запуске»;</li>
+        <li>готовая прежде запись останется готовой, с прежним протоколом.</li>
+      </ul>
+      <div class="row"><button type="button" class="ghost" data-ckeep data-focus="ckeep:${f}">Не отменять</button>
+        <button type="button" class="danger" data-cancel="${f}" data-focus="cancel:${f}"${cBusy === job.file ? " disabled" : ""}>${
+          cBusy === job.file ? "Отменяю…" : "Отменить прогон"}</button></div>
+    </div>`;
+  return `<div class="row jobacts"><button type="button" class="ghost dangerlink" data-cask="${f}" data-focus="cask:${f}"
+      title="${CANCEL_HINT}" aria-label="Отменить прогон ${f}">Отменить прогон</button></div>`;
+}
+
+async function queueAct(url, file, done, msgId) {
+  try {
+    await api(url, { file });
+    say(msgId, "ok", done);
+  } catch (err) { say(msgId, "err", err.message); }
+  await tick();
+}
+
+document.getElementById("queue").addEventListener("click", async e => {
+  const b = e.target.closest("button");
+  if (!b) return;
+  if (b.dataset.qask) {
+    qAsk = b.dataset.qask; say("qmsg", "", "");
+    render();
+    document.querySelector("#queue [data-qkeep]").focus();          // случайный Enter ничего не снимет
+  } else if ("qkeep" in b.dataset) {
+    const path = qAsk;
+    qAsk = null;
+    render();
+    const back = document.querySelector(`#queue [data-qask="${CSS.escape(path)}"]`);
+    if (back) back.focus();
+  } else if (b.dataset.qremove) {
+    const path = b.dataset.qremove;
+    qBusy = path; qAsk = null;
+    render();
+    await queueAct("/api/admin/queue/remove", path, `Запись ${path} снята из очереди.`, "qmsg");
+    qBusy = null;
+    render();
+  }
+});
+
+document.getElementById("running").addEventListener("click", async e => {
+  const b = e.target.closest("button");
+  if (!b) return;
+  if (b.dataset.cask) {
+    cAsk = b.dataset.cask; say("rmsg", "", "");
+    render();
+    document.querySelector("#running [data-ckeep]").focus();
+  } else if ("ckeep" in b.dataset) {
+    const file = cAsk;
+    cAsk = null;
+    render();
+    const back = document.querySelector(`#running [data-cask="${CSS.escape(file)}"]`);
+    if (back) back.focus();
+  } else if (b.dataset.cancel) {
+    const file = b.dataset.cancel;
+    cBusy = file;
+    render();
+    await queueAct("/api/admin/queue/cancel", file,
+      `Отмена прогона ${file} запрошена: он остановится перед следующим платным запросом.`, "rmsg");
+    cBusy = null; cAsk = null;
+    render();
+  }
+});
+
+/* ---------- резервная копия ----------
+   Копию делает сам сервис: по расписанию и кнопкой. Форма перерисовывается, только когда расписание на сервере
+   изменилось и в форме нет несохранённой правки. Сумм здесь нет; что не удалось — плашкой вверху раздела. */
+const BACKUP_DAYS = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"];
+const HOW = { command: "командой", schedule: "по расписанию", page: "по кнопке" };
+let bkSeen = "", bkDirty = false, bkBusy = "";      // bkBusy: "save" | "now" — идёт запрос
+
+function backupWarning(b) {
+  const f = b.failed;
+  if (!f) return "";
+  return `<div class="nhint warn lines" role="alert">${icon("alert", 14)}<span><b>Резервная копия не сделана</b>
+    ${esc(when(f.at))} (${esc(HOW[f.how] || f.how)}${f.by ? `, ${esc(f.by)}` : ""}): ${esc(f.why)}.
+    ${b.plan.on ? `Следующая попытка — по расписанию${b.next ? `, ${esc(when(b.next))}` : ""}; можно и сейчас — ` : "Повторить — "}
+    кнопка «Сделать копию сейчас» в разделе «Резервная копия» ниже.</span></div>`;
+}
+
+function backupState() {
+  const b = state.backups, last = state.storage.backup;
+  const parts = [last ? `Последняя копия — <b>${esc(when(last.at))}</b> (${esc(HOW[last.how] || "командой")}${
+      last.inbox ? "" : ", без исходных записей"})` : "Копий ещё не было"];
+  if (b.running) parts.push(`<b>Копия делается</b> с ${esc(hhmm(b.running.started))} (${esc(HOW[b.running.how] || b.running.how)}${
+    b.running.by ? `, ${esc(b.running.by)}` : ""}) — обработка записей при этом идёт`);
+  else parts.push(b.plan.on && b.next ? `следующая по расписанию — <b>${esc(when(b.next))}</b>` : "по расписанию копия не делается");
+  return parts.join("; ") + ".";
+}
+
+function renderBackup() {
+  const b = state.backups;
+  const line = backupState(), box = document.getElementById("backupstate");
+  if (box.dataset.shown !== line) { box.innerHTML = line; box.dataset.shown = line; }
+  const now = document.getElementById("bknow");
+  if (now) {
+    now.disabled = !!b.running || bkBusy === "now";
+    now.textContent = b.running || bkBusy === "now" ? "Копия делается…" : "Сделать копию сейчас";
+  }
+  const seen = JSON.stringify(b.plan);
+  if (seen === bkSeen || bkDirty) return;
+  bkSeen = seen;
+  const p = b.plan;
+  document.getElementById("backup").innerHTML = `
+    <label class="check" for="bkon"><input type="checkbox" id="bkon"${p.on ? " checked" : ""}> делать копию по расписанию</label>
+    <div class="bkgrid">
+      <div><label for="bktime">Время</label>
+        <input type="time" id="bktime" value="${esc(p.time)}" step="60" required aria-describedby="bktime-hint"></div>
+      <div><label for="bkevery">Как часто</label>
+        <select id="bkevery"><option value="day"${p.every === "day" ? " selected" : ""}>каждый день</option>
+          <option value="week"${p.every === "week" ? " selected" : ""}>раз в неделю</option></select></div>
+      <div><label for="bkday">День недели</label>
+        <select id="bkday"${p.every === "week" ? "" : " disabled"}>${BACKUP_DAYS.map((d, n) =>
+          `<option value="${n}"${n === p.weekday ? " selected" : ""}>${d}</option>`).join("")}</select></div>
+      <div><label for="bkkeep">Держать копий</label>
+        <input type="number" id="bkkeep" min="1" max="365" step="1" inputmode="numeric" value="${p.keep}" aria-describedby="bkkeep-hint"></div>
+    </div>
+    <div class="fhint" id="bktime-hint">Время — по часовому поясу сервиса (TZ в .env). Сервис был выключен в это время —
+      одна копия, когда он снова заработает; пропущенные копии он не догоняет.</div>
+    <div class="fhint" id="bkkeep-hint">Копии сверх этого числа, самые старые, стираются после каждой новой.</div>
+    <label class="check" for="bkinbox"><input type="checkbox" id="bkinbox" aria-describedby="bkinbox-hint"${p.inbox ? " checked" : ""}>
+      с исходными записями (папка inbox)</label>
+    <div class="fhint" id="bkinbox-hint">Без них архив намного меньше, но записи из него заново с распознаванием не обработать.</div>
+    <div class="ferr" id="bkerr" role="alert"></div>
+    <div class="row"><button type="button" id="bksave">Сохранить расписание</button>
+      <button type="button" class="ghost" id="bknow" aria-describedby="bknow-hint"${b.running ? " disabled" : ""}>${
+        b.running ? "Копия делается…" : "Сделать копию сейчас"}</button></div>
+    <div class="fhint" id="bknow-hint">Копия в фоне, обработка записей не останавливается. С исходными записями или без и
+      сколько держать — как в сохранённом расписании; его не сохраняли — с записями, старые копии не стираются.</div>
+    <div class="msg" id="bkmsg" role="status"></div>
+    <div class="note">Архив ложится в папку копий на сервере (BACKUP_DIR). Файлов настроек (.env, compose.yml) в нём нет —
+      их копируют отдельно; как проверить архив и восстановиться — <a href="/install-guide">инструкция по установке</a>.</div>
+    <p class="fhint">${p.by ? `Расписание сохранил ${esc(p.by)}, ${esc(when(p.at))}.` : "Расписание ещё не сохраняли."}</p>`;
+}
+
+const backupBox = document.getElementById("backup");
+backupBox.addEventListener("input", () => { bkDirty = true; });
+backupBox.addEventListener("change", e => {
+  bkDirty = true;
+  if (e.target.id === "bkevery") document.getElementById("bkday").disabled = e.target.value !== "week";
+});
+backupBox.addEventListener("click", async e => {
+  if (e.target.id === "bksave" && !bkBusy) {
+    const btn = e.target, plan = {
+      on: document.getElementById("bkon").checked, time: document.getElementById("bktime").value,
+      every: document.getElementById("bkevery").value, weekday: Number(document.getElementById("bkday").value),
+      inbox: document.getElementById("bkinbox").checked, keep: Number(document.getElementById("bkkeep").value) };
+    bkBusy = "save"; btn.disabled = true; btn.textContent = "Сохраняю…";
+    document.getElementById("bkerr").textContent = "";
+    try {
+      state.backups = (await api("/api/admin/backup/plan", plan)).backups;
+      bkDirty = false; bkSeen = "";
+      renderBackup();
+      say("bkmsg", "ok", plan.on ? "Расписание сохранено." : "Сохранено: по расписанию копия не делается.");
+    } catch (err) {
+      document.getElementById("bkerr").innerHTML = `${icon("alert", 14)}<span>Не сохранено: ${esc(err.message)}</span>`;
+      btn.disabled = false; btn.textContent = "Сохранить расписание";
+    }
+    bkBusy = "";
+  } else if (e.target.id === "bknow" && !bkBusy) {
+    bkBusy = "now";
+    renderBackup();
+    try {
+      state.backups = (await api("/api/admin/backup/now", {})).backups;
+      say("bkmsg", "ok", "Копия начата — итог появится здесь и в журнале работы.");
+    } catch (err) { say("bkmsg", "err", "Копия не начата: " + err.message); }
+    bkBusy = "";
+    renderBackup();
+  }
+});
 
 /* ---------- распознавание и поставщики ----------
    Модель для новых записей выбирает администратор; пока не выбрал — действует SPEECH_MODEL из .env.
@@ -1158,6 +1389,22 @@ function tplAsk(t) {
     "do-delete", "Удалить тип", true);
 }
 
+// общие правила: у общего файла — кто его куски подключает, у шаблона — какие куски он берёт оттуда
+function tplCommonNote(t) {
+  const common = tpl.items.find(i => i.kind === "common");
+  if (t.kind === "common") {
+    const users = tpl.items.filter(i => i.includes.length);
+    return `<div class="nhint">${icon("info", 14)}<span>${users.length
+      ? `Куски этого файла подключают: ${users.map(i => `${esc(i.title)} (${i.includes.map(esc).join(", ")})`).join("; ")}.
+        Правка куска действует во всех этих шаблонах со следующей записи; кусок, который подключают, сервис убрать не даст.`
+      : `Ни один шаблон куски этого файла не подключает: правка здесь пока ни на что не влияет.`}</span></div>`;
+  }
+  if (!t.includes.length) return "";
+  return `<div class="nhint">${icon("info", 14)}<span>Строки «@@ имя» — общие правила: при сборке задания на их место
+    встают куски ${t.includes.map(n => `«${esc(n)}»`).join(", ")} из файла «${esc(common ? common.title : "Общие правила шаблонов")}».
+    Модель получает шаблон уже с ними.</span></div>`;
+}
+
 function renderEditor(value) {
   const card = document.getElementById("tpleditcard");
   card.hidden = !tplOpen;
@@ -1176,6 +1423,7 @@ function renderEditor(value) {
     ${t.problem ? `<div class="nhint warn">${icon("alert", 14)}<span><b>С этим текстом сервис работать не сможет:</b> ${esc(t.problem)}.</span></div>` : ""}
     ${t.outside ? `<div class="nhint">${icon("info", 14)}<span>Текст в файле не тот, что сохраняли на странице: его правили
       на сервере, в обход страницы. Ниже — то, что лежит в файле сейчас.</span></div>` : ""}
+    ${tplCommonNote(t)}
     ${!t.warnings.length ? "" : t.state === "standard"
       ? `<div class="edwarn calm" role="note"><b>${icon("info", 14)} Так задумано: чего нет в протоколе этого типа</b>
       <ul class="plain">${t.warnings.map(w => `<li>${esc(w)}</li>`).join("")}</ul></div>`
@@ -2409,7 +2657,7 @@ const ACTIONS = {
   user_create: e => `завёл пользователя ${e.login}${e.admin ? " (администратор сервиса)" : ""}${homeUpload(e)}`,
   user_change: e => `изменил пользователя ${e.login}${e.admin ? " (администратор сервиса)" : ""}${e.password ? ", задал новый пароль" : ""}${homeUpload(e)}`,
   user_delete: e => `удалил пользователя ${e.login}`,
-  names: e => `подписал говорящих в записи «${e.file}»`,
+  names: e => `подписал говорящих в записи «${e.file}»${e.dictionary ? `; в словарь папки добавлено ФИО: ${e.dictionary}` : ""}`,
   dictionary: e => `изменил словарь ${e.file ? `записи «${e.file}»` : `папки «${e.folder}»`}: участников ${e.people}, сокращений ${e.terms}`,
   series: e => `${e.on ? "включил" : "выключил"} у папки «${e.folder}» серию совещаний`,
   previous_tasks: e => `${e.on ? "вернул" : "убрал"} раздел «Поручения прошлого совещания» в протоколе записи «${e.file}»`,
@@ -2418,6 +2666,15 @@ const ACTIONS = {
   speech_model: e => e.source === "env"
     ? `вернул модель распознавания к значению из .env: ${e.model} (была ${e.was})`
     : `выбрал модель распознавания для новых записей: ${e.model} (была ${e.was})`,
+  backup: e => `сделал резервную копию ${e.file}${e.how === "schedule" ? " — по расписанию" : e.how === "command" ? " — командой" : ""}${
+    e.inbox ? "" : ", без исходных записей"}${e.skipped ? `, не прочитано файлов: ${e.skipped}` : ""}`,
+  backup_failed: e => `резервная копия не сделана${e.how === "schedule" ? " (по расписанию)" : ""}: ${e.why}`,
+  backup_plan: e => e.plan.on
+    ? `задал расписание резервной копии: ${e.plan.every === "week" ? `по дням «${BACKUP_DAYS[e.plan.weekday]}»` : "каждый день"} в ${
+        e.plan.time}${e.plan.inbox ? "" : ", без исходных записей"}, держать копий: ${e.plan.keep}`
+    : "выключил резервную копию по расписанию",
+  queue_remove: e => `снял из очереди запись «${e.file}»`,
+  run_cancel: e => `отменил прогон записи «${e.file}»`,
   record_rename: e => `переименовал запись «${e.file}» в «${e.to.split("/").pop()}»`,
   record_move: e => `перенёс запись «${e.file}» в папку «${e.to.split("/").slice(0, -1).join("/") || "корень"}»`,
   record_delete: e => `удалил запись «${e.file}» в корзину`,

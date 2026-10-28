@@ -43,6 +43,8 @@ _BULLET_RE = re.compile(r"^\s*(?:\d{1,3}[.)]|[-–—•*·])\s+")        # «1.
 _MAIL_RE = re.compile(r"[<(\[]?\s*[\w.+-]+@[\w-]+(?:\.[\w-]+)+\s*[>)\]]?")
 _AKA_RE = re.compile(r"(.*?)\s*\(([^()]*)\)")                   # «ФИО (как ещё называют)»
 _PATRONYMIC_RE = re.compile(r"(?:вич|ьич|вна|чна|шна|оглы|кызы)$", re.I)
+# слово ФИО: с заглавной буквы, из букв, через дефис — двойная фамилия, с точкой — инициалы («П.», «П.А.»)
+_NAME_WORD_RE = re.compile(r"[^\W\d_](?:[^\W\d_]|[-.](?=[^\W\d_]))*\.?")
 
 
 class DictionaryError(ValueError):
@@ -163,6 +165,28 @@ def joined(old: list[dict], new: list[dict], field: str, limit: int) -> list[dic
     if len(out) > limit:
         raise DictionaryError(f"в одном словаре не больше {limit} строк, с добавленными выходит {len(out)}")
     return out
+
+
+def full_name(name: str) -> bool:
+    """ФИО, а не просто имя или описание: от двух до четырёх слов, каждое с заглавной буквы и из
+    одних букв (дефис и инициалы с точкой — можно). «Иван» модели ничего не подсказывает, а
+    «представитель заказчика» и «Голос из зала» — не имена: такую подпись в словарь не берут."""
+    words = name.split()
+    return 2 <= len(words) <= 4 and all(_NAME_WORD_RE.fullmatch(w) and w[0].isupper() for w in words)
+
+
+def known(people: list[dict], name: str) -> bool:
+    """Есть ли этот человек в списке: то же ФИО или то же «как ещё называют» — без учёта регистра,
+    «ё» и лишних пробелов; те же слова в другом порядке («Павел Ильич Тихонов»); или все слова
+    одного есть среди слов другого («Тихонов Павел» и «Тихонов Павел Ильич»). Последнее — только
+    когда слов хотя бы два: «Павел» с «Павлом Ильичом» не сводится."""
+    mine = set(key(name).split())
+    for person in people:
+        for other in [person["name"], *person["aka"]]:
+            theirs = set(key(other).split())
+            if mine == theirs or (min(len(mine), len(theirs)) >= 2 and (mine <= theirs or theirs <= mine)):
+                return True
+    return False
 
 
 def merge(layers: list[dict]) -> dict:
@@ -288,6 +312,45 @@ class Store:
             else:
                 con.execute("DELETE FROM dictionaries WHERE scope = ? AND path = ?", (scope, path))
         return self.get(scope, path)
+
+    def welcome(self, folder: str, names: list[str], by: str) -> list[str]:
+        """Подтверждённые ФИО — в словарь папки: человек подписал говорящего, значит, этот
+        человек на совещаниях папки бывает. Берётся ФИО (full_name), и только тех, кого ещё нет
+        в словаре папки и папок выше (known): словарь записи — про одну встречу, и его строки
+        папке не мешают. Роль не выдумывается — её допишет человек в окне словаря. Полный
+        словарь берёт, сколько влезет. У корня словаря нет — там нечего пополнять.
+
+        Пересборку протоколов это не запускает: словарь действует со следующего задания.
+        Отдаёт добавленных, в порядке подписи; author словаря становится by."""
+        if not folder:
+            return []
+        with self.db.write() as con:
+            def saved(path: str) -> dict | None:
+                row = con.execute("SELECT people, terms FROM dictionaries WHERE scope = ? AND path = ?",
+                                  (FOLDERS, path)).fetchone()
+                return row and {"people": json.loads(row["people"]), "terms": json.loads(row["terms"])}
+
+            own = saved(folder) or {"people": [], "terms": []}
+            seen = [p for f in parents(folder) for p in (saved(f) or {"people": []})["people"]]
+            added = []
+            for name in names:
+                name = _one_line(name, NAME_MAX)
+                if len(own["people"]) >= PEOPLE_MAX:
+                    break
+                if full_name(name) and not known(seen, name):
+                    person = {"name": name, "role": "", "aka": []}
+                    own["people"].append(person)
+                    seen.append(person)
+                    added.append(name)
+            if added:
+                now = datetime.datetime.now().astimezone()
+                con.execute(
+                    "INSERT INTO dictionaries (scope, path, people, terms, author, at, changed) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (scope, path) DO UPDATE SET people = excluded.people, "
+                    "author = excluded.author, at = excluded.at, changed = excluded.changed",
+                    (FOLDERS, folder, json.dumps(own["people"], ensure_ascii=False),
+                     json.dumps(own["terms"], ensure_ascii=False), by, now.isoformat(timespec="seconds"), now.timestamp()))
+        return added
 
     def layers(self, file: str = "", folder: str = "") -> list[dict]:
         """Непустые слои словаря записи file (или папки folder) — от ближнего к дальнему:

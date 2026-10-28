@@ -187,3 +187,55 @@ def test_fingerprint_changes_with_the_list_and_is_empty_without_it(store):
     assert first and first == dictionary.fingerprint(store.effective("Проекты/другая.mp3"))     # откуда строка — не важно
     fill(store, RECORDS, "Проекты/вкс.mp3", "", "СКУД")
     assert dictionary.fingerprint(store.effective("Проекты/вкс.mp3")) != first
+
+
+# ---------- пополнение подписью говорящих ----------
+
+def test_full_name_is_told_from_a_first_name_and_a_description():
+    """В словарь идёт ФИО, а не «Иван» или «представитель заказчика»: имя без фамилии ничего
+    модели не подсказывает, описание — не имя."""
+    for name in ("Тихонов Павел Ильич", "Юдина Анна", "Салтыков-Щедрин Михаил", "Громов П. А.", "Громов П.А."):
+        assert dictionary.full_name(name), name
+    for name in ("Иван", "", "представитель заказчика", "Голос из зала", "Иванов S2", "Иванов 2",
+                 "Один Два Три Четыре Пять"):
+        assert not dictionary.full_name(name), name
+
+
+def test_known_person_is_found_by_name_aka_and_word_order():
+    people = dictionary.parse_people("Тихонов Павел Ильич (Паша, Павел Ильич)\nЁлкина Анна")
+    for name in ("тихонов  павел ильич", "Павел Ильич Тихонов", "Тихонов Павел", "Павел Ильич", "Паша",
+                 "Елкина Анна", "Анна Ёлкина"):
+        assert dictionary.known(people, name), name
+    for name in ("Тихонова Мария", "Ёлкина Мария Павловна", "Павел Тихонов Сергеевич"):
+        assert not dictionary.known(people, name), name
+
+
+def test_confirmed_names_join_the_folder_dictionary_once(store):
+    fill(store, FOLDERS, "Проекты", "Ершова Лидия Марковна — главный бухгалтер", "КС-2 — акт")
+    fill(store, FOLDERS, "Проекты/Сметы", "Юдина Анна (Аня) — сметчик")
+    fill(store, RECORDS, "Проекты/Сметы/вкс.mp3", "Громов Пётр — только на этой встрече")
+
+    added = store.welcome("Проекты/Сметы", ["Тихонов Павел Ильич", "Иван", "Ершова Лидия Марковна", "Аня",
+                                            "Громов Пётр", "тихонов павел ильич", "Зуев Марк"], "ivanov")
+    # знакомые словарю папки и папок выше не повторяются; словарь записи — про одну встречу,
+    # и тот, кто был на ней, в словарь папки идёт
+    assert added == ["Тихонов Павел Ильич", "Громов Пётр", "Зуев Марк"]
+    saved = store.get(FOLDERS, "Проекты/Сметы")
+    assert [(p["name"], p["role"], p["aka"]) for p in saved["people"]] == [
+        ("Юдина Анна", "сметчик", ["Аня"]), ("Тихонов Павел Ильич", "", []), ("Громов Пётр", "", []),
+        ("Зуев Марк", "", [])]                                        # роль не выдумывается
+    assert saved["by"] == "ivanov" and saved["terms"] == []
+    assert store.get(FOLDERS, "Проекты")["people"][0]["name"] == "Ершова Лидия Марковна"      # выше не трогается
+    assert store.welcome("Проекты/Сметы", ["Тихонов Павел Ильич", "Павел Ильич Тихонов"], "petrov") == []
+    assert store.get(FOLDERS, "Проекты/Сметы")["by"] == "ivanov"                             # ничего не менялось
+    # папка без словаря получает его; у корня словаря нет
+    assert store.welcome("Снабжение", ["Родина Вера Павловна"], "ivanov") == ["Родина Вера Павловна"]
+    assert store.welcome("", ["Родина Вера Павловна"], "ivanov") == []
+    assert store.db.rows("SELECT path FROM dictionaries WHERE path = ''") == []
+
+
+def test_full_folder_dictionary_takes_only_what_fits(store):
+    fill(store, FOLDERS, "Проекты", [f"Человек Номер{n}" for n in range(dictionary.PEOPLE_MAX - 1)])
+    assert store.welcome("Проекты", ["Тихонов Павел", "Юдина Анна"], "ivanov") == ["Тихонов Павел"]
+    assert len(store.get(FOLDERS, "Проекты")["people"]) == dictionary.PEOPLE_MAX
+    assert store.welcome("Проекты", ["Зуев Марк"], "ivanov") == []

@@ -43,6 +43,9 @@ REMOVED = "prev_tasks_removed"
 SOURCE_STATE = "source_state"
 SOURCE_CHANGED = "changed"
 SOURCE_MISSING = "missing"
+# Последний прогон записи отменил администратор (watcher.Service.cancel): кто и когда. По расписанию такая
+# запись не повторяется — следующий прогон только вручную; он же отметку и снимает.
+CANCELLED = "cancelled"
 
 
 def said(record: dict | None) -> str | None:
@@ -100,10 +103,10 @@ class Ledger:
 
         Пауза растёт с каждым сбоем подряд: 30 минут, потом час. После
         MAX_FAILURES сбоев подряд автоматика сдаётся — дальше повторяет
-        администратор, посмотрев на ошибку.
+        администратор, посмотрев на ошибку. Прогон, отменённый администратором, не повторяется вовсе.
         """
         rec = self.records.get(rel)
-        if rec is None or rec.get("status") not in RETRY_STATUSES:
+        if rec is None or rec.get("status") not in RETRY_STATUSES or rec.get(CANCELLED):
             return False
         failures = int(rec.get("failures") or 1)
         if failures >= MAX_FAILURES:

@@ -1383,12 +1383,16 @@ async function sendNames(body, msg, draft) {
     // текст с подписями собирает сервер — после правки просто берём его заново
     if (viewKind === "summary") Object.assign(viewData, { names_newer: d.names_newer, rebuilding: d.rebuilding });
     else await refresh();
-    return true;
+    return d;
   } catch (e) {
     say(msg, "err", e.message);
-    return false;
+    return null;
   }
 }
+
+// подписанные ФИО, которых не было в словаре папки, сервер добавляет туда сам — сказать об этом
+const dictAdded = d => d.dictionary_added && d.dictionary_added.length
+  ? ` В словарь папки добавлено: ${d.dictionary_added.join(", ")} — должность допишите кнопкой «Словарь».` : "";
 
 async function refresh() {
   const d = await api(`/api/result?file=${encodeURIComponent(viewFile)}&kind=${viewKind}`);
@@ -1400,12 +1404,12 @@ async function saveNames() {
   document.getElementById("nsave").disabled = true;
   say("nmsg", "", "Сохраняю…");
   const again = canRebuild();
-  const ok = await sendNames({ parts, rebuild: again }, "nmsg", () => { namesDraft = parts; });
-  if (!ok) { const b = document.getElementById("nsave"); if (b) b.disabled = false; return; }
+  const d = await sendNames({ parts, rebuild: again }, "nmsg", () => { namesDraft = parts; });
+  if (!d) { const b = document.getElementById("nsave"); if (b) b.disabled = false; return; }
   namesDraft = {};
   fillDoc();
-  say("nmsg", "ok", again ? "Сохранено. Протокол пересобирается — обновится через несколько минут."
-    : "Подписи сохранены. Протокол не пересобирался.");
+  say("nmsg", "ok", (again ? "Сохранено. Протокол пересобирается — обновится через несколько минут."
+    : "Подписи сохранены. Протокол не пересобирался.") + dictAdded(d));
 }
 
 async function saveLine(reset) {

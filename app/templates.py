@@ -10,6 +10,11 @@
 шаблонов. Всё лежит в одной папке prompts: её правят и файлами, в обход страницы, поэтому
 страница показывает то, что действительно лежит в файлах, а испорченный файл не роняет
 ни её, ни обработку.
+
+Правила, одинаковые в нескольких шаблонах, лежат один раз — в общем файле common.md, кусками
+с именами. Строка «@@ имя» в шаблоне при сборке задания заменяется куском с этим именем
+(expand): правка куска действует во всех шаблонах, которые его подключают. Шаблон без таких
+строк собирается как есть — свои шаблоны, написанные до общего файла, работают как прежде.
 """
 from __future__ import annotations
 
@@ -36,6 +41,7 @@ TEMPLATES = {
 }
 
 GLOSSARY_FILE = "glossary.txt"
+COMMON_FILE = "common.md"
 TRIAGE_FILE = "triage.md"
 ACTIONS_FILE = "actions.md"
 TYPES_FILE = "types.json"
@@ -56,6 +62,10 @@ SERVICE = {
                          "и протокол; распознаванию речи — только у модели, которая принимает подсказки. "
                          "Это общий словарь на все записи; участников и сокращения отдельной папки или "
                          "записи вписывают в её словарь — кнопка «Словарь» в папке и в открытой записи."},
+    "common": {"title": "Общие правила шаблонов", "file": COMMON_FILE,
+               "when": "Правила, одинаковые в нескольких шаблонах, — кусками с именами. Строка «@@ имя» в шаблоне "
+                       "заменяется куском с этим именем, поэтому правка куска действует во всех шаблонах, которые "
+                       "его подключают. Сам файл модели не уходит — только куски в составе шаблонов."},
 }
 KEY_RE = re.compile(r"[a-z][a-z0-9_]{1,29}")
 
@@ -67,6 +77,11 @@ PEOPLE_RE = re.compile(r"^#{1,4}\s*(?:\d+[.)]\s*)?Участники", re.M)
 SECTION_RE = re.compile(r"^##\s+\S", re.M)
 PLACEHOLDER_RE = re.compile(r"\{\{\s*\w+\s*\}\}|\{(?:transcript|text|расшифровка|текст|glossary|словарь)\}", re.I)
 TRIAGE_FIELDS = ("title", "confidence", "date", "gist", "topics", "speakers", "same_person")
+# Строка «@@ имя»: в общем файле начинает кусок, в шаблоне подключает его. Отступ у строки
+# не важен — кусок вставляется со своими отступами, как он записан в общем файле.
+# \r — текст со страницы приходит с переводами строк Windows и до сохранения проверяется как есть
+PIECE_RE = re.compile(r"^[ \t]*@@[ \t]*([\w-]+)[ \t\r]*$", re.M)
+AT_RE = re.compile(r"^[ \t]*@@.*$", re.M)
 
 
 class TemplateError(ValueError):
@@ -305,6 +320,92 @@ def decode(data: bytes) -> str:
                             "Сохранить как → Кодировка) и загрузите снова")
 
 
+# ---------- общие правила ----------
+
+def pieces(text: str) -> dict[str, str]:
+    """Куски общего файла по именам. Кусок начинается строкой «@@ имя» и идёт до следующей такой
+    строки или до конца файла; пустые строки в его начале и в конце отбрасываются, отступы внутри
+    остаются. Текст до первого куска — пояснение для человека, модели он не уходит."""
+    out, marks = {}, list(PIECE_RE.finditer(text))
+    for n, mark in enumerate(marks):
+        name = mark.group(1)
+        if name in out:
+            raise TemplateError(f"кусок «{name}» описан в общем файле дважды — оставьте один")
+        end = marks[n + 1].start() if n + 1 < len(marks) else len(text)
+        lines = text[mark.end():end].split("\n")
+        while lines and not lines[0].strip():
+            lines.pop(0)
+        while lines and not lines[-1].strip():
+            lines.pop()
+        if not lines:
+            raise TemplateError(f"кусок «{name}» пустой: шаблон, который его подключает, получил бы пустую строку")
+        out[name] = "\n".join(lines)
+    return out
+
+
+def includes(text: str) -> list[str]:
+    """Какие куски общего файла подключает шаблон — по порядку, без повторов."""
+    return list(dict.fromkeys(PIECE_RE.findall(text)))
+
+
+def expand(prompts_dir: Path, text: str) -> str:
+    """Текст шаблона, как он уйдёт модели: каждая строка «@@ имя» заменена куском из общего файла.
+    Без таких строк текст возвращается как есть, и общий файл не читается."""
+    odd = [m.group(0).strip() for m in AT_RE.finditer(text) if not PIECE_RE.fullmatch(m.group(0))]
+    if odd:
+        raise TemplateError(f"строка «{odd[0][:60]}» начинается с @@, но имени куска в ней не разобрать: "
+                            "подключение — строка «@@ имя», имя без пробелов")
+    wanted = includes(text)
+    if not wanted:
+        return text
+    common = read(prompts_dir / COMMON_FILE)
+    if common is None:
+        raise TemplateError(f"шаблон подключает общие правила ({', '.join(wanted)}), а файла {COMMON_FILE} "
+                            "в папке шаблонов нет — верните стандартный")
+    found = pieces(common)
+    lost = [name for name in wanted if name not in found]
+    if lost:
+        raise TemplateError("шаблон подключает " + ", ".join(f"«{n}»" for n in lost)
+                            + f", а в общем файле {COMMON_FILE} такого куска нет")
+    return PIECE_RE.sub(lambda m: found[m.group(1)], text)
+
+
+def _assembled(prompts_dir: Path, path: Path, text: str) -> str:
+    """Для обработки: общие правила подставлены; не вышло — шаблон недоступен, как пустой."""
+    try:
+        return expand(prompts_dir, text).strip()
+    except TemplateError as e:
+        raise RuntimeError(f"{path.name}: {e}")
+
+
+def _includers(prompts_dir: Path) -> dict[str, list[str]]:
+    """Кто подключает куски общего файла: имя файла → имена кусков."""
+    files = [m["file"] for m in types_listed(prompts_dir).values()] + [TRIAGE_FILE, ACTIONS_FILE]
+    return {name: used for name in files if (used := includes(read(prompts_dir / name) or ""))}
+
+
+def check_file(prompts_dir: Path, kind: str, text: str) -> list[str]:
+    """check в составе папки шаблонов: шаблон и задание проверяются в том виде, в каком уйдут
+    модели, — с подставленными общими правилами; общий файл — ещё и на то, что в нём есть каждый
+    кусок, который подключают шаблоны: без него обработка этих шаблонов встала бы."""
+    if kind == "glossary":
+        return check(kind, text)
+    if kind != "common":
+        return check(kind, expand(prompts_dir, text))
+    warnings = check(kind, text)
+    found = pieces(text)
+    lost: dict[str, list[str]] = {}
+    for name, used in _includers(prompts_dir).items():
+        for piece in used:
+            if piece not in found:
+                lost.setdefault(piece, []).append(name)
+    if lost:
+        raise TemplateError("; ".join(f"кусок «{p}» подключают {', '.join(files)}" for p, files in lost.items())
+                            + " — без него эти шаблоны не соберутся. Верните кусок или сначала уберите "
+                              "строку «@@ …» из шаблонов")
+    return warnings
+
+
 # ---------- проверка текста ----------
 
 def check(kind: str, text: str) -> list[str]:
@@ -323,6 +424,8 @@ def check(kind: str, text: str) -> list[str]:
     if len(text) > MAX_CHARS:
         raise TemplateError(f"текст длиннее {MAX_CHARS} знаков ({len(text)}): он уходит модели с каждой записью "
                             "целиком — сократите его")
+    if kind == "common":
+        return [] if pieces(text) else ["В файле нет ни одного куска (строки «@@ имя»): шаблонам подключать нечего."]
     if kind == "glossary":
         useful = [ln for ln in body.splitlines() if ln.strip() and not ln.strip().startswith("#")]
         return [] if useful else ["В словаре нет ни одного термина (строки с # — пояснения): подсказок "
@@ -385,7 +488,7 @@ def load_template(prompts_dir: Path, key: str) -> tuple[str, str]:
     text = path.read_text(encoding="utf-8").strip()
     if not text:
         raise RuntimeError(f"шаблон пустой: {path}")
-    return meta["title"], text
+    return meta["title"], _assembled(prompts_dir, path, text)
 
 
 def load_triage(prompts_dir: Path, kinds: dict | None = None) -> str:
@@ -402,6 +505,7 @@ def load_triage(prompts_dir: Path, kinds: dict | None = None) -> str:
     text = path.read_text(encoding="utf-8").strip()
     if not text:
         raise RuntimeError(f"задание на разбор пустое: {path}")
+    text = _assembled(prompts_dir, path, text)
     kinds = types(prompts_dir) if kinds is None else kinds
     listing = "\n".join(f"- {key} — {meta['title']}" + (f": {meta['when']}" if meta.get("custom") else "")
                         for key, meta in kinds.items())
@@ -419,7 +523,7 @@ def load_actions(prompts_dir: Path) -> str:
     text = path.read_text(encoding="utf-8").strip()
     if not text:
         raise RuntimeError(f"задание на поручения пустое: {path}")
-    return text
+    return _assembled(prompts_dir, path, text)
 
 
 def load_glossary(prompts_dir: Path) -> str:

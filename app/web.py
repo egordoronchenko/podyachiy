@@ -188,6 +188,13 @@ def _seed_prompts() -> None:
     Свежая установка монтирует пустую папку, и без этого шаблоны пришлось бы
     доставать из образа руками. Существующие файлы не трогаются: их правят
     на хосте, и обновление образа не должно затирать правки.
+
+    Одно исключение — стандартный шаблон, который теперь подключает общие правила
+    (templates.COMMON_FILE), а в папке лежит целиком, как до общего файла, и не правлен:
+    его текст для модели тот же, что у нового с подставленными правилами. Такой файл
+    заменяется новым — модель получает ровно то же, а правка общего файла дальше
+    действует и в нём; без этого нетронутый шаблон числился бы изменённым в обход
+    страницы. Правленный руками остаётся как есть и собирается как раньше.
     """
     if not DEFAULT_PROMPTS.is_dir():
         return
@@ -199,11 +206,29 @@ def _seed_prompts() -> None:
             if src.is_file() and not target.exists():
                 shutil.copyfile(src, target)
                 added.append(src.name)
+        moved = []
+        for src in sorted(DEFAULT_PROMPTS.iterdir()):
+            fresh = templates.read(src) if src.is_file() else None
+            if fresh is None or not templates.includes(fresh) or not (cfg.prompts_dir / src.name).is_file():
+                continue
+            mine = templates.read(cfg.prompts_dir / src.name)
+            if mine == fresh:
+                continue
+            try:
+                same = templates.expand(cfg.prompts_dir, fresh).strip() == mine.strip()
+            except templates.TemplateError:
+                continue                    # общего файла нет или он другой — сравнивать не с чем
+            if same:
+                templates._write(cfg.prompts_dir / src.name, fresh)
+                moved.append(src.name)
     except OSError as e:
         log(f"ВНИМАНИЕ: не удалось разложить шаблоны в {cfg.prompts_dir}: {e}")
         return
     if added:
         log(f"шаблоны по умолчанию разложены в {cfg.prompts_dir}: {', '.join(added)}")
+    if moved:
+        log(f"шаблоны {', '.join(moved)} переведены на общие правила из {templates.COMMON_FILE}: "
+            "текст для модели тот же")
 
 
 def _startup_checks() -> None:
@@ -387,6 +412,79 @@ def _heartbeat() -> dict | None:
     return {**beat, "ago_sec": ago(beat.get("at")), "uptime_sec": ago(beat.get("started")), "every_sec": HEARTBEAT_SEC}
 
 
+# Резервную копию делает и сам сервис: по расписанию со страницы «Обработка» и кнопкой «Сделать копию сейчас»
+# (backup.create — та же, что у команды). Раз в BACKUP_CHECK_SEC сервис сверяется с расписанием (backup.due:
+# пропущенное время не догоняется пачкой). Копия идёт в потоке, обработка при этом работает. Две копии разом
+# не идут — ни по расписанию рядом с кнопкой, ни дважды по расписанию: backup_job отмечается в событийном
+# цикле без await между проверкой и отметкой. Копия и сбой — строкой в журнал работы, событием в журнал
+# действий, отметкой для страницы (backup.last, backup.failure).
+BACKUP_CHECK_SEC = 60
+BACKUP_BUSY = "резервная копия уже делается — дождитесь её окончания: итог появится на странице «Обработка»"
+backup_job: dict | None = None          # идущая копия: {"how", "by", "started"}
+backup_task: asyncio.Task | None = None
+
+
+def _backup_plan() -> dict:
+    """Расписание копии со страницы, а не сохраняли — выключенное по умолчанию (by и at пусты)."""
+    return options.backup_plan() or {**backup.PLAN, "by": "", "at": ""}
+
+
+def _backup_due(now: datetime.datetime) -> bool:
+    plan, made, failed = _backup_plan(), backup.last(base), backup.failure(base)
+    return backup.due(plan, now, [plan["at"], made and made["at"], failed and failed["at"]])
+
+
+def _backups() -> dict:
+    """Копия из сервиса — странице и API: расписание, когда следующая, идущая копия, последняя неудача."""
+    plan = _backup_plan()
+    now = datetime.datetime.now().astimezone()
+    return {"plan": plan, "next": backup.upcoming(plan, now).isoformat(timespec="seconds") if plan["on"] else None,
+            "running": backup_job, "failed": backup.failure(base)}
+
+
+async def _backup_work(how: str, by: str, inbox: bool, keep: int) -> None:
+    global backup_job
+    try:
+        await asyncio.to_thread(backup.create, cfg, None, inbox, keep, lambda line: None, db.kept,
+                                by=by, how=how, log=log, base=base)
+    except Exception as e:      # нет места, нет тома копий, сбой — отметкой и строкой; следующая — по расписанию
+        why = str(e) if isinstance(e, backup.BackupError) else f"сбой: {e!r}"
+        await asyncio.to_thread(backup.failed, cfg, why, by=by, how=how, log=log, base=base)
+    finally:
+        backup_job = None
+
+
+def _backup_start(how: str, by: str) -> dict:
+    """Начинает копию в фоне с настройками расписания: с исходными записями или без и сколько копий
+    держать (расписание не сохраняли — с записями, старые не стираются). Копия уже идёт — отказ 409."""
+    global backup_job, backup_task
+    if backup_job is not None:
+        raise HTTPException(409, BACKUP_BUSY)
+    plan = _backup_plan()
+    backup_job = {"how": how, "by": by, "started": datetime.datetime.now().astimezone().isoformat(timespec="seconds")}
+    backup_task = asyncio.create_task(_backup_work(how, by, plan["inbox"], plan["keep"] if plan["at"] else 0))
+    log("резервная копия: начинаю " + ("по расписанию" if how == backup.SCHEDULE else f"по кнопке ({by})")
+        + ("" if plan["inbox"] else ", без исходных записей"))
+    return backup_job
+
+
+def _backup_tick(now: datetime.datetime) -> bool:
+    """Пора ли копию по расписанию — пора, и копия не идёт: начать. Начата ли."""
+    if backup_job is not None or not _backup_due(now):
+        return False
+    _backup_start(backup.SCHEDULE, "")
+    return True
+
+
+async def _backup_loop() -> None:
+    while True:
+        await asyncio.sleep(BACKUP_CHECK_SEC)
+        try:
+            _backup_tick(datetime.datetime.now().astimezone())
+        except Exception as e:  # база занята — сверимся через минуту
+            log(f"сбой расписания резервной копии (продолжаю): {e!r}")
+
+
 def _key_targets() -> list[tuple[str, providers.Provider, tuple[str, ...]]]:
     """Чьи ключи проверять: основной поставщик, запасной и свой адрес текстовых этапов, если
     заданы. При каждом — текстовые модели, которые он должен знать: у текста со своим адресом
@@ -433,7 +531,8 @@ async def lifespan(app: FastAPI):
     global started_at
     service = Service(cfg=cfg, log=log, ledger=Ledger(base, log), journal=trail,
                       speech_model=speech_model, tell=_tell, words=words.effective, marked=noted,
-                      series=lambda rel: serial.on(_parent_of(rel)), people=people, dictionaries=words)
+                      series=lambda rel: serial.on(_parent_of(rel)), people=people, dictionaries=words,
+                      dropped=options.dropped(), keep_dropped=options.set_dropped)
     try:
         service.known_to_nfc()          # записи и папки под разложенными именами — разово, до обхода
     except Exception as e:
@@ -445,10 +544,11 @@ async def lifespan(app: FastAPI):
              asyncio.create_task(_check_keys_on_start())]     # не ждём: запуск не зависит от поставщика
     tasks.append(asyncio.create_task(_clean_loop()))
     tasks.append(asyncio.create_task(_beat_loop()))
+    tasks.append(asyncio.create_task(_backup_loop()))
     try:
         yield
     finally:
-        for t in tasks:
+        for t in tasks + ([backup_task] if backup_task else []):
             t.cancel()
         log("podyachiy остановлен")
         base.close()            # база дописывает журнал WAL в основной файл: после остановки она — один файл
@@ -1096,6 +1196,8 @@ def admin_status(log_from: int = 0, history_version: int = -1):
                     "warnings": storage_warnings, "backup": backup.last(base)},
         # тома установки: не подключены с хоста, мало места — по проверке при запуске и раз в сутки
         "volumes": {"warnings": volume_warnings},
+        # копия из самого сервиса: расписание, следующее время, идущая копия, последняя неудача
+        "backups": _backups(),
         # последняя отметка «сервис жив» в базе
         "heartbeat": _heartbeat(),
         "templates": {k: v["title"] for k, v in templates.types(cfg.prompts_dir).items()},
@@ -3561,7 +3663,8 @@ async def _sign(req: NamesRequest, who: users.Access) -> tuple[Path, str, dict]:
     локальный администратор общей, администратор сервиса. Тот, кому папка только
     открыта, читает, но не правит. Пересборка платная, поэтому хозяину личной папки
     она открыта только с правом загрузки в неё. Ключу доступа это открыто в тех же правах.
-    Отдаёт папку результата и имя записи в ней — по ним вызывающий собирает ответ — и, если
+    Отдаёт папку результата и имя записи в ней — по ним вызывающий собирает ответ, — кого из
+    подписанных добавили в словарь папки ({"dictionary_added": [ФИО]}, words.welcome) и, если
     просили пересборку, что с ней стало: {"rebuild": "queued"} или {"rebuild": "already"}.
     """
     assert service is not None
@@ -3594,14 +3697,23 @@ async def _sign(req: NamesRequest, who: users.Access) -> tuple[Path, str, dict]:
         else:
             signed["lines"].pop(key, None)
     signed["parts"] = {k: v for k, v in signed["parts"].items() if v}
+    added: list[str] = []
     if req.parts or req.lines:
         names.save(base, stem, signed)
+        # подписанное ФИО — подтверждённое имя: в словарь папки, чтобы следующие записи папки его
+        # уже знали. Право то же, что у подписи, — словарь папки правит её хозяин (NO_DICT_EDIT)
+        given = [names.clean(n) for labels in req.parts.values() for n in labels.values()]
+        added = await asyncio.to_thread(words.welcome, _parent_of(req.file),
+                                        given + [names.clean(n) for n in req.lines.values()], who.login)
         log(f"подписи говорящих: {req.file} — по частям "
             f"{sum(len(v) for v in signed['parts'].values())}, по строкам {len(signed['lines'])}"
+            + (f"; в словарь папки «{_parent_of(req.file)}» добавлено ФИО: {len(added)}" if added else "")
             + (f" ({who.login}, ключ «{who.key}»)" if who.key else ""))
-        jot("names", who, file=req.file)
+        # в журнал действий — сколько ФИО ушло в словарь, самих имён там нет
+        jot("names", who, file=req.file, dictionary=len(added))
 
-    return base, stem, {"rebuild": _queue_rebuild(req.file, record, who)} if req.rebuild else {}
+    return base, stem, {"dictionary_added": added,
+                        **({"rebuild": _queue_rebuild(req.file, record, who)} if req.rebuild else {})}
 
 
 @app.post("/api/admin/names")
@@ -4007,6 +4119,8 @@ def _template_item(item: str, meta: dict, notes: dict) -> dict:
            "custom": bool(meta.get("custom")), "actions": bool(meta.get("actions")),
            "has_default": default is not None, "exists": text is not None,
            "chars": len(text or ""), "backups": templates.backups(cfg.prompts_dir, file),
+           # какие куски общих правил подключает файл (у самого общего файла и словаря — никаких)
+           "includes": templates.includes(text or "") if kind not in ("common", "glossary") else [],
            "state": "missing", "changed_at": "", "by": "", "outside": False, "problem": "", "warnings": []}
     if text is None:
         out["problem"] = "файла нет в папке шаблонов" + (" — верните стандартный" if default is not None else "")
@@ -4021,7 +4135,7 @@ def _template_item(item: str, meta: dict, notes: dict) -> dict:
     elif out["state"] != "standard":
         out["outside"] = True                 # текст не тот, что сохраняли на странице: правили файлом
     try:
-        out["warnings"] = templates.check(kind, text)
+        out["warnings"] = templates.check_file(cfg.prompts_dir, kind, text)
     except templates.TemplateError as e:
         out["problem"] = str(e)
     return out
@@ -4083,7 +4197,7 @@ async def admin_template_text(id: str, version: str = "current", download: bool 
 def _template_store(item: str, text: str, who: users.Access, how: str) -> dict:
     file = _template_file(item)
     try:
-        warnings = templates.check(templates.kind_of(item), text)
+        warnings = templates.check_file(cfg.prompts_dir, templates.kind_of(item), text)
         changed = templates.save(cfg.prompts_dir, file, text)
     except templates.TemplateError as e:
         raise HTTPException(400, str(e))
@@ -4161,7 +4275,7 @@ def _type_store(req: TemplateType, who: users.Access) -> dict:
             jot("type_change", who, item=req.key, title=" ".join(req.title.split()))
             return {"ok": True, "key": req.key, "warnings": [], **_templates_view()}
         text = req.text if req.text is not None else _template_text(req.base or "meeting", "current")
-        warnings = templates.check("type", text)
+        warnings = templates.check_file(cfg.prompts_dir, "type", text)
         key = templates.add_type(cfg.prompts_dir, req.key, req.title, req.when, text, req.actions)
     except templates.TemplateError as e:
         raise HTTPException(400, str(e))
@@ -4265,9 +4379,80 @@ async def admin_run(req: RunRequest, who: users.Access = Depends(viewer)):
     rel = target.relative_to(root).as_posix()
     if hidden(rel) or service._ignore_reason(target) or service._under_outbox(rel):
         raise HTTPException(400, NOT_RUNNABLE)
-    if rel in service.pending:
+    # файл, который сканер отложил до решения администратора (копия готовой записи, похож на
+    # недокопированный), запускают именно вручную — так сервис и пишет; копируется ещё — нет
+    watch = service.pending.get(rel)
+    if watch is not None and not (watch.cut or watch.held):
         raise HTTPException(409, STILL_WRITTEN)
     if any(i.path == rel for i in service.queue) or _in_work(rel):
         raise HTTPException(409, "этот файл уже в очереди или обрабатывается")
     service.enqueue_manual(rel, req.template, req.force, who.login, "manual", req.model or "")
     return {"ok": True, "queued": rel}
+
+
+# ---------- резервная копия из сервиса ----------
+
+class BackupPlanRequest(BaseModel):
+    on: bool
+    time: str
+    every: str = "day"
+    weekday: int = 0
+    inbox: bool = True
+    keep: int = backup.PLAN["keep"]
+
+
+@app.post("/api/admin/backup/plan", dependencies=[Depends(admin_guard)])
+async def admin_backup_plan(req: BackupPlanRequest, who: users.Access = Depends(viewer)):
+    """Расписание резервной копии: включено ли, время суток по часовому поясу сервиса, каждый день или раз в
+    неделю, с исходными записями ли, сколько копий держать. Те же «с записями» и «сколько держать» — у кнопки
+    «Сделать копию сейчас»."""
+    try:
+        plan = backup.plan_of(req.on, req.time, req.every, req.weekday, req.inbox, req.keep)
+    except backup.BackupError as e:
+        raise HTTPException(400, str(e))
+    await asyncio.to_thread(options.set_backup_plan, plan, who.login)
+    log(f"расписание резервной копии: {backup.described(plan)} — сохранил {who.login}")
+    jot("backup_plan", who, plan=plan)
+    return {"ok": True, "backups": _backups()}
+
+
+@app.post("/api/admin/backup/now", dependencies=[Depends(admin_guard)])
+async def admin_backup_now(who: users.Access = Depends(viewer)):
+    """Копия сейчас, в фоне: ответ — сразу, итог — в GET /api/admin/status (storage.backup, backups)."""
+    _backup_start(backup.PAGE, who.login)
+    return {"ok": True, "backups": _backups()}
+
+
+# ---------- очередь: снять запись, отменить прогон ----------
+
+class QueueRequest(BaseModel):
+    file: str
+
+
+NOT_QUEUED = "этой записи в очереди нет: её уже взяли в работу или сняли — обновите страницу"
+NOT_RUNNING = "эта запись сейчас не обрабатывается: прогон уже закончился или ещё не начался — обновите страницу"
+
+
+@app.post("/api/admin/queue/remove", dependencies=[Depends(admin_guard)])
+async def admin_queue_remove(req: QueueRequest, who: users.Access = Depends(viewer)):
+    """Снять запись из очереди, пока её прогон не начался. Новая запись и повтор после сбоя сами в
+    очередь не вернутся (remembered), пока файл не изменится или запись не запустят вручную."""
+    assert service is not None
+    remembered = service.unqueue(req.file, who.login)
+    if remembered is None:
+        raise HTTPException(409, NOT_QUEUED)
+    jot("queue_remove", who, file=req.file, remembered=remembered)
+    return {"ok": True, "file": req.file, "remembered": remembered}
+
+
+@app.post("/api/admin/queue/cancel", dependencies=[Depends(admin_guard)])
+async def admin_queue_cancel(req: QueueRequest, who: users.Access = Depends(viewer)):
+    """Отменить идущий прогон. Он остановится перед следующим платным запросом: идущий запрос поставщику
+    доработает (за него могли уже списать деньги), ffmpeg — тоже. Оплаченное — в расходах и на диске,
+    повтор возьмёт его готовым; исход — «отменено администратором», по расписанию не повторяется."""
+    assert service is not None
+    mark = service.cancel(req.file, who.login)
+    if mark is None:
+        raise HTTPException(409, NOT_RUNNING)
+    jot("run_cancel", who, file=req.file)
+    return {"ok": True, "file": req.file, "cancel": mark}

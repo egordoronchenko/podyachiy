@@ -216,7 +216,13 @@ def test_every_example_request_is_accepted_and_the_answer_has_the_described_fiel
             kw["json"]["id"] = manage.get("/api/admin/requests").json()["requests"][0]["id"]
         if name == "post-admin-mail-test":
             continue                # без почты отвечает 503: пример проверяет отдельный тест, с почтой
+        if name == "post-admin-queue-remove":
+            web.service.queue.append(T.watcher.QueueItem(path=MEETING))      # снимать есть что
+        if name == "post-admin-queue-cancel":
+            web.service.running.append(T.job(MEETING))                        # прогон идёт
         answer = client.request(method, path, **kw)
+        if name == "post-admin-queue-cancel":
+            web.service.running.clear()
         assert answer.status_code == 200, f"{name}: {answer.status_code} {answer.text[:300]}"
         (media, good), = item["responses"]["200"]["content"].items()
         assert answer.headers["content-type"].split(";")[0] == media, name
