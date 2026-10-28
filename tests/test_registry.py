@@ -216,7 +216,8 @@ def processed(tmp_path, monkeypatch, name, neighbours, prev_tasks=True, protocol
     out = cfg.outbox / "Планёрки" / name / "transcript"
     out.mkdir(parents=True, exist_ok=True)
     (out / f"{name}.json").write_text(json.dumps(
-        {"segments": [{"start": 605, "end": 606, "speaker": "S1", "text": "Согласуйте смету."}]}), encoding="utf-8")
+        {"segments": [{"start": sec, "end": sec + 1, "speaker": "S1", "text": "Согласуйте смету."}
+                      for sec in (605, 720, 1200)]}), encoding="utf-8")       # метки протокола MD — из расшифровки
     (out / f"{name}.meta.json").write_text(json.dumps(
         {"success": True, "model": cfg.model, "audio_duration_sec": 700.0}), encoding="utf-8")
 

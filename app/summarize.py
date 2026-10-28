@@ -8,7 +8,8 @@
 правится и лежит рядом, поэтому вольности модели всегда можно сверить
 с первоисточником. Метки времени в протоколе делают эту сверку быстрой:
 модель обязана скопировать метку из расшифровки, а сервис потом проверяет,
-что каждая метка в протоколе там действительно есть.
+что каждая метка в протоколе там действительно есть, и помечает в протоколе
+те, которых там нет.
 """
 from __future__ import annotations
 
@@ -59,6 +60,17 @@ def check_marks(md: str, marks: set[str]) -> tuple[int, list[str]]:
     return len(used), sorted(u for u in used if u not in marks)
 
 
+def flag_marks(md: str, unknown: list[str]) -> str:
+    """Метки не из расшифровки — с вопросительным знаком в самом протоколе: [00:12:34] → [00:12:34?].
+
+    Журнал работы читатель протокола не видит, а выдуманная метка от настоящей на глаз не
+    отличается. Помеченная метка не ведёт к моменту записи — ни на странице, ни в карте протокола,
+    ни в скачанном файле: все они узнают метку только в виде [чч:мм:сс]."""
+    bad = set(unknown)
+    return MARK_RE.sub(lambda m: f"[{m.group(1)}:{m.group(2)}:{m.group(3)}?]"
+                       if f"{int(m.group(1)):02d}:{m.group(2)}:{m.group(3)}" in bad else m.group(0), md)
+
+
 async def summarize(text: str, prompt: str, cfg, log=lambda s: None,
                     notes: str = "", glossary: str = "") -> tuple[str, dict]:
     """Просит модель составить протокол по шаблону.
@@ -100,6 +112,7 @@ async def summarize_file(
         + (", со словарём терминов" if glossary else ""))
     md, api_usage = await summarize(text, prompt, cfg, log, notes, glossary)
     used, unknown = check_marks(md, marks)
+    md = flag_marks(md, unknown)
 
     out_dir = file_dir / "summary"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -142,7 +155,7 @@ async def summarize_file(
     if unknown:
         log(f"внимание: меток времени, которых нет в расшифровке: {len(unknown)} "
             f"({', '.join(unknown[:5])}{' …' if len(unknown) > 5 else ''}) — "
-            f"эти моменты модель назвала сама, сверяйте по записи")
+            f"эти моменты модель назвала сама, в протоколе они помечены знаком «?» — сверяйте по записи")
     return meta
 
 

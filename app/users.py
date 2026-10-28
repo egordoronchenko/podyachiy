@@ -401,7 +401,7 @@ class Users:
                         "notify_due": bool(row["notify_due"])}
 
     def reminded(self) -> list[dict]:
-        """Кому напоминать о сроках поручений: у кого есть почта и кто напоминания не отключил."""
+        """Кому напоминать о сроках поручений: у кого есть почта и кто сам включил напоминания."""
         return [dict(row) for row in self.db.rows(
             "SELECT login, name, email FROM users WHERE email <> '' AND notify_due = 1 ORDER BY login")]
 

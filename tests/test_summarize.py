@@ -106,3 +106,20 @@ def test_versions_made_in_one_second_do_not_overwrite_each_other(tmp_path, monke
         summarize.rewrite(summary, STEM, "# Не встанет\n", made, summarize.digest(target.read_bytes()))
     monkeypatch.setattr(summarize, "_save_index", real)
     assert target.read_text(encoding="utf-8") == "# Правка 2\n" and len(summarize.versions(summary, STEM)) == 3
+
+
+def test_mark_not_from_the_transcript_is_flagged_in_the_protocol_itself(tmp_path, monkeypatch):
+    """Метка, которой в расшифровке нет, — с вопросом в самом протоколе; настоящая — как была, и в счёт
+    меток помеченная не входит дважды. Ссылкой на момент помеченная уже не читается."""
+    base = record_dir(tmp_path)
+    meta = build(base, monkeypatch, "# Протокол\n\nСмету согласовать [00:00:05]. Оплатить [0:12:34], сверить [00:12:34].")
+    md = (base / "summary" / f"{STEM}.md").read_text(encoding="utf-8")
+    assert "Смету согласовать [00:00:05]." in md and "Оплатить [0:12:34?], сверить [00:12:34?]." in md
+    assert (meta["timestamps"], meta["timestamps_unknown"]) == (2, 1)
+    assert summarize.MARK_RE.findall(summarize.body_of(md)) == [("00", "00", "05")]
+
+
+def test_flag_marks_leaves_a_protocol_without_strange_marks_as_it_was():
+    md = "Решили [00:00:05], [1:02:03]."
+    assert summarize.flag_marks(md, []) == md
+    assert summarize.flag_marks(md, ["01:02:03"]) == "Решили [00:00:05], [1:02:03?]."

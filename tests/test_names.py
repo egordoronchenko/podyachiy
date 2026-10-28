@@ -35,10 +35,26 @@ def test_protocol_source_carries_names():
 def test_notes_keep_guesses_only_for_unsigned_labels():
     tri = {"speakers": [{"label": "S1", "name": "Пётр", "role": "ведёт"},
                         {"label": "S3", "name": "Мария", "role": ""}]}
-    text = triage.notes(tri, ["Петров Пётр Иванович"], {"S3"})
-    assert "Петров Пётр Иванович" in text
+    text = triage.notes(tri, {"Петров Пётр Иванович": ["S1"]}, {"S3"})
+    assert "Петров Пётр Иванович (S1)" in text
     assert "S3 — Мария" in text
     assert "S1 — Пётр" not in text
+
+
+def test_protocol_learns_which_voices_stand_behind_signed_names(tmp_path):
+    """Для колонки «Голос» в «Участниках»: у подписанного ФИО — метки его голосов, у записи из частей —
+    с номером части; ФИО только на отдельных репликах — без меток; два голоса одного человека — оба."""
+    import json
+    (tmp_path / "transcript").mkdir()
+    (tmp_path / "transcript" / "rec.json").write_text(json.dumps({"segments": SEGMENTS, "cuts": CUTS}), encoding="utf-8")
+    names.save(tmp_path, "rec", {"parts": {"1": {"S1": "Петров В. С.", "S3": "Петров В. С."}, "2": {"S3": "Орлова А. Л."}},
+                                 "lines": {names.line_key(3310.0): "Сидорова А. Л."}})
+    who, signed, unsigned = names.for_protocol(tmp_path, "rec")
+    assert who == ["Петров В. С.", "Петров В. С.", "Орлова А. Л.", "Сидорова А. Л."] and unsigned == set()
+    assert signed == {"Орлова А. Л.": ["S3 в части 2"], "Петров В. С.": ["S1 в части 1", "S3 в части 1"],
+                      "Сидорова А. Л.": []}
+    text = triage.notes({}, signed)
+    assert "Петров В. С. (S1 в части 1, S3 в части 1); Сидорова А. Л. (отдельные реплики)" in text
 
 
 def test_subtitles_follow_line_names():

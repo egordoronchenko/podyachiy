@@ -108,12 +108,12 @@ def unsure(data: dict) -> bool:
     return (data.get("confidence") or "").strip().lower() != SURE
 
 
-def notes(data: dict, signed: list[str] = (), unsigned: set[str] | None = None,
+def notes(data: dict, signed: dict[str, list[str]] | None = None, unsigned: set[str] | None = None,
           source: str = "") -> str:
     """Справка для шага протокола: кто есть кто и о чём вообще запись.
 
-    signed — ФИО, подписанные вручную (в расшифровке они уже стоят на
-    репликах вместо меток); unsigned — метки, у которых остались реплики без
+    signed — ФИО, подписанные вручную, с метками голосов (names.for_protocol): в расшифровке
+    ФИО уже стоят на репликах вместо меток; unsigned — метки, у которых остались реплики без
     ручной подписи: только про них и нужна догадка разбора; source — имя и
     дата файла записи: дату встречи в разговоре называют редко, а в имени
     файла она обычно есть.
@@ -133,8 +133,10 @@ def notes(data: dict, signed: list[str] = (), unsigned: set[str] | None = None,
                      + ". В протоколе считай их одним участником и укажи это.")
     if signed:
         lines.append("Участники, подписанные вручную участником встречи (это точно; "
-                     "в расшифровке их реплики уже стоят под этими ФИО вместо меток): "
-                     + "; ".join(signed) + ".")
+                     "в расшифровке их реплики уже стоят под этими ФИО вместо меток, "
+                     "в скобках — метки их голосов): "
+                     + "; ".join(f"{name} ({', '.join(labels) or 'отдельные реплики'})"
+                                 for name, labels in signed.items()) + ".")
     known = [s for s in data.get("speakers") or []
              if (unsigned is None or s["label"] in unsigned) and (s.get("name") or s.get("role"))]
     if known:

@@ -53,8 +53,7 @@ DESKTOP_FS = {"9p", "virtiofs", "fuse.grpcfuse", "fuse.osxfs", "fakeowner"}
 LOCAL, DESKTOP, NETWORK = "local", "desktop", "network"
 
 # Шаги схемы по порядку: шаг N приводит базу к версии N. Прежние шаги не правятся — новое
-# дописывается следующим шагом. Шаг 3 — схема версии 1.2.0: пока она не выпущена, её изменения
-# дописываются в этот шаг.
+# дописывается следующим шагом. Шаг 3 — схема версии 1.2.0, шаг 4 — 1.3.0.
 MIGRATIONS: tuple[tuple[str, ...], ...] = ((
     # сведения о самой базе: когда и какой версией сервиса создана, итог переноса с файлов
     "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT, WITHOUT ROWID",
@@ -251,7 +250,7 @@ MIGRATIONS: tuple[tuple[str, ...], ...] = ((
 
     # ---------- напоминания о сроках поручений ----------
     # Письмо-сводка раз в день: поручения человека со сроком сегодня, завтра и просроченные (notify.py).
-    # Включено, пока человек сам не отключит, — как письмо «запись готова» (notify_ready).
+    # В 1.2.0 — включено, пока человек сам не отключит; с 1.3.0 — выключено, пока не включит (шаг 4).
     "ALTER TABLE users ADD COLUMN notify_due INTEGER NOT NULL DEFAULT 1",
 
     # ---------- webhook «запись готова» (webhook.py) ----------
@@ -268,6 +267,19 @@ MIGRATIONS: tuple[tuple[str, ...], ...] = ((
         error TEXT NOT NULL DEFAULT '',         -- чем кончилась последняя
         PRIMARY KEY (id, url)
     ) STRICT, WITHOUT ROWID""",
+), (
+    # ========== шаг 4 — схема версии 1.3.0 ==========
+
+    # ---------- напоминания о сроках поручений — выключены, пока человек сам не включит ----------
+    # В 1.2.0 они были включены у всех (DEFAULT 1 шага 3). Умолчание столбца в SQLite не меняется —
+    # столбец пересоздаётся с DEFAULT 0. Включёнными остаются только у тех, кто включил их сам: такое
+    # включение лежит в журнале событий (событие notify с due = true, web.notify_set). Кто их не
+    # трогал или выключал, получает «выключено».
+    "ALTER TABLE users ADD COLUMN due_on INTEGER NOT NULL DEFAULT 0",
+    """UPDATE users SET due_on = 1 WHERE notify_due = 1 AND EXISTS (
+        SELECT 1 FROM events WHERE kind = 'notify' AND actor = users.login AND json_extract(data, '$.due') = 1)""",
+    "ALTER TABLE users DROP COLUMN notify_due",
+    "ALTER TABLE users RENAME COLUMN due_on TO notify_due",
 ),)
 SCHEMA_VERSION = len(MIGRATIONS)
 

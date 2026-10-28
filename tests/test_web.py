@@ -3181,7 +3181,7 @@ def test_person_switches_ready_letters_off_and_on(office):
     assert (shown["mail"], shown["email"], shown["notify_ready"]) == (True, "petrov@example.test", True)
     assert admin.get("/api/me").json()["email"] == "" and office[1].get("/api/me").json()["notify_ready"] is False
     assert petrov.post("/api/notify", json={"ready": False}).json() == {"ok": True, "notify_ready": False,
-                                                                        "notify_due": True}
+                                                                        "notify_due": False}
     assert petrov.get("/api/me").json()["notify_ready"] is False
     assert web.trail.read()[-1]["kind"] == "notify" and web.trail.read()[-1]["ready"] is False
     record = web.service.ledger.get(MEETING)
@@ -3209,7 +3209,7 @@ def test_users_file_from_before_the_letters_gets_them_switched_on(tmp_path):
     cfg = types.SimpleNamespace(state_dir=state, inbox=tmp_path / "inbox", outbox=tmp_path / "outbox")
     people = users.Users(legacy.start(cfg))
     assert people.mailbox("ivanov") == {"name": "Иванов", "email": "i@example.test", "notify_ready": True,
-                                      "notify_due": True}
+                                      "notify_due": False}
     assert people.mailbox("nobody") is None
 
 
@@ -5212,6 +5212,12 @@ def test_due_reminder_goes_once_a_day_to_the_assignee_who_sees_the_folder(office
         assert ivanov.post("/api/record/task", json={"file": MEETING, "key": _task_key(ivanov, text),
                                                      "due": today.isoformat()}).status_code == 200
     run = lambda at: web.asyncio.run(web._remind_tick(at))
+    # напоминания выключены, пока человек сам не включит: никто не включал — писем нет
+    assert ivanov.get("/api/me").json()["notify_due"] is False
+    assert run(morning) is True and post.sent == []
+    web.base.note(web.REMINDED, "2000-01-01")
+    assert ivanov.post("/api/notify", json={"due": True}).json() == {"ok": True, "notify_ready": True, "notify_due": True}
+    web.people.set_notify("orlova", due=True)
     assert run(morning.replace(hour=web.notify.REMIND_HOUR - 1)) is False and post.sent == []     # рано
     assert run(morning) is True
     # Иванов Иван — исполнитель; Орлова — тоже, но папка «Проекты» ей не открыта: письма ей нет

@@ -310,10 +310,42 @@ def test_base_of_version_1_1_1_takes_the_step_of_1_2_0(tmp_path):
     old.close()
     lines = []
     base = db.Database(tmp_path, lines.append)
-    assert base.version == db.SCHEMA_VERSION == 3 and lines == ["схема базы обновлена: версия 2 → 3"]
+    assert base.version == db.SCHEMA_VERSION and lines[0] == "схема базы обновлена: версия 2 → 3"
     assert dict(base.row("SELECT login, sessions FROM users")) == {"login": "ivanov", "sessions": 0}
     people = users.Users(base, "секрет-админа")
     people.put("ivanov", "Иванов", "пароль-1234")
     token = people.token("ivanov")
     people.end_sessions("ivanov")
     assert base.value("SELECT sessions FROM users WHERE login = 'ivanov'") == 1 and people.by_token(token) is None
+
+
+def test_base_of_version_1_2_turns_reminders_off_except_for_those_who_turned_them_on(tmp_path):
+    """Обновление с 1.2.x (схема 3): напоминания о сроках были включены у всех по умолчанию. После шага 4
+    они остаются только у того, кто включил их сам (событие notify с due = true в журнале действий), —
+    в том числе выключив и снова включив; кто выключил последним — выключено. Новая учётная запись —
+    без напоминаний, письма «запись готова» — как были."""
+    from app import journal, users
+    old = db.Database(tmp_path, steps=db.MIGRATIONS[:3])
+    with old.write() as con:
+        for login in ("ivanov", "petrov", "orlova", "sidorov"):
+            con.execute("INSERT INTO users (login, name, email, password, home) VALUES (?, ?, ?, '', ?)",
+                        (login, login, f"{login}@example.test", f"Пользовательские/{login}"))
+        con.execute("UPDATE users SET notify_due = 0 WHERE login IN ('orlova', 'sidorov')")
+    trail = journal.Journal(old)
+    trail.write("notify", "petrov", due=False)
+    trail.write("notify", "petrov", due=True)
+    trail.write("notify", "orlova", due=True)
+    trail.write("notify", "orlova", due=False)
+    trail.write("notify", "sidorov", ready=False)
+    trail.write("notify", "ivanov", ready=True)
+    assert old.value("SELECT count(*) FROM users WHERE notify_due = 1") == 2
+    old.close()
+    lines = []
+    base = db.Database(tmp_path, lines.append)
+    assert base.version == db.SCHEMA_VERSION == 4 and lines == ["схема базы обновлена: версия 3 → 4"]
+    people = users.Users(base, "секрет-админа")
+    assert [box["login"] for box in people.reminded()] == ["petrov"]
+    assert {login: people.mailbox(login)["notify_ready"] for login in ("ivanov", "petrov", "orlova")} == {
+        "ivanov": True, "petrov": True, "orlova": True}
+    people.put("kozlov", "Козлов", "пароль-1234", email="kozlov@example.test")
+    assert people.mailbox("kozlov")["notify_due"] is False and people.mailbox("kozlov")["notify_ready"] is True

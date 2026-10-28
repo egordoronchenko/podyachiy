@@ -96,14 +96,30 @@ def signed_names(segments: list[dict], cuts: list[float], signed: dict) -> list[
     return out
 
 
-def for_protocol(file_dir: Path, stem: str) -> tuple[list[str], list[str], set[str]]:
-    """Что нужно протоколу: ручное ФИО по каждой реплике, список этих ФИО
-    и метки, которые где-то остались без ручной подписи."""
+def for_protocol(file_dir: Path, stem: str) -> tuple[list[str], dict[str, list[str]], set[str]]:
+    """Что нужно протоколу: ручное ФИО по каждой реплике, эти ФИО с метками голосов, за которыми
+    они стоят, и метки, которые где-то остались без ручной подписи.
+
+    В расшифровке для протокола у подписанной реплики стоит ФИО вместо метки, а таблица
+    «Участники» сводит метки с именами: метки подписанных голосов модель узнаёт из справки.
+    У записи из нескольких частей метка — с номером части («S1 в части 2»): после стыка метки
+    раздаются заново. ФИО, подписанное только отдельным репликам, — без меток."""
     data = _transcript(file_dir, stem)
     segments = data.get("segments") or []
-    who = signed_names(segments, data.get("cuts") or [], load(file_dir, stem))
+    cuts = data.get("cuts") or []
+    signed = load(file_dir, stem)
+    who = signed_names(segments, cuts, signed)
     left = {seg.get("speaker") for seg, name in zip(segments, who) if not name}
-    return who, sorted({n for n in who if n}), left
+    voices: dict[str, list[str]] = {}
+    for seg, name in zip(segments, who):
+        if not name:
+            continue
+        mine = voices.setdefault(name, [])
+        part, label = part_of(float(seg.get("start") or 0), cuts), seg.get("speaker")
+        voice = f"{label} в части {part}" if cuts else label
+        if signed["parts"].get(str(part), {}).get(label) == name and voice not in mine:
+            mine.append(voice)
+    return who, dict(sorted(voices.items())), left
 
 
 def view(file_dir: Path, stem: str) -> dict:
