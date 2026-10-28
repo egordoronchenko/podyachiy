@@ -98,7 +98,7 @@ def volume_warnings(cfg, kept=None, room=None) -> list[str]:
             continue                    # папки нет (копий ещё не делали) — места на ней не занять
     for free, names in disks.values():
         if free < FREE_MIN:
-            found.append(f"на диске, где лежит {', '.join(names)}, свободно {human(free)} — меньше {human(FREE_MIN)}: "
+            found.append(f"на диске, где лежит {', '.join(names)}, свободно {human(free)} — меньше {FREE_MIN // 2 ** 30} ГБ: "
                          "новая запись, протокол или резервная копия могут не уместиться. Что сделать: освободите "
                          "место (старые резервные копии, ненужные записи) или перенесите том на диск побольше")
     return found

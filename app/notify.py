@@ -194,16 +194,20 @@ def _readings(name: str) -> list[tuple[str, list[str]]]:
 
 def assigned(who: str | None, name: str) -> bool:
     """Поручение с исполнителем who (как он записан в протоколе) — этого человека (ФИО name)? Фамилия —
-    отдельным словом; остальные слова — его имя или отчество, буквы — их инициалы по порядку."""
+    отдельным словом; остальные слова — его имя или отчество, буквы — их инициалы по порядку. Прочтение
+    двух слов «Имя Фамилия» годится, только если кроме фамилии названо и имя: одно слово «Иван» у
+    «Иванов Иван» — имя, а не фамилия, и письмо ушло бы не тому."""
     words = marks.norm(who).split()
-    for surname, given in _readings(name):
+    for n, (surname, given) in enumerate(_readings(name)):
         if surname not in words:
             continue
         rest = [w for w in words if w != surname]
+        if n and not rest:
+            continue
         full, initials = [w for w in rest if len(w) > 1], [w for w in rest if len(w) == 1]
         if given and any(w not in given for w in full):
             continue
-        if all(n >= len(given) or w == given[n][0] for n, w in enumerate(initials)):
+        if all(i >= len(given) or w == given[i][0] for i, w in enumerate(initials)):
             return True
     return False
 

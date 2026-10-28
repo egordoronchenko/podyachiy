@@ -438,4 +438,4 @@ def test_volumes_not_mounted_and_short_of_space_are_warnings_with_what_to_do(tmp
     # все папки на одном диске — одно предупреждение о месте, с их названиями
     short, = migrate.volume_warnings(cfg, kept=lambda path: True, room=lambda path: types.SimpleNamespace(free=2 ** 29))
     assert "входная папка, папка результатов, папка состояния, папка резервных копий" in short
-    assert "свободно 512.0 МБ" in short and "Что сделать" in short
+    assert "свободно 512.0 МБ — меньше 2 ГБ" in short and "Что сделать" in short
